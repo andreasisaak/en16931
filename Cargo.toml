@@ -6,23 +6,18 @@ members  = [
     "crates/en16931-formats",
     "xtask",
 ]
+# `fuzz/` is cargo-fuzz's own workspace (nightly); `just fuzz` and CI build it.
+exclude = ["fuzz"]
 
-# `en16931-formats` depends on `en16931`; rustc forbids the reverse, which is
-# what enforces "the semantic rules do not depend on a syntax". `en16931-cli` is
-# the only binary, and depends on both with every feature on — sound because
-# nothing depends on it. `xtask` runs `fetch` / `codegen` and is not published.
-#
-# One repository because both libraries derive their tables from the same four
-# upstream artefacts at the same revision, and
-# `every_artefact_pin_in_the_workspace_agrees` compares all three copies of that
-# pin — which nothing could do across a repository boundary.
+# `en16931-formats` depends on `en16931`, never the reverse: the semantic rules
+# cannot depend on a syntax. `en16931-cli` depends on both with every feature on.
+# `xtask` (fetch, codegen) is not published.
 
 [workspace.package]
-# All three release in lockstep. Bump here and in the two requirements below —
-# the only other copies of the number, and cargo rejects a bump that misses one.
-version      = "0.7.3"
+# All three crates release in lockstep: bump here and in the two requirements below.
+version      = "0.8.0"
 edition      = "2024"
-# `let`-chains, stabilised in 1.88. CI reads this rather than repeating it.
+# `let`-chains need 1.88. CI reads this value.
 rust-version = "1.88"
 authors      = ["hupe1980"]
 license      = "MIT OR Apache-2.0"
@@ -30,12 +25,18 @@ repository   = "https://github.com/hupe1980/en16931"
 
 [workspace.dependencies]
 # `version` as well as `path`, so `cargo publish` resolves them from crates.io.
-en16931         = { version = "0.7.3", path = "crates/en16931" }
-en16931-formats = { version = "0.7.3", path = "crates/en16931-formats" }
+en16931         = { version = "0.8.0", path = "crates/en16931" }
+en16931-formats = { version = "0.8.0", path = "crates/en16931-formats" }
 
-# Pinned once: two `rust_decimal` majors in one graph means two incompatible
-# `Decimal` types.
-rust_decimal = { version = "1.42", default-features = false, features = ["std"] }
+# Pinned once: two `rust_decimal` versions would mean two incompatible `Decimal` types.
+rust_decimal = { version = "1.43", default-features = false, features = ["std"] }
 roxmltree    = "0.21"
 thiserror    = "2"
 serde        = { version = "1", features = ["derive"] }
+
+# Used by `cargo mutants` (`.cargo/mutants.toml`): every mutant is a fresh build,
+# so debuginfo and incremental state only cost time.
+[profile.mutants]
+inherits    = "dev"
+debug       = false
+incremental = false

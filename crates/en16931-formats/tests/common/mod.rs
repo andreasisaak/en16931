@@ -1,14 +1,14 @@
-//! A **maximal** invoice — every business term the model carries, populated.
-//!
-//! The point of a fixture here is coverage, not realism. `tests/order.rs` and
-//! `tests/subset.rs` inspect what the writer *emits*, so an invoice with empty
-//! optionals would exercise a fraction of the writer and report success. Every
-//! `Option` that is `None` here is a branch no test reaches.
-//!
-//! `every_writer_branch_is_covered` in `tests/subset.rs` is the guard against
-//! this file quietly falling behind the model.
+//! Shared test support: a maximal invoice (every term the model carries,
+//! populated, so writer suites reach every branch) and access to the
+//! reference corpus.
 
 #![allow(dead_code)]
+
+pub mod watchdog;
+
+/// The documentation reader `en16931`'s `documented_numbers` suite uses.
+#[path = "../../../en16931/tests/common/docs.rs"]
+pub mod docs;
 
 use en16931::invoice::*;
 use en16931::{
@@ -22,12 +22,8 @@ fn a(s: &str) -> InvoiceAmount {
 }
 /// A unit price.
 ///
-/// `UnitPriceAmount`'s `Display` normalises — `100.00` is written `100` — which
-/// is deliberate: `BR-DEC-*` constrains amounts to two decimals but prices are
-/// allowed more, so the model refuses to invent a scale. The consequence is
-/// that a price round-trips *up to normalisation*, so this fixture uses values
-/// that are already normalised. A fixture that ignored this would report a
-/// round-trip failure for a property the model never claimed.
+/// `UnitPriceAmount`'s `Display` normalises (`100.00` → `100`), so the fixture
+/// uses already-normalised values.
 fn u(v: &str) -> UnitPriceAmount {
     let d: rust_decimal::Decimal = v.parse().expect("fixture unit price");
     assert_eq!(d, d.normalize(), "fixture prices must be normalised: {v}");
@@ -64,10 +60,7 @@ fn party(tag: &str) -> Party {
         legal_registration: Some(Identifier::schemed("HRB 1234", "0198")),
         vat_identifier: Some("DE123456789".into()),
         tax_registration: Some("FC-987".into()),
-        // BT-33 is the *seller's*; `UBL-CR-244` forbids `cbc:CompanyLegalForm`
-        // on the customer. The model gives every party the field, so the
-        // fixture must not populate it for the buyer or the round-trip is
-        // asserting something UBL cannot express.
+        // BT-33 is the seller's; `UBL-CR-244` forbids it on the customer.
         additional_legal_information: None,
         electronic_address: Some(Identifier::schemed(format!("{tag}@example.test"), "EM")),
         address: address(tag),
@@ -179,6 +172,9 @@ pub fn maximal() -> Invoice {
     }];
     inv.seller = party("Seller");
     inv.buyer = party("Buyer");
+    // BT-46, the buyer's identifier, is 0..1 (BT-29, the seller's, repeats):
+    // `UBL-SR-16` rejects a second one, so a maximal *lawful* buyer has one.
+    inv.buyer.identifiers.truncate(1);
     inv.payee = Some(Payee {
         name: Some("Payee GmbH".into()),
         identifier: Some(Identifier::schemed("PAY-1", "0088")),
@@ -274,45 +270,44 @@ pub fn maximal_credit_note() -> Invoice {
     let mut inv = maximal();
     inv.kind = DocumentKind::CreditNote;
     inv.type_code = Some(Code::new("381"));
-    // Two terms UBL's credit note cannot carry. Neither is a writer bug: no
-    // authority instance places `cbc:DueDate` or `cac:ProjectReference` under
-    // `<CreditNote>`, so the derived sequence has no slot for them and the
-    // serialiser drops them — reporting each one. `nothing_is_dropped_that_
-    // should_not_be` asserts exactly that behaviour; the fixture clears them so
-    // the round-trip tests the writer rather than re-testing the schema.
+    // UBL's `<CreditNote>` has no slot for `cbc:DueDate` or
+    // `cac:ProjectReference`; the writer drops and reports them
+    // (`nothing_is_dropped_that_should_not_be`), so the fixture clears them.
     inv.due_date = None;
     inv.project_reference = None;
     inv
 }
 
-// ── Finding `spec/` ───────────────────────────────────────────────────────────
+// ── Finding the reference corpus ───────────────────────────────────────────
 //
-// See `crates/en16931/tests/common/mod.rs` for the full account. The short
-// version: this was `PathBuf::from("spec")`, which resolved against the package
-// directory. When the crate moved into `crates/en16931-formats/` the corpus
-// suite stopped finding 490 documents and reported green.
+// The location comes from `EN16931_REFERENCE`, set once for the workspace.
 
 use std::path::{Path, PathBuf};
+
+/// The sources in the reference corpus the corpus suites read: the
+/// authorities' own published instances. Must equal `ORDER_SOURCES` in
+/// `xtask` (asserted by `crates/en16931/tests/artefact_pin.rs`).
+pub const AUTHORITY_SOURCES: &[&str] = &[
+    "eInvoicing-EN16931",
+    "peppol-bis-invoice-3",
+    "xrechnung-schematron",
+    "validator-configuration-xrechnung",
+];
 
 /// The environment variable CI sets to forbid skipping.
 pub const REQUIRE: &str = "EN16931_REQUIRE_SPEC";
 
-/// The workspace's `spec/` directory, if it has been fetched.
-///
-/// Walks up rather than assuming a depth, so moving the crate within the
-/// workspace cannot silently disable the corpus again.
+/// The reference corpus, if it has been fetched (`cargo xtask fetch`).
 pub fn spec_root() -> Option<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .map(|dir| dir.join("spec"))
-        .find(|p| p.is_dir())
+    option_env!("EN16931_REFERENCE")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
 }
 
 /// `spec_root()`, or `None` — and a failure instead when CI forbids skipping.
 ///
 /// # Panics
-/// When `spec/` is absent and [`REQUIRE`] is set. A skipped corpus run is
-/// indistinguishable from a passing one in exactly the situation that matters.
+/// When the reference corpus is absent and [`REQUIRE`] is set.
 pub fn require(suite: &str) -> Option<PathBuf> {
     match spec_root() {
         Some(p) => Some(p),
@@ -323,10 +318,204 @@ pub fn require(suite: &str) -> Option<PathBuf> {
                  not permitted here. Run `cargo xtask fetch`."
             );
             eprintln!(
-                "note: {suite} SKIPPED — no spec/ directory. Run `cargo xtask fetch`. \
+                "note: {suite} SKIPPED — no reference corpus. Run `cargo xtask fetch`. \
                  Set {REQUIRE}=1 to make this a failure."
             );
             None
         }
     }
+}
+
+/// CEN's CII list for BT-8 (`ram:DueDateTypeCode`, `BR-CL-06` in the CII code
+/// Schematron). `tests/vat_point_date_code.rs` asserts it against the artefact.
+pub const CII_VAT_POINT_DATE_CODES: &[&str] = &["5", "29", "72"];
+
+/// Every `ram:DueDateTypeCode` a written CII document carries is in CEN's CII
+/// list — the model's UNTDID 2005 code never leaks into CII.
+///
+/// # Panics
+/// When one is not, naming `origin`.
+pub fn assert_cii_bt8_spelled_for_cii(origin: &str, xml: &str) {
+    let doc = roxmltree::Document::parse(xml).expect("the writer emits well-formed XML");
+    for n in doc
+        .descendants()
+        .filter(|n| n.tag_name().name() == "DueDateTypeCode")
+    {
+        let code = n.text().unwrap_or_default().trim();
+        assert!(
+            CII_VAT_POINT_DATE_CODES.contains(&code),
+            "{origin}: ram:DueDateTypeCode {code:?} is not in CEN's CII list \
+             {CII_VAT_POINT_DATE_CODES:?}"
+        );
+    }
+}
+
+fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect(&p, out);
+        } else if p.extension().is_some_and(|x| x == "xml") {
+            out.push(p);
+        }
+    }
+}
+
+/// The syntax a document's element names, by its local name; `None` for
+/// anything else, malformed XML included.
+#[must_use]
+pub fn sniff(xml: &str) -> Option<en16931_formats::Syntax> {
+    let mut rest = xml;
+    let name = loop {
+        rest = &rest[rest.find('<')? + 1..];
+        if let Some(body) = rest.strip_prefix("!--") {
+            rest = &body[body.find("-->")? + 3..];
+        } else if rest.starts_with('?') {
+            rest = &rest[rest.find("?>")? + 2..];
+        } else if rest.starts_with('!') {
+            rest = &rest[rest.find('>')? + 1..];
+        } else {
+            break rest
+                .split([' ', '>', '\t', '\n', '\r', '/'])
+                .next()?
+                .rsplit(':')
+                .next()?;
+        }
+    };
+    match name {
+        #[cfg(feature = "ubl")]
+        "Invoice" | "CreditNote" => Some(en16931_formats::Syntax::Ubl),
+        #[cfg(feature = "cii")]
+        "CrossIndustryInvoice" => Some(en16931_formats::Syntax::Cii),
+        _ => None,
+    }
+}
+
+/// Every document of `syntax` in the authority sources, sorted by path.
+///
+/// Empty when the corpus is absent (and a failure under [`REQUIRE`]).
+pub fn authority_documents(syntax: en16931_formats::Syntax, suite: &str) -> Vec<(PathBuf, String)> {
+    let Some(root) = require(suite) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for source in AUTHORITY_SOURCES {
+        collect(&root.join(source), &mut paths);
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|p| {
+            let text = std::fs::read_to_string(&p).ok()?;
+            (sniff(&text) == Some(syntax)).then_some((p, text))
+        })
+        .collect()
+}
+
+/// A derived `billing` document: a 19 % and a 7 % line, a 10 % allowance
+/// apportioned over both VAT groups, and cash rounding to 0.05.
+#[must_use]
+pub fn billing_document() -> billing::Document {
+    use billing::{
+        Adjust, AdjustmentKind, AmountScale, CashRounding, Currency, Document, Line, Percent,
+        Price, Quantity as Qty, Rounding, UnitPrice, Vat,
+    };
+    let vat = |p| Vat::standard(Percent::new(p)).expect("a standard rate");
+    Document::builder(Currency::EUR, AmountScale::EN16931)
+        .default_vat(vat(dec!(19)))
+        .line(Line::new(
+            "Wartung",
+            Qty::new(dec!(3), "HUR"),
+            UnitPrice::new(Price::new(dec!(133.33))),
+        ))
+        .line(Line::fixed("Fachbuch", dec!(100)).with_vat(vat(dec!(7))))
+        .apportion(
+            AdjustmentKind::Allowance,
+            "10 % Rabatt",
+            Adjust::Percent(Percent::new(dec!(10))),
+        )
+        .cash_rounding(CashRounding {
+            increment: dec!(0.05),
+            rounding: Rounding::HalfAwayFromZero,
+        })
+        .build()
+        .expect("a lawful billing document")
+}
+
+/// [`billing_document`] under a core-valid header, through
+/// `billing_adapter::from_billing`.
+#[must_use]
+pub fn billing_invoice() -> Invoice {
+    let party = |name: &str, country: &str| Party {
+        name: Some(name.to_owned()),
+        address: PostalAddress {
+            city: Some("Berlin".to_owned()),
+            post_code: Some("10115".to_owned()),
+            country: Some(Code::new(country)),
+            ..Default::default()
+        },
+        electronic_address: Some(Identifier::schemed("4006381333931", "0088")),
+        vat_identifier: Some(format!("{country}123456789")),
+        ..Default::default()
+    };
+    let header = Invoice::builder(
+        "urn:cen.eu:en16931:2017",
+        "R-2026-0001",
+        d("2026-07-31"),
+        "380",
+        "EUR",
+    )
+    .seller(party("Stadtwerke Musterstadt GmbH", "DE"))
+    .buyer(party("Beispiel AG", "DE"))
+    .due_date(d("2026-08-14"))
+    .build();
+    en16931::billing_adapter::from_billing(&billing_document(), header).expect("converts")
+}
+
+// ── The site's figures ─────────────────────────────────────────────────────
+
+/// A page under `site/content/docs/`, or `None` outside the repository (the
+/// site is not part of a published crate).
+#[must_use]
+pub fn site_page(name: &str) -> Option<String> {
+    std::fs::read_to_string(docs::workspace_root().join("site/content/docs").join(name)).ok()
+}
+
+/// `page` quotes each figure where its pattern (one `<N>`) says, at least once
+/// and never as anything else.
+///
+/// # Panics
+/// On a pattern that matches nothing or a figure that differs.
+pub fn assert_page_states(name: &str, figures: &[(&str, usize)]) {
+    let Some(page) = site_page(name) else {
+        return;
+    };
+    for (pattern, expected) in figures {
+        let found = docs::find_all(pattern, &page);
+        assert!(
+            !found.is_empty(),
+            "{name} no longer matches {pattern:?}; measured {expected}"
+        );
+        assert!(
+            found.iter().all(|n| n == expected),
+            "{name}: {pattern:?} documented as {found:?}, measured {expected}"
+        );
+    }
+}
+
+/// `page` pastes `block`, a suite's printed summary, verbatim.
+///
+/// # Panics
+/// When it does not.
+pub fn assert_page_pastes(name: &str, block: &str) {
+    let Some(page) = site_page(name) else {
+        return;
+    };
+    assert!(
+        page.contains(&format!("```text\n{block}\n```")),
+        "{name} does not paste this output verbatim:\n{block}"
+    );
 }

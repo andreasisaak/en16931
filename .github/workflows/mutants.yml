@@ -1,0 +1,32 @@
+name: Mutation sweep
+
+# The full mutation sweep of the rules, by hand only: optional and slow (about
+# an hour, one mutant at a time). It fails on a survivor the baseline does not
+# record with a reason and on a recorded one that is now caught; the survivors
+# it found are uploaded either way. Pull requests are mutated on their changed
+# lines by the `mutants` job in ci.yml.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants-full:
+    name: Mutation sweep (rules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants,just
+      - run: just mutants
+      - name: Keep what the sweep found
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-full
+          path: target/mutants-full

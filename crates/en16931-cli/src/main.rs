@@ -1,21 +1,19 @@
-//! `en16931` — the European e-invoice, on the command line.
+//! `en16931`: validate, convert, compare, inspect and embed EN 16931
+//! e-invoices (UBL, CII, ZUGFeRD / Factur-X) on the command line.
 //!
-//! Everything the libraries do, without writing any Rust: read a UBL, CII or
-//! ZUGFeRD document, validate it against the core model or a national CIUS,
-//! convert between the two syntaxes, and print the verdict as text, JSON or
-//! SVRL.
+//! # Exit codes
 //!
-//! # Exit codes, because this belongs in a pipeline
+//! `validate` exits with the recommendation `en16931_formats::receive` gives:
 //!
 //! | | |
 //! |---|---|
-//! | `0` | every document passed |
-//! | `1` | a document was read and is **invalid** |
-//! | `2` | a document could not be read at all, or the command was misused |
+//! | `0` | every document is **accepted** |
+//! | `1` | a document is **rejected** — invalid, unreadable bytes, or a BT-24 no profile matches — or **undefined** (ZUGFeRD MINIMUM / BASIC WL: not an EN 16931 invoice) |
+//! | `2` | a file could not be opened, or the command was misused |
 //!
-//! Telling `1` from `2` is the whole point: a CI job that treats "this invoice
-//! is invalid" and "that path does not exist" the same way will eventually ship
-//! an invoice because a mount was missing.
+//! Bytes that are not an invoice are a rejection (`1`); a missing file is `2`.
+
+#![forbid(unsafe_code)]
 
 mod input;
 mod output;
@@ -23,11 +21,12 @@ mod output;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use en16931::validation::profile::Profile;
 use en16931::{Severity, profiles};
+use en16931_formats::{Loss, Policy, Recommendation, Syntax, zugferd};
 
-/// Exit code for "read it, and it is not valid".
+/// Exit code for "rejected", "undefined" or "differs".
 const INVALID: u8 = 1;
 /// Exit code for "could not read it, or the command was wrong".
 const ERROR: u8 = 2;
@@ -47,43 +46,50 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Validate one or more documents.
+    /// Receive one or more documents: validate and decide.
     ///
-    /// Reads UBL, CII and ZUGFeRD/Factur-X PDFs, picking the rule set from the
-    /// document's own BT-24 unless told otherwise.
+    /// Reads UBL, CII and ZUGFeRD/Factur-X PDFs, checks each under the profile
+    /// its own BT-24 declares and, with `--require`, under the profile you
+    /// require, and recommends accept, reject or undefined.
     Validate {
         /// Documents to validate. `-` reads standard input.
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<PathBuf>,
 
-        /// Which rule set to apply: `auto`, or a name from `en16931 profiles`.
+        /// The profile you require, by name from `en16931 profiles` or BT-24.
         ///
-        /// The default reads BT-24 and uses the profile the document declares,
-        /// which is what a receiving system does — validating an XRechnung
-        /// against the bare core model is the most common way to ship a
-        /// document a counterparty then rejects.
-        #[arg(long, short, value_name = "PROFILE", default_value = "auto")]
-        profile: String,
+        /// Adds a second check beside the declared profile (BT-24); a German
+        /// public buyer requires `xrechnung`.
+        #[arg(long, short, value_name = "PROFILE")]
+        require: Option<String>,
+
+        /// Report a rule at another severity: `RULE=fatal|warning|information`.
+        /// Repeatable.
+        ///
+        /// A receiver's deviation, like KoSIT's `customLevel`. Recorded on the
+        /// report; the run cannot produce a proof.
+        #[arg(long, value_name = "RULE=LEVEL")]
+        relevel: Vec<String>,
+
+        /// Skip a rule, by any of its spellings. Repeatable.
+        ///
+        /// Recorded on the report as not checked; the run cannot produce a proof.
+        #[arg(long = "without", value_name = "RULE")]
+        without: Vec<String>,
 
         /// Output shape.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
 
-        /// Treat warnings and information as failures.
+        /// Fail an accepted document that reports anything at all — a warning,
+        /// an unmapped element.
         ///
-        /// Off by default because the authorities do not: KoSIT reports
-        /// `BR-CL-23` at warning on purpose, and a build that fails on it fails
-        /// on invoices Germany accepts.
+        /// Off by default: authorities accept documents with warnings.
         #[arg(long)]
         strict: bool,
 
-        /// Skip a rule, by any of its spellings. Repeatable.
-        ///
-        /// Recorded on the report and printed, and it makes the run unable to
-        /// produce a proof — a deviation you cannot see is worse than one you
-        /// argued for.
-        #[arg(long = "without", value_name = "RULE")]
-        without: Vec<String>,
+        #[command(flatten)]
+        limits: LimitArgs,
 
         /// Print nothing; use the exit code.
         #[arg(long, short)]
@@ -92,9 +98,9 @@ enum Command {
 
     /// Convert a document to the other syntax.
     ///
-    /// The conversion goes through the semantic model, so the output is what
-    /// EN 16931 says the document means — not a transliteration of its
-    /// elements.
+    /// Goes through the semantic model. Anything that would not reach the
+    /// target refuses the conversion unless `--allow-loss` is given; what
+    /// was derived or lost is printed to standard error.
     Convert {
         /// The document to convert. `-` reads standard input.
         #[arg(value_name = "PATH")]
@@ -104,13 +110,13 @@ enum Command {
         #[arg(long, value_enum, value_name = "SYNTAX")]
         to: TargetSyntax,
 
-        /// Validate against this profile first, and stamp BT-24 from it.
-        ///
-        /// Without it the document is written as it stands, which is right when
-        /// you are converting something you did not author. With it, nothing is
-        /// written unless the model passes — see `--profile` on `validate`.
+        /// Convert even when something would be lost, and list it.
+        #[arg(long)]
+        allow_loss: bool,
+
+        /// Convert only a document `validate --require PROFILE` accepts.
         #[arg(long, short, value_name = "PROFILE")]
-        profile: Option<String>,
+        require: Option<String>,
 
         /// Write here instead of standard output.
         #[arg(long, short, value_name = "PATH")]
@@ -119,8 +125,7 @@ enum Command {
 
     /// Extract the XML payload from a ZUGFeRD / Factur-X PDF.
     ///
-    /// The bytes come out verbatim: whoever diagnoses a rejected invoice
-    /// needs what the counterparty sent, not a reconstruction of it.
+    /// The bytes come out verbatim.
     Extract {
         /// The hybrid PDF. `-` reads standard input.
         #[arg(value_name = "PATH")]
@@ -129,14 +134,49 @@ enum Command {
         /// Write here instead of standard output.
         #[arg(long, short, value_name = "PATH")]
         output: Option<PathBuf>,
+
+        #[command(flatten)]
+        limits: LimitArgs,
+    },
+
+    /// Embed an invoice into a PDF/A-3 file: a ZUGFeRD / Factur-X hybrid.
+    ///
+    /// The invoice — UBL, CII or the JSON envelope — is validated under the
+    /// profile its BT-24 declares (or `--profile`), which must be `en16931` or
+    /// `xrechnung`, and written as CII under `factur-x.xml` or `xrechnung.xml`.
+    /// The PDF must already be PDF/A-3: nothing is converted. The result is the
+    /// PDF followed by one incremental update, read back before it is written.
+    ///
+    ///     en16931 embed rendered.pdf invoice.xml -o invoice.pdf
+    #[command(verbatim_doc_comment)]
+    Embed {
+        /// The PDF/A-3 rendering of the invoice.
+        #[arg(value_name = "PDF")]
+        pdf: PathBuf,
+
+        /// The invoice: UBL, CII or the JSON envelope. `-` reads standard input.
+        #[arg(value_name = "INVOICE")]
+        invoice: PathBuf,
+
+        /// Where to write the hybrid PDF.
+        #[arg(long, short, value_name = "PATH")]
+        output: PathBuf,
+
+        /// Validate and embed under this profile instead of the one BT-24
+        /// declares: `en16931` or `xrechnung`.
+        #[arg(long, short, value_name = "PROFILE")]
+        profile: Option<String>,
+
+        /// `/AFRelationship`: `alternative` (German guidance; the default) or
+        /// `source` (PDFlib's for Factur-X sent abroad).
+        #[arg(long, value_enum, default_value_t = RelationshipArg::Alternative)]
+        relationship: RelationshipArg,
     },
 
     /// Compare two documents as invoices, not as XML.
     ///
     /// Both are read into the semantic model first, so a UBL invoice and its
-    /// CII translation compare equal where an XML diff would show two
-    /// unrelated files. That is the question worth asking of a conversion, a
-    /// migration, or a counterparty who says they received something else.
+    /// CII translation compare equal.
     Diff {
         /// The document to compare from. `-` reads standard input.
         #[arg(value_name = "LEFT")]
@@ -154,14 +194,15 @@ enum Command {
 
     /// Say what a document is, without validating it.
     ///
-    /// Syntax, declared profile, the totals, and anything the reader could not
-    /// map. The first command to run on a document you were sent.
+    /// Syntax, declared profile, the totals, and everything the reader had to
+    /// say.
     Inspect {
         /// Documents to inspect. `-` reads standard input.
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<PathBuf>,
 
-        /// Output shape. SVRL is not a document description, so it is refused.
+        /// Output shape. JSON is the report shape with no rules run; SVRL is a
+        /// verdict, so it is refused.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
     },
@@ -178,10 +219,7 @@ enum Command {
 
     /// May these VAT categories share one invoice? Answered before you build it
     ///
-    /// Two of the ten categories are exclusive, and they are the only rules in
-    /// EN 16931 that a set of category codes decides on its own — so this needs
-    /// no document, no amounts and no parties, which is when the question is
-    /// actually asked.
+    /// Needs no document: the exclusivity rules depend on the codes alone.
     ///
     ///     en16931 categories S Z      # ordinary: standard beside zero-rated
     ///     en16931 categories S O      # refused — BR-O-11…14
@@ -197,8 +235,7 @@ enum Command {
 
     /// Print the whole rule catalogue — every id, severity, provenance and text.
     ///
-    /// The thing to diff across releases, feed to a documentation build, or grep
-    /// when a counterparty quotes an id you do not recognise.
+    /// Derived from the registry; diff it across releases.
     Rules {
         /// Only rules a profile runs, by name or BT-24. Default: everything.
         #[arg(long, short, value_name = "PROFILE")]
@@ -218,15 +255,39 @@ enum Command {
     ///     en16931 generate bash > /usr/share/bash-completion/completions/en16931
     ///     en16931 generate man  > /usr/share/man/man1/en16931.1
     //
-    // `verbatim_doc_comment`, because clap reflows long help to the terminal
-    // width and a reflowed shell command is not one. Everything above is
-    // already wrapped for a narrow terminal, so nothing else loses by it.
+    // `verbatim_doc_comment`: clap would reflow the shell commands above.
     #[command(verbatim_doc_comment)]
     Generate {
         /// What to write to standard output.
         #[arg(value_name = "WHAT")]
         what: Generate,
     },
+}
+
+/// The bounds a hybrid PDF is extracted under. The defaults are the
+/// library's; lower them for a service that receives from strangers.
+#[derive(Args)]
+struct LimitArgs {
+    /// The most bytes any one PDF stream may inflate to.
+    #[arg(long, value_name = "BYTES", default_value_t = zugferd::Limits::DEFAULT_MAX_STREAM_BYTES)]
+    max_stream_bytes: usize,
+
+    /// The most bytes one PDF may inflate in all.
+    #[arg(long, value_name = "BYTES", default_value_t = zugferd::Limits::DEFAULT_MAX_TOTAL_BYTES)]
+    max_total_bytes: usize,
+
+    /// The most PDF objects one walk may visit.
+    #[arg(long, value_name = "COUNT", default_value_t = zugferd::Limits::DEFAULT_MAX_OBJECTS)]
+    max_objects: usize,
+}
+
+impl LimitArgs {
+    fn limits(&self) -> zugferd::Limits {
+        zugferd::Limits::new()
+            .with_max_stream_bytes(self.max_stream_bytes)
+            .with_max_total_bytes(self.max_total_bytes)
+            .with_max_objects(self.max_objects)
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -253,10 +314,18 @@ enum Generate {
 enum Format {
     /// For a person.
     Text,
-    /// The stable interchange shape — see `en16931::report`.
+    /// The interchange shape, `en16931-report/4` — see `en16931::report`.
     Json,
     /// What every Schematron tool in this field speaks.
     Svrl,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RelationshipArg {
+    /// The XML is another representation of the same invoice.
+    Alternative,
+    /// The pages were produced from the XML.
+    Source,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -277,12 +346,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Whether an I/O failure is just the reader having gone away.
-///
-/// `en16931 convert x.xml --to cii | head` closes the pipe, and Rust's default
-/// is to report that as an error on stderr. It is not one: the user asked for
-/// the first few lines and got them. Every well-behaved command-line tool is
-/// silent here.
+/// Whether an I/O failure is the reader having gone away (`… | head`), which
+/// is not reported.
 fn is_broken_pipe(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::BrokenPipe
 }
@@ -291,19 +356,44 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
         Command::Validate {
             paths,
-            profile,
+            require,
+            relevel,
+            without,
             format,
             strict,
-            without,
+            limits,
             quiet,
-        } => validate(&paths, &profile, format, strict, &without, quiet),
+        } => {
+            let policy = Policy {
+                require: require.as_deref().map(resolve).transpose()?,
+                relevel: relevel
+                    .iter()
+                    .map(|r| relevelling(r))
+                    .collect::<Result<_, _>>()?,
+                without,
+                limits: limits.limits(),
+            };
+            validate(&paths, &policy, format, strict, quiet)
+        }
         Command::Convert {
             path,
             to,
-            profile,
+            allow_loss,
+            require,
             output,
-        } => convert(&path, to, profile.as_deref(), output.as_deref()),
-        Command::Extract { path, output } => extract(&path, output.as_deref()),
+        } => convert(&path, to, allow_loss, require.as_deref(), output.as_deref()),
+        Command::Extract {
+            path,
+            output,
+            limits,
+        } => extract(&path, output.as_deref(), &limits.limits()),
+        Command::Embed {
+            pdf,
+            invoice,
+            output,
+            profile,
+            relationship,
+        } => embed(&pdf, &invoice, &output, profile.as_deref(), relationship),
         Command::Inspect { paths, format } => inspect(&paths, format),
         Command::Diff {
             left,
@@ -335,11 +425,11 @@ fn rules(
     format: CatalogueFormat,
 ) -> Result<ExitCode, String> {
     let profile = match profile {
-        Some(name) => Some(resolve(name)?.ok_or("--profile auto is not meaningful here")?),
+        Some(name) => Some(resolve(name)?),
         None => None,
     };
     let term = match term {
-        // `BT-117` and `117` are the same question asked by two kinds of user.
+        // `BT-117` and `117` are the same term.
         Some(t) => Some(
             t.trim_start_matches("BT-")
                 .trim_start_matches("bt-")
@@ -385,156 +475,220 @@ fn generate(what: Generate) -> Result<ExitCode, String> {
 
 fn validate(
     paths: &[PathBuf],
-    profile: &str,
+    policy: &Policy,
     format: Format,
     strict: bool,
-    without: &[String],
     quiet: bool,
 ) -> Result<ExitCode, String> {
-    let selected = resolve(profile)?;
     let mut worst = ExitCode::SUCCESS;
-    let mut reports = Vec::new();
+    let mut results = Vec::new();
 
     for path in paths {
-        let loaded = input::load(path).map_err(|e| e.to_string())?;
-        // `auto` asks the document. §7.6 exists for exactly this: BT-24 is there
-        // so a receiver can apply the rules the sender generated under.
-        let profile = selected.unwrap_or_else(|| declared(&loaded.invoice));
-        let report = if without.is_empty() {
-            profile.validate(&loaded.invoice)
-        } else {
-            let mut check = en16931::validation::Check::new(profile);
-            for rule in without {
-                check = check.without(rule.clone());
-            }
-            check.run(&loaded.invoice)
-        };
-        let failed = !report.is_valid()
-            || (strict
-                && report
-                    .findings()
-                    .iter()
-                    .any(|f| f.severity != Severity::Fatal));
-        if failed {
+        let bytes = input::bytes(path)?;
+        let received = en16931_formats::receive(&bytes, policy);
+        let accepted = received.recommendation == Recommendation::Accept
+            && !(strict && reports_anything(&received));
+        if !accepted {
             worst = ExitCode::from(INVALID);
         }
-        reports.push((loaded, report));
+        results.push((path.clone(), received));
     }
 
     if !quiet {
         let mut out = String::new();
-        output::validation(&mut out, &reports, format);
+        output::validation(&mut out, &results, format);
         write_out(None, out.as_bytes())?;
     }
     Ok(worst)
 }
 
-/// The profile a document declares, falling back to the core model.
-///
-/// Never a guess: an unknown BT-24 means the sender used a usage specification
-/// this build does not carry, and checking it against the core rules is the
-/// most that can honestly be said about it.
-fn declared(invoice: &en16931::Invoice) -> &'static Profile {
-    invoice
-        .specification_id
-        .as_deref()
-        .and_then(profiles::for_specification_id)
-        .unwrap_or(&profiles::EN16931)
+/// Whether either report holds anything at all — what `--strict` fails on.
+fn reports_anything(r: &en16931_formats::Received) -> bool {
+    std::iter::once(&r.report_declared)
+        .chain(&r.report_required)
+        .any(|rep| rep.most_severe().is_some())
 }
 
-/// Resolve `--profile`. `auto` yields `None`, meaning "ask each document".
-///
-/// By slug, display name or BT-24 — see [`profiles::lookup`]. The slug is the
-/// one a person types: the display name is `XRechnung 3.0`, and a profile
-/// selector that every shell needs quoted is a profile selector people get
-/// wrong.
-fn resolve(name: &str) -> Result<Option<&'static Profile>, String> {
-    if name.eq_ignore_ascii_case("auto") {
-        return Ok(None);
-    }
-    profiles::lookup(name).map(Some).ok_or_else(|| {
-        let known: Vec<&str> = profiles::ALL.iter().map(|p| p.slug).collect();
-        format!(
-            "unknown profile {name:?}. Known: auto, {} \
-             (or a profile's full name, or its BT-24 identifier)",
-            known.join(", ")
-        )
-    })
+/// Resolve a profile by slug, display name, alias or BT-24, via the library's
+/// parser.
+fn resolve(name: &str) -> Result<&'static Profile, String> {
+    name.parse()
+        .map_err(|e: profiles::UnknownProfile| e.to_string())
+}
+
+/// `BR-CL-23=warning` → the rule and its new severity.
+fn relevelling(arg: &str) -> Result<(String, Severity), String> {
+    let (rule, level) = arg
+        .split_once('=')
+        .ok_or_else(|| format!("--relevel {arg:?}: expected RULE=LEVEL, as BR-CL-23=warning"))?;
+    let level = level
+        .parse::<Severity>()
+        .map_err(|e| format!("--relevel {arg:?}: {e}"))?;
+    Ok((rule.trim().to_owned(), level))
 }
 
 // ── convert ──────────────────────────────────────────────────────────────────
 
 fn convert(
-    path: &std::path::Path,
+    path: &Path,
     to: TargetSyntax,
-    profile: Option<&str>,
-    out: Option<&std::path::Path>,
+    allow_loss: bool,
+    require: Option<&str>,
+    out: Option<&Path>,
 ) -> Result<ExitCode, String> {
-    let loaded = input::load(path).map_err(|e| e.to_string())?;
-    let profile = match profile {
-        Some(name) => Some(resolve(name)?.ok_or("--profile auto is not meaningful here")?),
-        None => None,
-    };
+    let bytes = input::bytes(path)?;
+    if let Some(name) = require {
+        let policy = Policy {
+            require: Some(resolve(name)?),
+            ..Policy::default()
+        };
+        let received = en16931_formats::receive(&bytes, &policy);
+        if received.recommendation != Recommendation::Accept {
+            eprintln!("en16931: not converted: {}\n{received}", path.display());
+            return Ok(ExitCode::from(INVALID));
+        }
+    }
 
-    // `ubl::Written` and `cii::Written` are distinct types with the same two
-    // fields, so each arm reduces to that pair rather than to a common type
-    // neither crate declares.
-    let written: Result<(String, Vec<String>), String> = match (to, profile) {
-        (TargetSyntax::Ubl, None) => {
-            let w = en16931_formats::ubl::write(&loaded.invoice);
-            Ok((w.xml, w.dropped))
-        }
-        (TargetSyntax::Cii, None) => {
-            let w = en16931_formats::cii::write(&loaded.invoice);
-            Ok((w.xml, w.dropped))
-        }
-        (TargetSyntax::Ubl, Some(p)) => en16931_formats::ubl::write_for(&loaded.invoice, p)
-            .map(|w| (w.xml, w.dropped))
-            .map_err(|e| format!("{e}\n{}", e.report())),
-        (TargetSyntax::Cii, Some(p)) => en16931_formats::cii::write_for(&loaded.invoice, p)
-            .map(|w| (w.xml, w.dropped))
-            .map_err(|e| format!("{e}\n{}", e.report())),
+    let syntax = match to {
+        TargetSyntax::Ubl => Syntax::Ubl,
+        TargetSyntax::Cii => Syntax::Cii,
     };
-    let (xml, dropped) = match written {
-        Ok(pair) => pair,
-        Err(message) => {
-            eprintln!("en16931: {message}");
+    let loss = if allow_loss {
+        Loss::Allow
+    } else {
+        Loss::Refuse
+    };
+    let converted = match en16931_formats::convert(&bytes, syntax, loss) {
+        Ok(c) => c,
+        Err(en16931_formats::ConvertError::Read(e)) => {
+            return Err(format!("{}: {e}", path.display()));
+        }
+        Err(en16931_formats::ConvertError::Lossy { lost }) => {
+            eprintln!(
+                "en16931: {}: not converted — {} item(s) would be lost; \
+                 --allow-loss converts and lists them",
+                path.display(),
+                lost.len()
+            );
+            for e in &lost {
+                eprintln!("  {e}");
+            }
+            return Ok(ExitCode::from(INVALID));
+        }
+        Err(en16931_formats::ConvertError::Unwritable(u)) => {
+            eprintln!("en16931: {}: {u}", path.display());
+            for e in &u.entries {
+                eprintln!("  {e}");
+            }
             return Ok(ExitCode::from(INVALID));
         }
     };
 
-    // Anything the target syntax could not carry goes to stderr, so a redirected
-    // stdout is the document and nothing else — and the loss is still visible.
-    for d in &dropped {
-        eprintln!("en16931: dropped, unrepresentable in the target syntax: {d}");
+    // Reader and writer entries go to stderr; stdout is only the document.
+    for e in converted.report.entries().chain(&converted.written) {
+        eprintln!("en16931: {e}");
     }
-    for n in &loaded.notes {
-        eprintln!("en16931: {n}");
+    if !converted.report.is_valid() {
+        eprintln!(
+            "en16931: the source is not valid as it declares itself; \
+             `en16931 validate` says why"
+        );
     }
-    write_out(out, xml.as_bytes())?;
+    write_out(out, converted.document.as_bytes())?;
     Ok(ExitCode::SUCCESS)
 }
 
 // ── extract ──────────────────────────────────────────────────────────────────
 
-fn extract(path: &std::path::Path, out: Option<&std::path::Path>) -> Result<ExitCode, String> {
-    let bytes = if path == std::path::Path::new("-") {
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("-: {e}"))?;
-        buf
-    } else {
-        std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?
-    };
-    let got = en16931_formats::zugferd::extract(&bytes)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+fn extract(path: &Path, out: Option<&Path>, limits: &zugferd::Limits) -> Result<ExitCode, String> {
+    let bytes = input::bytes(path)?;
+    let got = zugferd::extract(&bytes, limits).map_err(|e| format!("{}: {e}", path.display()))?;
     for d in &got.divergence {
         eprintln!("en16931: {d}");
     }
-    write_out(out, got.xml.as_bytes())?;
+    write_out(out, &got.xml)?;
     Ok(ExitCode::SUCCESS)
+}
+
+// ── embed ────────────────────────────────────────────────────────────────────
+
+fn embed(
+    pdf: &Path,
+    invoice: &Path,
+    out: &Path,
+    profile: Option<&str>,
+    relationship: RelationshipArg,
+) -> Result<ExitCode, String> {
+    use en16931::profiles::{En16931, XRechnung};
+    use en16931::validation::profile::Validated;
+
+    let pdf_bytes = input::bytes(pdf)?;
+    let bytes = input::bytes(invoice)?;
+    let model = if bytes.trim_ascii_start().starts_with(b"{") {
+        serde_json::from_slice::<en16931::Invoice>(&bytes)
+            .map_err(|e| format!("{}: {e}", invoice.display()))?
+    } else {
+        en16931_formats::read(&bytes)
+            .map_err(|e| format!("{}: {e}", invoice.display()))?
+            .invoice
+    };
+    let target = match profile {
+        Some(name) => resolve(name)?,
+        None => match profiles::classify(model.specification_id.as_deref()).profile() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "en16931: {}: BT-24 names no profile this build knows; pass --profile en16931 or xrechnung",
+                    invoice.display()
+                );
+                return Ok(ExitCode::from(INVALID));
+            }
+        },
+    };
+    let options = zugferd::EmbedOptions {
+        relationship: match relationship {
+            RelationshipArg::Alternative => zugferd::Relationship::Alternative,
+            RelationshipArg::Source => zugferd::Relationship::Source,
+        },
+        ..zugferd::EmbedOptions::default()
+    };
+    let result = if std::ptr::eq(target, &profiles::EN16931) {
+        match Validated::<En16931>::new(model) {
+            Ok(proof) => zugferd::embed(&pdf_bytes, &proof, &options),
+            Err(rejected) => return Ok(not_valid(invoice, rejected.report())),
+        }
+    } else if std::ptr::eq(target, &profiles::XRECHNUNG) {
+        match Validated::<XRechnung>::new(model) {
+            Ok(proof) => zugferd::embed(&pdf_bytes, &proof, &options),
+            Err(rejected) => return Ok(not_valid(invoice, rejected.report())),
+        }
+    } else {
+        eprintln!(
+            "en16931: {}: {} has no ZUGFeRD / Factur-X carrier; embed writes EN 16931 and XRechnung",
+            invoice.display(),
+            target.id
+        );
+        return Ok(ExitCode::from(INVALID));
+    };
+    match result {
+        Ok(hybrid) => {
+            write_out(Some(out), &hybrid)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            eprintln!("en16931: {}: not embedded: {e}", pdf.display());
+            Ok(ExitCode::from(INVALID))
+        }
+    }
+}
+
+/// An invoice that does not pass the profile it is embedded under.
+fn not_valid(path: &Path, report: &en16931::ValidationReport) -> ExitCode {
+    eprintln!(
+        "en16931: {}: not embedded — the invoice is not valid\n{report}",
+        path.display()
+    );
+    ExitCode::from(INVALID)
 }
 
 // ── inspect ──────────────────────────────────────────────────────────────────
@@ -542,7 +696,7 @@ fn extract(path: &std::path::Path, out: Option<&std::path::Path>) -> Result<Exit
 fn inspect(paths: &[PathBuf], format: Format) -> Result<ExitCode, String> {
     let mut loaded = Vec::new();
     for path in paths {
-        loaded.push(input::load(path).map_err(|e| e.to_string())?);
+        loaded.push(input::load(path)?);
     }
     let mut out = String::new();
     match format {
@@ -562,31 +716,15 @@ fn inspect(paths: &[PathBuf], format: Format) -> Result<ExitCode, String> {
 
 // ── diff ─────────────────────────────────────────────────────────────────────
 
-/// Compare two documents as invoices.
+/// Compare two documents as invoices, through the model, so different
+/// syntaxes carrying the same invoice compare equal.
 ///
-/// # Why this is a comparison nothing XML-first can make
-///
-/// `diff a.xml b.xml` on two e-invoices answers a question nobody asked. The
-/// same invoice written as UBL and as CII shares almost no text; the same
-/// invoice written twice by the same system differs in whitespace, element
-/// order and optional wrappers. What a person actually wants to know is
-/// *"do these say the same thing?"*, and that is a question about the model.
-///
-/// So both sides are read into an [`Invoice`](en16931::Invoice) first. Two
-/// documents in **different syntaxes** compare equal when they carry the same
-/// invoice — which is the whole point of a conversion, and the thing you would
-/// otherwise verify by reading.
-///
-/// # Exit codes
-///
-/// `0` identical, `1` they differ, `2` one could not be read. Same shape as
-/// `validate`, and for the same reason: a pipeline has to tell "the answer is
-/// no" from "I could not answer".
+/// Exits `0` identical, `1` they differ, `2` one could not be read.
 fn diff(left: &Path, right: &Path, format: Format) -> Result<ExitCode, String> {
-    let a = input::load(left).map_err(|e| e.to_string())?;
-    let b = input::load(right).map_err(|e| e.to_string())?;
+    let a = input::load(left)?;
+    let b = input::load(right)?;
 
-    let differences = output::model_differences(&a.invoice, &b.invoice)?;
+    let differences = output::model_differences(&a.read.invoice, &b.read.invoice)?;
     let mut out = String::new();
     match format {
         Format::Text => output::diff_text(&mut out, &a, &b, &differences),
@@ -614,9 +752,7 @@ fn explain(query: &str) -> Result<ExitCode, String> {
         write_out(None, out.as_bytes())?;
         return Ok(ExitCode::SUCCESS);
     }
-    // Restrictions are data rather than predicates, so they are not rules — and
-    // they appear in reports under their real ids, so a user holding one
-    // deserves an answer rather than "no such rule".
+    // Profile restrictions (§7.3.2) are not rules but are reported under ids.
     if let Some((profile, restriction)) = en16931::validation::rules::explain_restriction(query) {
         output::restriction(&mut out, profile, restriction);
         write_out(None, out.as_bytes())?;
@@ -624,29 +760,18 @@ fn explain(query: &str) -> Result<ExitCode, String> {
     }
     Err(format!(
         "no rule or restriction called {query:?}. Ids are matched loosely — \
-         `BR-CO-3`, `BR-CO-03` and `br-co-3` are the same rule, and the \
-         standard's `BR-IG-*` / `BR-IP-*` reach the artefacts' `BR-AF-*` / \
-         `BR-AG-*`."
+         `BR-CO-3`, `BR-CO-03` and `br-co-3` are the same rule. The IGIC and \
+         IPSI rules are `BR-AF-*` and `BR-AG-*`."
     ))
 }
 
-/// `en16931 categories S O` — may these share one invoice?
-///
-/// # Why this is a command and not a flag on `validate`
-///
-/// It takes **no document**. The whole value is answering before one exists:
-/// a caller choosing what to put on an invoice, or a service deciding whether
-/// a set of charges can be billed together at all. Wiring it into `validate`
-/// would require the document the question exists to avoid building.
+/// `en16931 categories S O`: may these share one invoice? Takes no document.
 fn categories(codes: &[String]) -> Result<ExitCode, String> {
     let mut cats = Vec::with_capacity(codes.len());
     for code in codes {
         let cat = en16931::VatCategory::from_code(code).ok_or_else(|| {
-            // Built rather than continued with `\`. A `\`-continued literal
-            // keeps its own indentation and `rustfmt` bakes it in — which is
-            // how a run of 32 spaces once shipped inside this workspace's
-            // attribution notice, and how it got into this message on the first
-            // attempt at writing it.
+            // Built with `push_str`: `rustfmt` would bake indentation into a
+            // `\`-continued literal.
             let known: Vec<&str> = en16931::VatCategory::ALL.iter().map(|c| c.code()).collect();
             let mut msg = format!("{code:?} is not a VAT category code. ");
             msg.push_str("EN 16931 has ten, and BR-CL-17 compares them literally, so they are ");
@@ -668,14 +793,9 @@ fn categories(codes: &[String]) -> Result<ExitCode, String> {
 
 // ── shared ───────────────────────────────────────────────────────────────────
 
-/// The one place anything reaches standard output.
+/// The one place anything reaches standard output (or `path`).
 ///
-/// Every command builds its output into a `String` and hands it here, rather
-/// than calling `println!`. That is not tidiness: `println!` **panics** when the
-/// reader has gone away, so `en16931 rules | head` printed a Rust backtrace
-/// where every other command-line tool prints nothing. Funnelling the writes
-/// makes the one place that has to know about `BrokenPipe` the one place that
-/// does, and makes each command a single `write(2)`.
+/// Not `println!`, which panics on a closed pipe; a broken pipe is silent here.
 fn write_out(path: Option<&std::path::Path>, bytes: &[u8]) -> Result<(), String> {
     match path {
         Some(p) => std::fs::write(p, bytes).map_err(|e| format!("{}: {e}", p.display())),

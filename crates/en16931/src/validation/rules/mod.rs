@@ -1,30 +1,14 @@
 //! The EN 16931 core rule set.
 //!
-//! # The three tolerance regimes
-//!
-//! This is the detail that is impossible to get right from the standard's prose
-//! alone, and where a hand-written engine most easily diverges from the
-//! Schematron everyone else runs:
+//! Three tolerance regimes, none of them in the standard's prose:
 //!
 //! | Regime | Rules | Tolerance | Whose |
 //! |---|---|---|---|
-//! | Totals chain | `BR-CO-10` … `BR-CO-16` | **exact** | CEN |
-//! | VAT derivation | `BR-CO-17`, `BR-S-08/09`, `BR-AF/AG-08/09` | **±1.00**, on absolute values | CEN artefacts |
-//! | Line & allowance derivation | `PEPPOL-EN16931-R120`, `-R040` | **±0.02** | Peppol |
+//! | Totals chain | `BR-CO-10` … `BR-CO-16` | exact | CEN |
+//! | VAT derivation | `BR-CO-17`, `BR-S-08/09`, `BR-AF/AG-08/09` | ±1.00 | CEN artefacts |
+//! | Line & allowance derivation | `PEPPOL-EN16931-R120`, `-R040` | ±0.02 | Peppol |
 //!
-//! They are not interchangeable. Checking the VAT derivation exactly rejects
-//! invoices every real validator accepts; applying its tolerance to `BR-CO-14`
-//! accepts invoices every real validator rejects.
-//!
-//! **None of the tolerance is in the standard.** EN 16931-1 §6.4.2 states
-//! `BR-CO-17` as a plain equation — *"= BT-116 x (BT-119 / 100), rounded to two
-//! decimals"* — with no slack at all. The ±1.00 is an artefact decision and the
-//! ±0.02 a Peppol one, which is why [`Source`] is recorded per rule.
-//!
-//! And *"rounded"* is a fourth thing that is not what it looks like: the
-//! artefacts round the way XPath does, ties towards +∞, which no
-//! `rust_decimal::RoundingStrategy` reproduces. That lives in `arith`, beside
-//! the tolerance it shares with all nine category tables.
+//! Rounding follows XPath (ties towards +∞); see `arith`.
 
 use rust_decimal::Decimal;
 
@@ -259,9 +243,7 @@ rule!(BR_48, "BR-48", Fatal, Both, terms: [bt::VAT_RATE],
  is not subject to VAT.",
 |inv, f| {
     for (i, e) in inv.vat_breakdown.iter().enumerate() {
-        // "not subject to VAT" is category O — and note this is BT-119, a
-        // different term from BT-152. XRechnung's BR-DE-14 requires BT-119
-        // unconditionally, which is a profile rule, not this one.
+        // "Not subject to VAT" is category O.
         let exempt_from_the_requirement = e.semantics() == Some(VatCategory::OutOfScope);
         if e.rate.is_none() && !exempt_from_the_requirement {
             f.at(Path::at_term(Group::VatBreakdown, i, bt::VAT_RATE));
@@ -279,7 +261,7 @@ rule!(BR_CO_18, "BR-CO-18", Fatal, Both, terms: [],
 
 // ── The totals chain — EXACT ──────────────────────────────────────────────────
 
-/// Sum, reporting overflow as a finding rather than panicking.
+/// Checked sum; `None` on overflow (the rule then reports nothing).
 fn sum(amounts: impl IntoIterator<Item = InvoiceAmount>) -> Option<InvoiceAmount> {
     InvoiceAmount::checked_sum(amounts).ok()
 }
@@ -304,8 +286,7 @@ rule!(BR_CO_11, "BR-CO-11", Fatal, Both, terms: [bt::ALLOWANCE_TOTAL, bt::ALLOWA
     let Some(expected) = sum(inv.allowances.iter().map(|a| a.amount)) else { return };
     match inv.totals.allowance_total {
         Some(stated) if stated != expected => f.arithmetic(path, expected, stated),
-        // Absent is not zero: BT-107 may be omitted only when there are no
-        // allowances at all.
+        // BT-107 may be omitted only when there are no allowances.
         None if !inv.allowances.is_empty() => f.arithmetic(path, expected, "absent"),
         _ => {}
     }
@@ -351,8 +332,7 @@ rule!(BR_CO_14, "BR-CO-14", Fatal, Both, terms: [bt::VAT_TOTAL, bt::VAT_TAX_AMOU
     let path = Path::group_term(Group::Totals, bt::VAT_TOTAL);
     let Some(expected) = sum(inv.vat_breakdown.iter().map(|e| e.tax_amount)) else { return };
     match inv.totals.vat_total {
-        // EXACT. Applying the VAT-derivation tolerance here would accept
-        // invoices every validator rejects.
+        // Exact, no tolerance.
         Some(stated) if stated != expected => f.arithmetic(path, expected, stated),
         None if !expected.is_zero() => f.arithmetic(path, expected, "absent"),
         _ => {}
@@ -402,10 +382,8 @@ rule!(BR_CO_17, "BR-CO-17", Fatal, Both, terms: [bt::VAT_TAX_AMOUNT, bt::VAT_TAX
         let path = Path::at_term(Group::VatBreakdown, i, bt::VAT_TAX_AMOUNT);
         let rate = e.rate.map_or(Decimal::ZERO, |r| r.into_decimal());
 
-        // The artefact's zero-rate branch: if the rate rounds to zero, the
-        // tax must round to zero — checked WITHOUT tolerance. Both roundings
-        // are XPath's, which is why they go through `xpath_round`; a rate of
-        // exactly 0.5 % is the case that tells the two apart.
+        // The artefact's zero-rate branch: if the rate rounds to zero, the tax
+        // must round to zero, without tolerance (XPath rounding).
         if xpath_round(rate) == Decimal::ZERO {
             if xpath_round(e.tax_amount.into_decimal()) != Decimal::ZERO {
                 f.arithmetic(path, "0", e.tax_amount);
@@ -413,12 +391,8 @@ rule!(BR_CO_17, "BR-CO-17", Fatal, Both, terms: [bt::VAT_TAX_AMOUNT, bt::VAT_TAX
             continue;
         }
 
-        // `abs()` on BOTH sides, which is what lets a credit note pass, then
-        // a full currency unit of slack. Not in the standard — see the
-        // module docs — but it is what every validator runs.
-        //
-        // `continue`, not `return`: one group whose product overflows must not
-        // silence the rule for every group after it.
+        // Absolute values on both sides, ±1.00. On overflow, skip this group
+        // only.
         let Some(expected) = derived_vat(e.taxable_amount.into_decimal(), rate) else {
             continue;
         };
@@ -429,19 +403,14 @@ rule!(BR_CO_17, "BR-CO-17", Fatal, Both, terms: [bt::VAT_TAX_AMOUNT, bt::VAT_TAX
     }
 });
 
-// ── Category rules ────────────────────────────────────────────────────────────
-
 // ── Code lists ────────────────────────────────────────────────────────────────
 
 rule!(BR_CL_01, "BR-CL-01", Fatal, ArtefactOnly, terms: [bt::TYPE_CODE],
 "The document type code MUST be coded by the invoice and credit note related code lists of \
  UNTDID 1001.",
 |inv, f| {
-    // Two lists, selected by the document's kind: 50 codes for an invoice, 13
-    // for a credit note, overlapping only in `81`. The artefact expresses this
-    // as a `self::` disjunction over the two UBL elements; `DocumentKind` is
-    // the same distinction without the syntax, so the check is **exact** — an
-    // invoice carrying `381` is invalid here, as it is in UBL.
+    // The invoice or credit-note list, chosen by `DocumentKind` as the
+    // artefact chooses by UBL root element.
     let list = match inv.kind {
         crate::invoice::DocumentKind::Invoice => lists::INVOICE_TYPE_CODES,
         crate::invoice::DocumentKind::CreditNote => lists::CREDIT_NOTE_TYPE_CODES,
@@ -506,11 +475,8 @@ rule!(BR_CO_25, "BR-CO-25", Fatal, StandardOnly, terms: [bt::DUE, bt::DUE_DATE, 
 "In case the Amount due for payment (BT-115) is positive, either the Payment due date (BT-9) \
  or the Payment terms (BT-20) shall be present.",
 |inv, f| {
-    // **Invoices only.** The artefact binds this to `ubl-invoice:Invoice`, and
-    // CEN's conformance suite spells it out with six cases titled *"Verify that
-    // rule does not fire on Credit Notes"* — including one with a positive
-    // payable amount. A credit note states what is owed *back*, so a due date
-    // for paying it is not the sender's to give.
+    // Invoices only: the artefact binds this to `ubl-invoice:Invoice`, and
+    // CEN's conformance suite has credit-note cases where it must not fire.
     if is_credit_note(inv) {
         return;
     }
@@ -518,10 +484,6 @@ rule!(BR_CO_25, "BR-CO-25", Fatal, StandardOnly, terms: [bt::DUE, bt::DUE_DATE, 
         && inv.due_date.is_none()
         && inv.payment_terms.as_deref().is_none_or(str::is_empty)
     {
-        // The rule names both terms; the hint names the two *methods*, because
-        // an engine that computes an amount and leaves terms to an ERP reads
-        // "shall be present" and has no idea which of the two it is expected to
-        // fill in, nor that BT-20 is free text it may simply state.
         f.at_with_hint(
             Path::term(bt::DUE_DATE),
             "set BT-9 with `InvoiceBuilder::due_date`, or state BT-20 as free text with \
@@ -531,16 +493,13 @@ rule!(BR_CO_25, "BR-CO-25", Fatal, StandardOnly, terms: [bt::DUE, bt::DUE_DATE, 
     }
 });
 
-/// Whether this document is a credit note.
-///
-/// Reads [`crate::invoice::DocumentKind`], not BT-3: CEN's conformance suite
-/// has credit-note cases with no BT-3 at all, and `BR-CO-25` must not fire on
-/// them.
+/// Whether this document is a credit note, by [`crate::invoice::DocumentKind`]
+/// rather than BT-3 (which may be absent).
 pub(crate) fn is_credit_note(inv: &Invoice) -> bool {
     inv.kind == crate::invoice::DocumentKind::CreditNote
 }
 
-// ── Ours, namespaced so it can never be mistaken for CEN's ────────────────────
+// ── This crate's own rules, namespaced `EN-*` ─────────────────────────────────
 
 rule!(EN_CURRENCY_01, "EN-CURRENCY-01", Fatal, Crate, terms: [bt::CURRENCY],
 "The Invoice currency code (BT-5) shall not be XXX. ISO 4217 XXX means \"no currency \
@@ -560,8 +519,7 @@ rule!(EN_EXT_01, "EN-EXT-01", Warning, Crate, terms: [bt::PAID],
  payable a second time. Either target a profile that carries it, or bill the residual \
  instead and list no advances.",
 |inv, f| {
-    // Core has no extension support at all, so any populated group warns.
-    // A profile-aware run narrows this — see `Profile::validate`.
+    // Any populated group warns; `Profile::validate` narrows this.
     if !inv.extensions.is_empty() {
         f.at(Path::term(bt::PAID));
     }
@@ -573,16 +531,8 @@ rule!(EN_EXT_02, "EN-EXT-02", Fatal, Crate, terms: [bt::LINE_ID],
  index past the end of BG-25 names nothing: the group is invisible to BR-DEX-02 and BR-DEX-03, \
  and no writer will emit it. Re-key it, or remove it.",
 |inv, f| {
-    // **This crate's own**, because the hazard is this crate's own modelling
-    // choice: `Extensions::sub_invoice_lines` is keyed by line *index*, so a
-    // caller that removes or reorders a line leaves the key pointing at the
-    // wrong one — or at nothing.
-    //
-    // Nothing else notices. `BR-DEX-02` and `BR-DEX-03` iterate the lines and
-    // ask for each one's sub-lines, so an out-of-range group is never visited;
-    // the writer does the same, so it is never emitted. Data that validates
-    // clean and does not survive being written down is the failure mode this
-    // whole crate is built against, so it is a finding.
+    // `Extensions::sub_invoice_lines` is keyed by line index; an
+    // out-of-range key is skipped by `BR-DEX-02/03` and by the writer.
     for (index, subs) in &inv.extensions.sub_invoice_lines {
         if !subs.is_empty() && *index >= inv.lines.len() {
             f.arithmetic(
@@ -639,22 +589,12 @@ static GENERAL: &[&Rule] = &[
     &EN_EXT_02,
 ];
 
-/// The EN 16931 core rule set — **all 223 syntax-independent ids** of the
-/// pinned CEN artefacts, plus this crate's own `EN-*` rules.
+/// The EN 16931 core rule set — every syntax-independent id of the pinned CEN
+/// artefacts, `BR-CO-25`, and this crate's own `EN-*` rules.
 ///
-/// Complete, and measured rather than claimed:
-/// `the_registry_covers_the_syntax_independent_artefacts` in `tests/codelists.rs`
-/// diffs this list against the artefacts on any machine that has them, and CI
-/// runs it with `EN16931_REQUIRE_SPEC=1` so it cannot skip.
-///
-/// "Complete" does not mean every rule has a predicate: 53 are retired by the
-/// model's types and four are undecidable — CEN's own binding for them is
-/// `value="true()"`. Both kinds are registered so [`explain`] resolves them and
-/// a report can state they were checked. See
-/// [`structural`] for the list and the reasoning.
-///
-/// [`crate::validation::ValidationReport::rules_checked`] reports what a given
-/// run covered, which for a profile is this set plus its own.
+/// 37 are retired by the model's types and four are undecidable (CEN binds
+/// them to `true()`); both are registered with a constant-pass evaluation.
+/// See [`structural`].
 pub static CORE: std::sync::LazyLock<Vec<&'static Rule>> = std::sync::LazyLock::new(|| {
     GENERAL
         .iter()
@@ -666,10 +606,8 @@ pub static CORE: std::sync::LazyLock<Vec<&'static Rule>> = std::sync::LazyLock::
         .collect()
 });
 
-/// Every rule this crate can report, core **and** profile.
-///
-/// `CORE` alone is not that set: `PEPPOL-EN16931-R120`, `BR-DE-16` and
-/// `BR-DEX-09` all live in a profile's `extra_rules` and all appear in reports.
+/// Every rule this crate can report: [`CORE`] plus every profile's
+/// `extra_rules`.
 pub fn all() -> impl Iterator<Item = &'static Rule> {
     CORE.iter().copied().chain(
         crate::profiles::ALL
@@ -678,25 +616,15 @@ pub fn all() -> impl Iterator<Item = &'static Rule> {
     )
 }
 
-/// Look a rule up by any of its spellings — `BR-CO-3`, `BR-CO-03`, `br-co-3`.
-///
-/// Searches **every** rule the crate ships, not just the core set: an ordinary
-/// XRechnung report cites `BR-DE-16`, `PEPPOL-EN16931-R120` and `BR-DEX-09`,
-/// and a registry that cannot explain its own findings is not a registry.
-///
-/// Restrictions are not rules and are not found here; see
-/// [`explain_restriction`].
+/// Look a rule up by any of its spellings — `BR-CO-3`, `BR-CO-03`, `br-co-3` —
+/// across [`all`] rules. Restrictions: see [`explain_restriction`].
 #[must_use]
 pub fn explain(query: &str) -> Option<&'static Rule> {
     all().find(|r| r.id.matches(query))
 }
 
-/// Look up a profile **restriction** by its published id — `BR-DE-3`.
-///
-/// The companion to [`explain`]. Restrictions are data rather than predicates
-/// (see [`crate::validation::profile::Restriction`]), so they have no `Rule` to
-/// return — but they do appear in reports under their real ids, and a user
-/// holding one deserves an answer.
+/// Look up a profile [`Restriction`](crate::validation::profile::Restriction)
+/// by its published id — `BR-DE-3`.
 #[must_use]
 pub fn explain_restriction(
     query: &str,
@@ -782,17 +710,7 @@ mod tests {
 mod registry_tests {
     use super::*;
 
-    /// The registry's actual size and shape.
-    ///
-    /// The *authoritative* completeness check is
-    /// `the_registry_covers_the_syntax_independent_artefacts` in
-    /// `tests/codelists.rs`, which diffs this list against CEN's artefacts. This
-    /// one is its offline stand-in: it runs without `spec/`, so a contributor
-    /// who deletes a family notices before CI does.
-    ///
-    /// Both counts are **exact**. They were floors — `>= 45` and `>= 85` against
-    /// an actual 96 and 225 — which is a test that cannot fail for any change
-    /// short of deleting a third of the registry.
+    /// The registry's exact size and shape, without the reference corpus.
     #[test]
     fn coverage_is_what_we_say_it_is() {
         let ids: Vec<&str> = CORE.iter().map(|r| r.id.as_str()).collect();
@@ -828,8 +746,6 @@ mod registry_tests {
                 _ => assert!(r.id.as_str().starts_with("BR-"), "{}", r.id),
             }
         }
-        // Diffing EN 16931-1 against the artefacts yields exactly one rule the
-        // standard states and the artefacts do not ship.
         assert_eq!(standard_only, 1, "BR-CO-25 is the only one");
         assert!(crate_only >= 1);
     }
@@ -845,9 +761,9 @@ mod registry_tests {
                 assert!(explain(&id).is_some(), "{id} missing");
             }
         }
-        // …and the standard's own spelling for the last two reaches them.
-        assert_eq!(explain("BR-IG-8").map(|r| r.id.as_str()), Some("BR-AF-08"));
-        assert_eq!(explain("BR-IP-9").map(|r| r.id.as_str()), Some("BR-AG-09"));
+        // No other family's spelling reaches them.
+        assert!(explain("BR-IG-8").is_none());
+        assert!(explain("BR-IP-9").is_none());
     }
 }
 
@@ -855,12 +771,7 @@ mod registry_tests {
 mod provenance_tests {
     use super::*;
 
-    /// The `EN-` prefix is the whole reason a crate rule can never be mistaken
-    /// for CEN's, so it must agree with [`Source::Crate`] in both directions.
-    ///
-    /// Asserted rather than assumed: an `EN-` id reads like an authority's own
-    /// unless the namespace is airtight, and a prefix that drifts out of step
-    /// with the provenance it advertises is worse than no prefix.
+    /// The `EN-` prefix agrees with [`Source::Crate`] in both directions.
     #[test]
     fn the_en_namespace_means_exactly_source_crate() {
         for p in crate::profiles::ALL {
@@ -877,9 +788,6 @@ mod provenance_tests {
     }
 
     /// Exactly one core rule is in the standard and absent from the artefacts.
-    ///
-    /// If a second ever appears, the standard-versus-artefact diff has moved and
-    /// the reader of a report deserves to know before the rule set does.
     #[test]
     fn br_co_25_is_the_only_standard_only_rule() {
         let ids: Vec<_> = CORE

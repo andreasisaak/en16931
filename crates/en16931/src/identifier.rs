@@ -1,10 +1,7 @@
 //! [`Identifier`] and [`DocumentReference`] — EN 16931 §6.5.6 and §6.5.7.
 //!
-//! These are two **different** semantic data types, and the difference is not
-//! cosmetic. Modelling a document reference as an identifier would permit a
-//! scheme the standard does not allow there; modelling an identifier as a plain
-//! string loses the scheme that several rules require (BR-62, BR-63, BR-64,
-//! BR-65) and that tells a receiver how to interpret the value at all.
+//! Two distinct semantic types: an identifier may carry a scheme, a document
+//! reference never does.
 
 use core::fmt;
 
@@ -18,23 +15,8 @@ use core::fmt;
 /// | Scheme identifier | conditional | `GLN` |
 /// | Scheme version identifier | conditional | `1.0` |
 ///
-/// The **scheme version** is the component most implementations forget. It is
-/// separate from the scheme, and both are conditional per business term — the
-/// semantic model states, for each identifier, whether a scheme may or shall be
-/// given and from which list.
-///
-/// Several rules are exactly "this identifier shall carry a scheme":
-///
-/// | Rule | Term |
-/// |---|---|
-/// | BR-62 | Seller electronic address (BT-34) |
-/// | BR-63 | Buyer electronic address (BT-49) |
-/// | BR-64 | Item standard identifier (BT-157) |
-/// | BR-65 | Item classification identifier (BT-158) |
-///
-/// so [`Identifier::scheme`] being `None` is a *reportable finding*, not an
-/// impossible state — the type must be able to hold an invalid document in
-/// order to explain why it is invalid.
+/// A missing scheme is representable so BR-62 … BR-65 (BT-34, BT-49, BT-157,
+/// BT-158) can report it.
 ///
 /// ```
 /// use en16931::Identifier;
@@ -82,91 +64,43 @@ impl Identifier {
         }
     }
 
-    /// BT-34 / BT-49 — an electronic address, with its EAS scheme **checked**.
-    ///
-    /// The one identifier in the model whose scheme comes from a code list that
-    /// changes: nine EAS schemes were withdrawn in 2023 alone, and `9958` —
-    /// the one a German integrator reaches for — is among them. Checking here
-    /// turns `BR-CL-25` from a finding on an assembled document into an error
-    /// at the line of code that produced it, with the successor named.
-    ///
-    /// ```
-    /// use en16931::Identifier;
-    ///
-    /// let ok = Identifier::eas("4012345000009", "0088")?;      // GLN
-    /// assert_eq!(ok.scheme(), Some("0088"));
-    ///
-    /// // The Leitweg-ID scheme, withdrawn on 2023-07-31.
-    /// let err = Identifier::eas("991-01234-56", "9958").unwrap_err();
-    /// assert!(err.to_string().contains("use 0204 instead"));
-    /// # Ok::<(), en16931::codes::guard::CodeError>(())
-    /// ```
-    ///
-    /// # What this call asserts, and what it does not check
-    ///
-    /// **The scheme is validated. The content is not.** `eas(x, "0088")` states
-    /// that `x` *is a GS1 GLN*, and nothing here — nor `BR-CL-25`, which also
-    /// only looks at the scheme — checks that it is one.
-    ///
-    /// That is worth saying plainly because the `Result` invites the opposite
-    /// reading. A downstream user put an eleven-digit BDEW *Marktlokations-ID*
-    /// through `eas(malo, "0088")`; it returned `Ok`, `BR-CL-25` passed, and the
-    /// document went out asserting that an eleven-digit German metering
-    /// identifier was a thirteen-digit GLN. Syntactically valid, semantically
-    /// false, and unresolvable for any receiver that believed it. No rule in the
-    /// standard can catch that.
-    ///
-    /// [`Identifier::eas_checked`] additionally verifies the *value* for the
-    /// schemes whose format is fixed and publicly specified. Use it where the
-    /// scheme is one of those; this one where it is not.
-    ///
-    /// # Errors
-    /// [`CodeError`](crate::codes::guard::CodeError) when `scheme` is not in the
-    /// CEF EAS code list, carrying the successor of a withdrawn code where the
-    /// authority names one.
-    pub fn eas(
-        content: impl Into<String>,
-        scheme: &str,
-    ) -> Result<Self, crate::codes::guard::CodeError> {
-        let scheme = crate::codes::guard::eas(scheme)?;
-        Ok(Self::schemed(content, scheme.as_str()))
-    }
-
-    /// As [`eas`](Self::eas), and **also** check the value against the scheme's
-    /// own format.
-    ///
-    /// Only for the schemes in [`guard::CHECKED_EAS_SCHEMES`], which is a short
-    /// list on purpose: it holds the ones whose format is fixed, publicly
-    /// specified and self-verifying. For every other scheme this behaves exactly
-    /// like [`eas`](Self::eas) and says so through
-    /// [`guard::eas_value_is_checkable`], so a caller can tell "verified" from
-    /// "not verifiable here" rather than reading `Ok` as the former.
+    /// BT-34 / BT-49 — an electronic address with its EAS scheme checked
+    /// (`BR-CL-25`), and its value too where the scheme's format is checkable.
     ///
     /// ```
     /// use en16931::Identifier;
     /// use en16931::codes::guard;
     ///
-    /// // A real GLN, check digit and all.
-    /// assert!(Identifier::eas_checked("4012345000009", "0088").is_ok());
+    /// let ok = Identifier::eas("4012345000009", "0088")?;      // a real GLN
+    /// assert_eq!(ok.scheme(), Some("0088"));
     ///
-    /// // The BDEW Marktlokations-ID that started this: eleven digits, not a GLN.
-    /// let err = Identifier::eas_checked("51238696781", "0088").unwrap_err();
+    /// // The Leitweg-ID scheme, withdrawn on 2023-07-31.
+    /// let err = Identifier::eas("991-01234-56", "9958").unwrap_err();
+    /// assert!(err.to_string().contains("use 0204 instead"));
+    ///
+    /// // A BDEW Marktlokations-ID is eleven digits, not a GLN.
+    /// let err = Identifier::eas("51238696781", "0088").unwrap_err();
     /// assert!(err.to_string().contains("13 digits"), "{err}");
     ///
-    /// // A scheme with no shape check behaves as `eas`, and says so.
-    /// assert!(Identifier::eas_checked("anything", "0204").is_ok());
+    /// // A scheme with no shape check accepts any value, and says so.
+    /// assert!(Identifier::eas("991-01234-56", "0204").is_ok());
     /// assert!(!guard::eas_value_is_checkable("0204"));
     /// # Ok::<(), en16931::codes::guard::CodeError>(())
     /// ```
+    ///
+    /// The value is checked only for [`guard::CHECKED_EAS_SCHEMES`]; for other
+    /// schemes `Ok` means only that the scheme is a live EAS code
+    /// ([`guard::eas_value_is_checkable`] tells which).
     ///
     /// [`guard::CHECKED_EAS_SCHEMES`]: crate::codes::guard::CHECKED_EAS_SCHEMES
     /// [`guard::eas_value_is_checkable`]: crate::codes::guard::eas_value_is_checkable
     ///
     /// # Errors
-    /// [`CodeError`](crate::codes::guard::CodeError) when the scheme is not in
-    /// the CEF EAS code list, or when it is one this crate can check and the
-    /// content does not have its shape.
-    pub fn eas_checked(
+    /// [`CodeError`](crate::codes::guard::CodeError) when `scheme` is not in the
+    /// CEF EAS code list (carrying the successor of a withdrawn code where the
+    /// authority names one), or when it is a scheme this crate can check and
+    /// the content does not have its shape.
+    pub fn eas(
         content: impl Into<String>,
         scheme: &str,
     ) -> Result<Self, crate::codes::guard::CodeError> {
@@ -203,9 +137,7 @@ impl Identifier {
 
     /// Whether the content is empty or whitespace only.
     ///
-    /// §6.5 says content is always mandatory — *"Whenever a business term is
-    /// used in a core Invoice this term shall always have content"* — so an
-    /// empty identifier is a finding rather than an absent term.
+    /// §6.5: a business term that is used shall have content.
     #[must_use]
     pub fn is_blank(&self) -> bool {
         self.content.trim().is_empty()
@@ -215,9 +147,7 @@ impl Identifier {
 impl fmt::Display for Identifier {
     /// `scheme:content` when a scheme is present, otherwise the bare content.
     ///
-    /// This is a *diagnostic* rendering for reports and logs, not a wire format:
-    /// each syntax carries the scheme in its own attribute
-    /// (`@schemeID` in UBL), never concatenated.
+    /// A diagnostic rendering, not a wire format.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.scheme {
             Some(s) => write!(f, "{s}:{}", self.content),
@@ -240,16 +170,8 @@ impl From<String> for Identifier {
 
 /// A reference to another document — EN 16931-1 §6.5.7 `Document Reference. Type`.
 ///
-/// > Identifiers that were assigned to a document or document line by the Buyer,
-/// > the Seller or by a third party.
-///
-/// Table 21 gives it **one** component: content. It is deliberately *not* an
-/// [`Identifier`] — there is no scheme, because the issuer of the referenced
-/// document is already known from which business term carries it.
-///
-/// Used by BT-12 (contract), BT-13 (purchase order), BT-14 (sales order),
-/// BT-16 (despatch advice), BT-25 (preceding invoice), BT-122 (supporting
-/// document) and others.
+/// Content only, no scheme (Table 21). Used by BT-12, BT-13, BT-14, BT-16,
+/// BT-25, BT-122 and others.
 ///
 /// ```
 /// use en16931::DocumentReference;
@@ -313,8 +235,7 @@ mod tests {
 
     #[test]
     fn a_missing_scheme_is_representable_so_it_can_be_reported() {
-        // BR-62/63/64/65 require a scheme on four terms. The type must be able
-        // to hold the invalid state, or a parser cannot explain what is wrong.
+        // BR-62 … BR-65 report it, so it must be representable.
         let bare = Identifier::new("DE123456789");
         assert_eq!(bare.scheme(), None);
         assert_eq!(bare.to_string(), "DE123456789");
@@ -329,7 +250,6 @@ mod tests {
 
     #[test]
     fn document_reference_has_no_scheme_by_construction() {
-        // §6.5.7 Table 21: one component. Not an Identifier with None.
         let r = DocumentReference::new("PO-4711");
         assert_eq!(r.as_str(), "PO-4711");
         assert_eq!(r.to_string(), "PO-4711");
@@ -342,7 +262,6 @@ mod tests {
         assert_eq!(bare, r#"{"content":"X"}"#);
         let full = serde_json::to_string(&Identifier::schemed("X", "0088")).unwrap();
         assert_eq!(full, r#"{"content":"X","scheme":"0088"}"#);
-        // Document Reference is transparent — a bare string, not an object.
         assert_eq!(
             serde_json::to_string(&DocumentReference::new("PO-1")).unwrap(),
             r#""PO-1""#

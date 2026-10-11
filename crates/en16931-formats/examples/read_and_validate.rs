@@ -1,19 +1,17 @@
 //! Read an inbound document and validate it — the receiving path, end to end.
 //!
 //! ```sh
-//! cargo run --example read_and_validate --features cii
+//! cargo run --example read_and_validate
 //! ```
 //!
-//! This is the whole point of the two-crate split: this crate turns bytes into
-//! an `Invoice`, and `en16931` decides whether that invoice is correct. Neither
-//! knows anything about the other's job.
-//!
-//! Note what the reader hands back besides the model. **`unmapped`** names every
-//! element it saw and did not map, and **`malformed`** every value that was
-//! present but not representable. A reader that returned only the invoice would
-//! let a document with six ignored elements come back looking clean.
+//! * `en16931_formats::read`: bytes in, model out, whatever the syntax, plus
+//!   `entries` naming every element not mapped, every value not representable
+//!   and every duplicate not read.
+//! * `en16931_formats::receive`: bytes and a policy in, a decision out (read,
+//!   classify BT-24, validate as declared and as required, recommend).
 
-use en16931_formats::{Syntax, sniff, ubl};
+use en16931::profiles;
+use en16931_formats::{Policy, Syntax};
 
 /// A small but complete UBL invoice.
 const DOCUMENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -68,26 +66,26 @@ const DOCUMENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </Invoice>"#;
 
 fn main() {
-    // Which syntax is this? Cheap, and it refuses to guess when the answer is
-    // neither — "not an e-invoice" and "an e-invoice in the other syntax" need
-    // different messages.
-    println!("syntax: {:?}", sniff(DOCUMENT));
-    assert_eq!(sniff(DOCUMENT), Some(Syntax::Ubl));
+    // The syntax is the document's own: one call reads UBL, CII or a PDF.
+    let read = en16931_formats::read(DOCUMENT.as_bytes()).expect("a well-formed invoice");
+    println!("syntax: {}", read.syntax);
+    assert_eq!(read.syntax, Syntax::Ubl);
 
-    let read = ubl::from_str(DOCUMENT).expect("a well-formed UBL invoice");
+    println!("reader entries: {}", read.entries.len());
+    for entry in &read.entries {
+        println!("  {entry}");
+    }
+    println!();
 
-    println!("unmapped elements: {:?}", read.unmapped);
-    println!("malformed values:  {:?}\n", read.malformed);
-
-    let invoice = read.invoice;
+    let invoice = &read.invoice;
     println!("BT-1  invoice number: {:?}", invoice.number);
     println!("BT-2  issue date:     {:?}", invoice.issue_date);
     println!("BT-27 seller name:    {:?}", invoice.seller.name);
     println!("BT-112 gross total:   {}", invoice.totals.gross_total);
     println!("lines:                {}\n", invoice.lines.len());
 
-    // `en16931` decides correctness. This crate re-implements none of it.
-    let report = en16931::validate(&invoice);
+    // `en16931` decides correctness.
+    let report = en16931::validate(invoice);
     println!(
         "valid: {} ({} rules)",
         report.is_valid(),
@@ -98,5 +96,18 @@ fn main() {
             "  [{}] {} — {}\n      {}",
             f.severity, f.rule, f.path, f.message
         );
+    }
+
+    // `receive` reads, classifies BT-24 and validates in one call. A German
+    // public buyer requires XRechnung, which this document does not declare,
+    // so the decision covers both profiles.
+    let policy = Policy {
+        require: Some(&profiles::XRECHNUNG),
+        ..Policy::default()
+    };
+    let received = en16931_formats::receive(DOCUMENT.as_bytes(), &policy);
+    println!("\nreceived as XRechnung: {:?}", received.recommendation);
+    for reason in &received.reasons {
+        println!("  {reason}");
     }
 }

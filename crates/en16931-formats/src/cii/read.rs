@@ -1,89 +1,49 @@
 //! Reading UN/CEFACT CII D16B into the semantic model.
 //!
-//! # It never silently drops anything
+//! Every element walked is mapped or recorded as
+//! [`Unmapped`](crate::report::Kind::Unmapped) (`Parent/Child`). A value the
+//! model cannot hold is recorded as [`Malformed`](crate::report::Kind::Malformed)
+//! and the field left absent.
 //!
-//! Every element walked is either mapped or recorded in [`Reader::unmapped`],
-//! as `Parent/Child`. A reader that quietly ignored `ram:TaxBasisTotalAmount`
-//! would report a clean parse and prove nothing.
-//!
-//! # Malformed values are reported, not panicked on
-//!
-//! CEN's suites carry deliberately malformed values to exercise `BR-DEC-*` and
-//! the date rules. [`en16931`]'s types make those unrepresentable, so the reader
-//! records them in [`Reader::malformed`] and leaves the field absent. Losing the
-//! distinction between "absent" and "present but unreadable" would make a
-//! `BR-03` finding unexplainable.
-//!
-//! # Two shapes that have to be undone
-//!
-//! **`ram:ID` versus `ram:GlobalID`.** CII splits one business term across two
-//! elements by whether it carries a scheme. Both are read back into
-//! `Party::identifiers`, so the round-trip holds.
-//!
-//! **BT-7/BT-8 repeat.** The VAT point date and its code sit on *each* tax
-//! breakdown entry rather than on the document. They are collapsed to the
-//! document-level term, which is where the model puts them — and where the
-//! standard's own semantics put them, since one invoice has one tax point.
+//! `ram:ID` and `ram:GlobalID` are both read into `Party::identifiers`. BT-7
+//! and BT-8, repeated on each tax breakdown entry, collapse to the document
+//! level; BT-8 is translated from UNTDID 2475 to 2005 (see [`super`]).
 
 use std::collections::BTreeSet;
 
 use en16931::invoice::*;
 use en16931::{Date, DocumentKind, DocumentReference, Identifier, InvoiceAmount, Quantity};
 
+use crate::report::{Entry, Kind};
+use crate::xml::{Node, kid, kids, name};
+
 /// Reads one `rsm:CrossIndustryInvoice` into an [`Invoice`].
 #[derive(Default)]
-pub struct Reader {
-    /// Element paths encountered and not mapped, as `Parent/Child`.
-    pub unmapped: BTreeSet<String>,
-    /// Values present in the document but not representable in the model.
-    pub malformed: Vec<String>,
+pub(crate) struct Reader {
+    /// Element paths encountered and not mapped, as `Parent/Child`, each once.
+    unmapped: BTreeSet<String>,
+    /// Everything else the reader has to say, in document order.
+    entries: Vec<Entry>,
 }
 
-type Node<'a, 'i> = roxmltree::Node<'a, 'i>;
-
-fn name<'i>(n: Node<'_, 'i>) -> &'i str {
-    n.tag_name().name()
-}
-
-fn kids<'a, 'i>(n: Node<'a, 'i>) -> impl Iterator<Item = Node<'a, 'i>> {
-    n.children().filter(roxmltree::Node::is_element)
-}
-
-fn kid<'a, 'i>(n: Node<'a, 'i>, want: &str) -> Option<Node<'a, 'i>> {
-    kids(n).find(|c| name(*c) == want)
-}
-
+/// Trimmed text of this element, empty when there is none.
 fn own_text(n: Node<'_, '_>) -> String {
-    n.text().unwrap_or_default().trim().to_owned()
+    crate::xml::text(n).unwrap_or_default()
 }
 
-/// Trimmed text of a direct child, or `None` when the element is absent **or
-/// empty**.
-///
-/// # Why empty is absent
-///
-/// `<ram:Description/>` is not a description whose value is the empty string;
-/// it is a description that is not there — which is also what the UBL reader
-/// answers, since `roxmltree` gives an empty element no text node.
-///
-/// Two readers of one model disagreeing about that is a real difference and not
-/// a cosmetic one. Rules mostly paper over it (`is_none_or(str::is_empty)` reads
-/// both the same way), but `Restriction::NotUsed` treats blank as absent, an
-/// empty `DocumentReference` serialises back out as an empty element, and a
-/// caller matching on `Option` sees two different documents. Nine of the
-/// published CII instances differ from their UBL crossing on this alone.
+/// Trimmed text of the first child named `want`, or `None` when the element is
+/// absent or empty ([`crate::xml::child_text`], shared with the UBL reader).
 fn text(n: Node<'_, '_>, want: &str) -> Option<String> {
-    kid(n, want).map(own_text).filter(|t| !t.is_empty())
+    crate::xml::child_text(n, want)
 }
 
-/// `None` for an empty string, so the two sites that read an element's own text
-/// agree with [`text`] about what an empty element means.
+/// `None` for an empty string.
 fn non_empty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
 fn code(n: Node<'_, '_>, want: &str) -> Option<Code> {
-    text(n, want).filter(|t| !t.is_empty()).map(Code::new)
+    text(n, want).map(Code::new)
 }
 
 fn decimal(n: Node<'_, '_>, want: &str) -> Option<rust_decimal::Decimal> {
@@ -100,12 +60,44 @@ fn identifier(n: Node<'_, '_>) -> Identifier {
 }
 
 impl Reader {
+    /// Note an element this reader does not map.
+    fn push_path(&mut self, parent: &str, child: &str) {
+        self.unmapped.insert(format!("{parent}/{child}"));
+    }
+
+    /// Note a combination the model cannot hold, at `path`.
+    fn not_held(&mut self, path: &str, message: &str) {
+        self.entries
+            .push(Entry::new(Kind::Unmapped, path, message.to_owned()));
+    }
+
+    /// Note a value the model cannot hold.
+    fn malformed(&mut self, path: String, message: impl Into<String>, value: String) {
+        self.entries
+            .push(Entry::new(Kind::Malformed, path, message).value(value));
+    }
+
+    /// Everything the reader has to say: its own entries in document order, then
+    /// each unmapped path once, sorted.
+    pub(crate) fn finish(self) -> Vec<Entry> {
+        let mut out = self.entries;
+        out.extend(self.unmapped.into_iter().map(|path| {
+            Entry::new(
+                Kind::Unmapped,
+                path,
+                "not mapped: outside the EN 16931 subset, or an extension the declared \
+                 profile does not define",
+            )
+        }));
+        out
+    }
+
     fn amount(&mut self, n: Node<'_, '_>, want: &str) -> Option<InvoiceAmount> {
         let raw = text(n, want)?;
         match InvoiceAmount::parse(&raw) {
             Ok(a) => Some(a),
             Err(e) => {
-                self.malformed.push(format!("{want}: {raw:?} ({e})"));
+                self.malformed(format!("{}/{want}", name(n)), e.to_string(), raw);
                 None
             }
         }
@@ -114,34 +106,53 @@ impl Reader {
     /// `<ram:Foo><udt:DateTimeString format="102">20260115</udt:DateTimeString></ram:Foo>`
     ///
     /// `ram:TaxPointDate` (BT-7) carries a `udt:DateString` instead. Either
-    /// child is accepted on any wrapper: this crate wrote BT-7 as a
-    /// `DateTimeString` up to 0.7.0, and refusing those would drop the date.
-    ///
-    /// A format other than `102` is *reported*, not guessed at: `20260103`
-    /// under format `101` (`YYMMDD`) would silently become a date six years
-    /// wrong, and the standard permits only `102`.
+    /// child is read on any wrapper; a format other than `102` is reported, not
+    /// guessed at.
     fn date(&mut self, n: Node<'_, '_>, want: &str) -> Option<Date> {
         let wrapper = kid(n, want)?;
         let s = kid(wrapper, "DateTimeString").or_else(|| kid(wrapper, "DateString"))?;
+        let path = format!("{}/{want}/{}", name(n), name(s));
         let raw = own_text(s);
+        // D16B types BT-7 `udt:DateType` (`udt:DateString`) and every other
+        // date `udt:DateTimeString`. The other spelling is read and reported.
+        let expected = if want == "TaxPointDate" {
+            "DateString"
+        } else {
+            "DateTimeString"
+        };
+        if name(s) != expected {
+            self.entries.push(
+                Entry::new(
+                    Kind::Schema,
+                    path.clone(),
+                    format!(
+                        "the D16B schema has a {expected} here; this spelling is read and \
+                         reported"
+                    ),
+                )
+                .value(raw.clone()),
+            );
+        }
         match s.attribute("format") {
             Some(super::write::DATE_FORMAT) | None => {}
             Some(other) => {
-                self.malformed
-                    .push(format!("{want}: format {other:?}, only 102 is permitted"));
+                self.malformed(
+                    path,
+                    format!("format {other:?}; only 102 (CCYYMMDD) is permitted"),
+                    raw,
+                );
                 return None;
             }
         }
         if raw.len() != 8 || !raw.bytes().all(|b| b.is_ascii_digit()) {
-            self.malformed
-                .push(format!("{want}: {raw:?} is not CCYYMMDD"));
+            self.malformed(path, "not CCYYMMDD", raw);
             return None;
         }
         let f = format!("{}-{}-{}", &raw[0..4], &raw[4..6], &raw[6..8]);
         match Date::parse(&f) {
             Ok(d) => Some(d),
             Err(e) => {
-                self.malformed.push(format!("{want}: {raw:?} ({e})"));
+                self.malformed(path, e.to_string(), raw);
                 None
             }
         }
@@ -150,35 +161,25 @@ impl Reader {
     fn note(&mut self, parent: &str, n: Node<'_, '_>) {
         for c in kids(n) {
             if !matches!(name(c), "Content" | "SubjectCode") {
-                self.unmapped.push_path(parent, name(c));
+                self.push_path(parent, name(c));
             }
         }
     }
 
     /// Read the document element.
-    pub fn read(&mut self, root: Node<'_, '_>) -> Invoice {
+    pub(crate) fn read(&mut self, root: Node<'_, '_>) -> Invoice {
         let mut inv = Invoice::default();
         for c in kids(root) {
             match name(c) {
                 "ExchangedDocumentContext" => self.context(&mut inv, c),
                 "ExchangedDocument" => self.document(&mut inv, c),
                 "SupplyChainTradeTransaction" => self.transaction(&mut inv, c),
-                other => self.unmapped.push_path("CrossIndustryInvoice", other),
+                other => self.push_path("CrossIndustryInvoice", other),
             }
         }
-        // CII has one document element, so the kind comes from BT-3 alone —
-        // and from the whole UNTDID 1001 credit-note list, not just `381`.
-        //
-        // Checking only `381` is wrong in a way the corpus cannot show: every
-        // published CII credit note uses `381`, so nothing exercises `396`
-        // (factored), `532` (forwarder's) or `83`. Those would read back as
-        // *invoices*, and `BR-CL-01` would then check them against the 50
-        // invoice codes and report a violation that is not one.
-        //
-        // `81` is on **both** lists. It is read as a credit note here, which is
-        // what `PEPPOL-EN16931-P0101` expects and what
-        // `rules::peppol::is_credit_note` already assumes — one reading, in two
-        // places, rather than two.
+        // The kind comes from BT-3 against the whole UNTDID 1001 credit-note
+        // list (`381`, `396`, `532`, `83`, …). `81` is on both lists and is
+        // read as a credit note, as `PEPPOL-EN16931-P0101` expects.
         if inv
             .type_code
             .as_ref()
@@ -198,7 +199,7 @@ impl Reader {
                 "GuidelineSpecifiedDocumentContextParameter" => {
                     inv.specification_id = text(c, "ID");
                 }
-                other => self.unmapped.push_path("ExchangedDocumentContext", other),
+                other => self.push_path("ExchangedDocumentContext", other),
             }
         }
     }
@@ -216,7 +217,7 @@ impl Reader {
                         note: text(c, "Content"),
                     });
                 }
-                other => self.unmapped.push_path("ExchangedDocument", other),
+                other => self.push_path("ExchangedDocument", other),
             }
         }
     }
@@ -228,9 +229,7 @@ impl Reader {
                 "ApplicableHeaderTradeAgreement" => self.agreement(inv, c),
                 "ApplicableHeaderTradeDelivery" => self.delivery(inv, c),
                 "ApplicableHeaderTradeSettlement" => self.settlement(inv, c),
-                other => self
-                    .unmapped
-                    .push_path("SupplyChainTradeTransaction", other),
+                other => self.push_path("SupplyChainTradeTransaction", other),
             }
         }
     }
@@ -268,9 +267,7 @@ impl Reader {
                 "SpecifiedProcuringProject" => {
                     inv.project_reference = text(c, "ID").map(DocumentReference::new);
                 }
-                other => self
-                    .unmapped
-                    .push_path("ApplicableHeaderTradeAgreement", other),
+                other => self.push_path("ApplicableHeaderTradeAgreement", other),
             }
         }
     }
@@ -297,7 +294,14 @@ impl Reader {
                     ) {
                         Ok(a) => Some(a),
                         Err(e) => {
-                            self.malformed.push(format!("AttachmentBinaryObject: {e}"));
+                            self.entries.push(
+                                Entry::new(
+                                    Kind::Malformed,
+                                    "AdditionalReferencedDocument/AttachmentBinaryObject",
+                                    e.to_string(),
+                                )
+                                .term("BT-125"),
+                            );
                             None
                         }
                     }
@@ -316,8 +320,7 @@ impl Reader {
         let mut p = Party::default();
         for c in kids(n) {
             match name(c) {
-                // One business term across two elements: scheme-qualified goes
-                // to GlobalID, unqualified to ID. Merged back here.
+                // BT-29 from both `ram:GlobalID` and `ram:ID`.
                 "ID" | "GlobalID" => p.identifiers.push(identifier(c)),
                 "Name" => p.name = non_empty(own_text(c)),
                 "Description" if seller => p.additional_legal_information = non_empty(own_text(c)),
@@ -347,7 +350,7 @@ impl Reader {
                         p.tax_registration = non_empty(own_text(id));
                     }
                 }
-                other => self.unmapped.push_path("TradeParty", other),
+                other => self.push_path("TradeParty", other),
             }
         }
         p
@@ -372,7 +375,7 @@ impl Reader {
                 "CityName" => a.city = non_empty(own_text(c)),
                 "CountryID" => a.country = Some(Code::new(own_text(c))),
                 "CountrySubDivisionName" => a.subdivision = non_empty(own_text(c)),
-                other => self.unmapped.push_path("PostalTradeAddress", other),
+                other => self.push_path("PostalTradeAddress", other),
             }
         }
         a
@@ -400,7 +403,7 @@ impl Reader {
                                 d.address = Some(self.address(g));
                                 any = true;
                             }
-                            other => self.unmapped.push_path("ShipToTradeParty", other),
+                            other => self.push_path("ShipToTradeParty", other),
                         }
                     }
                 }
@@ -416,9 +419,7 @@ impl Reader {
                     inv.receiving_advice_reference =
                         text(c, "IssuerAssignedID").map(DocumentReference::new);
                 }
-                other => self
-                    .unmapped
-                    .push_path("ApplicableHeaderTradeDelivery", other),
+                other => self.push_path("ApplicableHeaderTradeDelivery", other),
             }
         }
         if any {
@@ -432,6 +433,9 @@ impl Reader {
     fn settlement(&mut self, inv: &mut Invoice, n: Node<'_, '_>) {
         let mut payment = PaymentInstructions::default();
         let mut have_payment = false;
+        // BT-8 is read from its first occurrence: the rest are required to
+        // agree with it (CII-SR-462), and one that does not is reported.
+        let mut bt8_first: Option<String> = None;
         let mut creditor_id = None;
         let mut mandate = None;
         for c in kids(n) {
@@ -457,13 +461,31 @@ impl Reader {
                     have_payment = true;
                 }
                 "ApplicableTradeTax" => {
-                    // BT-7/BT-8 repeat on every entry; the model has one of
-                    // each, so the first wins and the rest agree by construction.
+                    // BT-7/BT-8 repeat per entry; the first wins.
                     if inv.vat_point_date.is_none() {
                         inv.vat_point_date = self.date(c, "TaxPointDate");
                     }
-                    if inv.vat_point_date_code.is_none() {
-                        inv.vat_point_date_code = code(c, "DueDateTypeCode");
+                    // A repetition that differs (CII-SR-462) is reported.
+                    if let Some(raw) = text(c, "DueDateTypeCode") {
+                        match &bt8_first {
+                            None => {
+                                inv.vat_point_date_code = self.vat_point_date_code(&raw);
+                                bt8_first = Some(raw);
+                            }
+                            Some(first) if *first != raw => self.entries.push(
+                                Entry::new(
+                                    Kind::Duplicate,
+                                    "ApplicableHeaderTradeSettlement/ApplicableTradeTax/DueDateTypeCode",
+                                    format!(
+                                        "a second, different VAT point date code; the first ({first}) is read"
+                                    ),
+                                )
+                                .term("BT-8")
+                                .value(raw)
+                                .rule("CII-SR-462"),
+                            ),
+                            Some(_) => {}
+                        }
                     }
                     inv.vat_breakdown.push(VatBreakdown {
                         taxable_amount: self.amount(c, "BasisAmount").unwrap_or_default(),
@@ -497,21 +519,14 @@ impl Reader {
                         inv.allowances.push(a);
                     }
                 }
-                // ZUGFeRD / Factur-X EXTENDED's freight and packing charge.
-                // FeRD's BR-FXEXT-CO-12 counts it in BT-108 and its VAT rules
-                // in BT-116, so it *is* a document-level charge, and leaving it
-                // out made BT-108 disagree with the model and a UBL conversion
-                // write a charge total with no charge behind it.
-                //
-                // Only under an extension (`#conformant#` in BT-24, EN 16931
-                // §4.3). For the core, CEN's CII-SR-396 says the element should
-                // not be present and CEN's BR-CO-12 does not count it; mapping
-                // it there would accept a document CEN rejects.
+                // ZUGFeRD / Factur-X EXTENDED's freight and packing charge, a
+                // document-level charge (FeRD's BR-FXEXT-CO-12 counts it in
+                // BT-108). Mapped only under an extension (`#conformant#` in
+                // BT-24, EN 16931 §4.3).
                 "SpecifiedLogisticsServiceCharge"
-                    if inv
-                        .specification_id
-                        .as_deref()
-                        .is_some_and(|s| s.contains("#conformant#")) =>
+                    if inv.specification_id.as_deref().is_some_and(|s| {
+                        s.contains("#conformant#") || s.contains(":conformant:")
+                    }) =>
                 {
                     inv.charges.push(DocumentAllowanceCharge {
                         amount: self.amount(c, "AppliedAmount").unwrap_or_default(),
@@ -524,18 +539,24 @@ impl Reader {
                         reason_code: None,
                     });
                 }
+                // Under the core: CII-SR-396 says it should not be present and
+                // BR-CO-12 does not count it. Not mapped.
+                "SpecifiedLogisticsServiceCharge" => self.entries.push(
+                    Entry::new(
+                        Kind::Unmapped,
+                        "ApplicableHeaderTradeSettlement/SpecifiedLogisticsServiceCharge",
+                        "a logistics service charge, which the core does not count",
+                    )
+                    .rule("CII-SR-396")
+                    .hint(
+                        "declare the extension in BT-24 (`#conformant#`), or send the charge \
+                         as a document-level charge (BG-21)",
+                    ),
+                ),
                 "SpecifiedTradePaymentTerms" => {
-                    // **Not trimmed**, exactly as the UBL reader does not trim
-                    // it. `BR-DE-18` requires the Skonto block to end with a
-                    // newline, so BT-20's trailing whitespace is load-bearing —
-                    // and XRechnung is carried in CII as well as UBL, with a
-                    // KoSIT scenario of its own. This reader used `own_text`,
-                    // which trims, so a CII XRechnung with a Skonto lost its
-                    // terminator and was rejected. 36 of the corpus documents
-                    // that survive UBL→CII conversion differ on this one field.
-                    inv.payment_terms = kid(c, "Description")
-                        .and_then(|d| d.text())
-                        .map(str::to_owned);
+                    // Not trimmed: `BR-DE-18` requires the Skonto block to
+                    // end with a newline.
+                    inv.payment_terms = kid(c, "Description").and_then(crate::xml::raw_text);
                     inv.due_date = self.date(c, "DueDateDateTime");
                     mandate = text(c, "DirectDebitMandateID");
                 }
@@ -550,9 +571,7 @@ impl Reader {
                 "ReceivableSpecifiedTradeAccountingAccount" => {
                     inv.accounting_reference = text(c, "ID");
                 }
-                other => self
-                    .unmapped
-                    .push_path("ApplicableHeaderTradeSettlement", other),
+                other => self.push_path("ApplicableHeaderTradeSettlement", other),
             }
         }
         // The mandate and creditor identifier arrive from two different
@@ -578,12 +597,9 @@ impl Reader {
     }
 
     fn payment_means(&mut self, p: &mut PaymentInstructions, n: Node<'_, '_>) {
-        // Called once per `ram:SpecifiedTradeSettlementPaymentMeans`, which is
-        // 0..unbounded in D16B: several elements are one BG-16 with several
-        // BG-17 accounts, since the XSD puts the creditor account at 0..1 per
-        // element. So everything here *accumulates* into `p`: assigning would
-        // keep only the last element's accounts, and a round trip against a
-        // writer with the mirror-image defect would never notice.
+        // Called once per `ram:SpecifiedTradeSettlementPaymentMeans`; several
+        // are one BG-16 with several BG-17 accounts (0..1 per element), so
+        // everything accumulates into `p`.
         let mut transfers: Vec<CreditTransfer> = Vec::new();
         for c in kids(n) {
             match name(c) {
@@ -621,36 +637,27 @@ impl Reader {
                         t.provider_identifier = text(c, "BICID");
                     }
                 }
-                other => self
-                    .unmapped
-                    .push_path("SpecifiedTradeSettlementPaymentMeans", other),
+                other => self.push_path("SpecifiedTradeSettlementPaymentMeans", other),
             }
         }
         if !transfers.is_empty() {
             match &mut p.means {
                 Some(PaymentMeans::CreditTransfer(existing)) => existing.extend(transfers),
                 slot @ None => *slot = Some(PaymentMeans::CreditTransfer(transfers)),
-                // A card or a mandate is already in the model's single BG-16;
-                // an account arriving on top of it cannot be represented, and
-                // dropping it silently is the failure mode this reader's
-                // contract forbids.
-                Some(_) => {
-                    self.unmapped.insert(
-                        "SpecifiedTradeSettlementPaymentMeans/PayeePartyCreditorFinancialAccount \
-                         (beside a card or mandate)"
-                            .to_owned(),
-                    );
-                }
+                // An account on top of a card or mandate cannot be
+                // represented; reported.
+                Some(_) => self.not_held(
+                    "SpecifiedTradeSettlementPaymentMeans/PayeePartyCreditorFinancialAccount",
+                    "an account beside a card or mandate; BG-16 holds one kind",
+                ),
             }
         }
     }
 
     fn totals(&mut self, inv: &mut Invoice, n: Node<'_, '_>) {
         let mut t = DocumentTotals::default();
-        // Two `ram:TaxTotalAmount` elements may appear, told apart only by
-        // `@currencyID`: the second is BT-111, in the accounting currency. When
-        // BT-6 equals BT-5 they are the same element twice over, which is the
-        // case the match below exists for.
+        // Two `ram:TaxTotalAmount` elements may appear, told apart by
+        // `@currencyID`: BT-110 and BT-111 (accounting currency).
         let doc_ccy = inv.currency.as_ref().map(Code::as_str);
         let tax_ccy = inv.vat_accounting_currency.as_ref().map(Code::as_str);
         for c in kids(n) {
@@ -669,15 +676,20 @@ impl Reader {
                     let raw = own_text(c);
                     let parsed = InvoiceAmount::parse(&raw).ok();
                     if parsed.is_none() {
-                        self.malformed.push(format!("TaxTotalAmount: {raw:?}"));
+                        self.malformed(
+                            "SpecifiedTradeSettlementHeaderMonetarySummation/TaxTotalAmount"
+                                .to_owned(),
+                            "not an amount the model can hold (at most two decimals)",
+                            raw,
+                        );
                     }
-                    match c.attribute("currencyID") {
-                        // BT-6 == BT-5 makes one element **both** totals, the
-                        // same case the UBL reader handles: `BR-53`'s binding is
-                        // satisfied by the document-currency total whenever the
-                        // two currencies coincide, so assigning it to only one
-                        // of them manufactures a `BR-53` finding on a document
-                        // CEN publishes as an example.
+                    // Trimmed; a blank `@currencyID` means the document currency.
+                    match c
+                        .attribute("currencyID")
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                    {
+                        // BT-6 == BT-5: one element is both totals (`BR-53`).
                         Some(cur) if Some(cur) == tax_ccy => {
                             if Some(cur) == doc_ccy && t.vat_total.is_none() {
                                 t.vat_total = parsed;
@@ -696,9 +708,7 @@ impl Reader {
                 "DuePayableAmount" => {
                     t.due = self.amount(n, "DuePayableAmount").unwrap_or_default();
                 }
-                other => self
-                    .unmapped
-                    .push_path("SpecifiedTradeSettlementHeaderMonetarySummation", other),
+                other => self.push_path("SpecifiedTradeSettlementHeaderMonetarySummation", other),
             }
         }
         inv.totals = t;
@@ -713,26 +723,56 @@ impl Reader {
 
     /// `ram:ChargeIndicator/udt:Indicator` — `true` is a charge.
     ///
-    /// `udt:IndicatorType` is `xs:boolean`, so all four lexical forms occur and
-    /// all four are accepted. Anything else is recorded rather than folded into
-    /// *allowance*: this one element decides whether an amount is **added to or
-    /// subtracted from** the invoice, and an unreadable one silently reversing
-    /// the sign of the money is the worst way for a reader to be wrong.
+    /// All four `xs:boolean` lexical forms are accepted; anything else is
+    /// reported, never defaulted to an allowance.
     fn is_charge(&mut self, n: Node<'_, '_>, at: &str) -> bool {
         let raw = kid(n, "ChargeIndicator")
             .and_then(|i| kid(i, "Indicator"))
             .map(own_text);
-        match raw.as_deref().map(str::trim) {
+        match raw.as_deref() {
             Some("true" | "1") => true,
             Some("false" | "0") => false,
-            other => {
-                self.malformed.push(format!(
-                    "{at}/ChargeIndicator/Indicator={}: not an xs:boolean",
-                    other.unwrap_or("<absent>")
-                ));
+            _ => {
+                let e = Entry::new(
+                    Kind::Malformed,
+                    format!("{at}/ChargeIndicator/Indicator"),
+                    match &raw {
+                        Some(_) => "not an xs:boolean",
+                        None => "absent, and CII requires it",
+                    },
+                )
+                .hint("the value must be `true` or `false`");
+                self.entries.push(match raw {
+                    Some(v) => e.value(v),
+                    None => e,
+                });
                 false
             }
         }
+    }
+
+    /// BT-8 from its CII spelling (UNTDID 2475) to the model's (UNTDID 2005).
+    ///
+    /// A value outside CII's list (including a model code like `3`) is not
+    /// passed on.
+    fn vat_point_date_code(&mut self, raw: &str) -> Option<Code> {
+        if let Some(model) = super::vat_point_date_code_from_cii(raw) {
+            return Some(Code::new(model));
+        }
+        self.entries.push(
+            Entry::new(
+                Kind::Malformed,
+                "ApplicableTradeTax/DueDateTypeCode",
+                "not a CII VAT point date code (5, 29 or 72, UNTDID 2475)",
+            )
+            .term("BT-8")
+            .value(raw)
+            .hint(
+                "CII spells the model's 3, 35 and 432 as 5, 29 and 72 — the same three \
+                 meanings",
+            ),
+        );
+        None
     }
 
     fn line_vat(n: Node<'_, '_>) -> LineVat {
@@ -791,18 +831,14 @@ impl Reader {
                                     .unwrap_or_default();
                                 l.price.base_quantity =
                                     decimal(g, "BasisQuantity").map(Quantity::new);
-                                // An empty `unitCode` is an absent BT-150, not a
-                                // BT-150 whose value is the empty string. The
-                                // difference is a fatal `PEPPOL-EN16931-R130`,
-                                // which compares BT-150 against BT-130.
+                                // An empty `unitCode` is an absent BT-150
+                                // (else `PEPPOL-EN16931-R130` fires).
                                 l.price.base_quantity_code = kid(g, "BasisQuantity")
                                     .and_then(|q| q.attribute("unitCode"))
                                     .filter(|u| !u.trim().is_empty())
                                     .map(Code::new);
                             }
-                            other => self
-                                .unmapped
-                                .push_path("SpecifiedLineTradeAgreement", other),
+                            other => self.push_path("SpecifiedLineTradeAgreement", other),
                         }
                     }
                 }
@@ -815,9 +851,7 @@ impl Reader {
                     }
                 }
                 "SpecifiedLineTradeSettlement" => self.line_settlement(&mut l, c),
-                other => self
-                    .unmapped
-                    .push_path("IncludedSupplyChainTradeLineItem", other),
+                other => self.push_path("IncludedSupplyChainTradeLineItem", other),
             }
         }
         l
@@ -861,9 +895,7 @@ impl Reader {
                 "ReceivableSpecifiedTradeAccountingAccount" => {
                     l.accounting_reference = text(c, "ID");
                 }
-                other => self
-                    .unmapped
-                    .push_path("SpecifiedLineTradeSettlement", other),
+                other => self.push_path("SpecifiedLineTradeSettlement", other),
             }
         }
     }
@@ -887,20 +919,9 @@ impl Reader {
                     }
                 }
                 "OriginTradeCountry" => i.origin_country = code(c, "ID"),
-                other => self.unmapped.push_path("SpecifiedTradeProduct", other),
+                other => self.push_path("SpecifiedTradeProduct", other),
             }
         }
         i
-    }
-}
-
-/// Recording an unmapped element, in the one shape the whole reader uses.
-trait PushPath {
-    fn push_path(&mut self, parent: &str, child: &str);
-}
-
-impl PushPath for BTreeSet<String> {
-    fn push_path(&mut self, parent: &str, child: &str) {
-        self.insert(format!("{parent}/{child}"));
     }
 }

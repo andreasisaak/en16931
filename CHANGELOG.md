@@ -1,19 +1,11 @@
 # Changelog
 
 All three published crates — [`en16931`], [`en16931-formats`] and
-[`en16931-cli`] — share one version and one entry per release. They are released
-from a single tag for the reason [`Cargo.toml`](Cargo.toml) gives: the bindings
-re-export the model's types across their whole surface, so a breaking change to
-the model breaks them either way, and two version numbers would only record that
-fact twice.
+[`en16931-cli`] — share one version and one entry per release.
 
 The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Before 1.0, a minor bump may break: the promise is that a break is **deliberate
-and written down here**, not that there are none.
-
-Entries say *why*, not only *what*. A line that reads "fixed rule count" tells a
-reader upgrading nothing about whether it affected them.
+Before 1.0, a minor release may break; every break is listed here.
 
 [`en16931`]: https://crates.io/crates/en16931
 [`en16931::fmt`]: https://docs.rs/en16931/latest/en16931/fmt/index.html
@@ -21,6 +13,214 @@ reader upgrading nothing about whether it affected them.
 [`en16931-cli`]: https://crates.io/crates/en16931-cli
 
 ## [Unreleased]
+
+## [0.8.0] — 2026-10-11
+
+Everything under Removed is breaking.
+
+`en16931-formats` gets one façade (`read`, `receive`, `write`,
+`write_unchecked`, `convert`), a layered report and a ZUGFeRD / Factur-X writer;
+the pinned authorities move to their current releases.
+
+### Added
+
+- `en16931_formats::read(&bytes)` for UBL, CII and ZUGFeRD / Factur-X PDFs
+  (UTF-8, or UTF-8 / UTF-16 with a byte-order mark; other encodings refused).
+- `en16931_formats::read_with(&bytes, &Limits)`: `read` under the caller's PDF
+  extraction limits.
+- `en16931_formats::receive(&bytes, &Policy) -> Received`: validate as declared
+  and as required, and recommend `Accept`, `Reject` or `Undefined` as KoSIT's
+  validator does.
+- `en16931_formats::write(&proof, syntax)`, `write_unchecked(&invoice, syntax)`
+  (refuses a model the target schema cannot express) and `convert(&bytes,
+  syntax, Loss)` (refuses any loss unless `Loss::Allow`).
+- A layered report, `en16931_formats::report::Report` (container, syntax,
+  schema, semantic), and typed `report::Entry { kind, path, term, value, rule,
+  message, hint }` for everything a reader, the container or a writer reports.
+- Duplicate detection: the readers read the first occurrence of every element
+  the schema or a CEN syntax rule allows once, and report each further one as
+  `Duplicate` (or `Repeated` where CEN's rule is a warning). Generated tables
+  `ubl::once` and `cii::once`; `cii::KOSIT_RAISED` names the two CII rules
+  KoSIT raises to error under XRechnung.
+- `zugferd::embed(pdf_a3, &proof, &EmbedOptions)`: embeds a validated
+  EN 16931 or XRechnung invoice into a PDF/A-3 file as one incremental update,
+  reads the result back, and refuses with a typed `EmbedError`.
+- `zugferd::Limits`: 64 MiB per stream, 128 MiB per call and 10 000 objects per
+  walk by default. New `zugferd::Error` variants `LimitExceeded`,
+  `EmbeddedFilesTree` and `Undecodable`.
+- `en16931::profiles::classify(bt24) -> Declaration` (`Known`, `Unknown`,
+  `WrongProcess`), and `profiles::ZUGFERD`: `ZUGFERD_MINIMUM`,
+  `ZUGFERD_BASIC_WL`, `ZUGFERD_BASIC` and `ZUGFERD_EXTENDED`.
+  `Profile::is_en16931_invoice` and `Profile::left_out`.
+- `FromStr` for `&'static Profile` (slug, display name, alias or BT-24, over
+  `profiles::ALL` and `profiles::ZUGFERD`) and for `Severity`. `Check::relevel(rule, Severity)`, recorded on the report.
+- `en16931-report/4`: the interchange report carries `layers`, `identity`,
+  `declaration`, `recommendation`, `reasons`, `required`, `relevelled`,
+  `leftOut` and `source`. Filled by `Received::to_interchange()`,
+  `en16931_formats::report::Report::to_interchange()` and
+  `en16931_formats::Read::report()`; `en16931::report::Report::unchecked()`.
+  SVRL renders every layer.
+- Constructors: `PostalAddress::new`, `Party::new` with `with_vat_identifier`,
+  `with_electronic_address` and `with_contact`, `Contact::new`,
+  `PaymentInstructions::sepa_credit_transfer` and `sepa_direct_debit`.
+- `en16931::examples`: `annex_a()`, the eight worked examples of EN 16931-1
+  Annex A, and `for_profile(&profile)`, a valid invoice for each profile in
+  `profiles::ALL`.
+- `PaymentTerms` and `EarlyPaymentDiscount` render BT-20 with XRechnung's
+  `#SKONTO#` lines (`PaymentTermsError` names BT-20).
+- CLI: `en16931 embed`; `validate --relevel RULE=LEVEL`; the three PDF limits
+  as flags on `validate` and `extract`.
+- `ProveError::Relevelled` (the enum is `#[non_exhaustive]`): a re-levelled
+  check never yields a proof.
+- `en16931_formats::Syntax` and `en16931_formats::Error` are
+  `#[non_exhaustive]`; their variants depend on the enabled features.
+- `#![forbid(unsafe_code)]` in `en16931-formats` and `en16931-cli`.
+- For contributors: cargo-fuzz targets (`just fuzz`), mutation testing of
+  changed lines in CI (`just mutants-diff`), a veraPDF PDF/A-3b gate for
+  `embed`, and an OASIS UBL 2.1 schema gate beside the CII D16B one.
+
+### Changed
+
+- **Breaking:** the pinned authorities move to their current releases: KoSIT
+  XRechnung Schematron `v2.6.0` (was `v2.5.0`), validator configuration
+  `v2026-08-31` (was `v2026-01-31`), Peppol BIS Billing 3.0.21 at commit
+  `806866bd` (was 3.0.20). CEN stays at `validation-1.3.16`.
+- **Breaking:** with them, `BR-TMP-2` is fatal under every XRechnung profile
+  (was a warning); 17 `PEPPOL-COMMON-*` identifier rules run under Peppol
+  (290 checks, was 273; 334 rules registered, was 317); `PEPPOL-EN16931-R007`
+  accepts exactly 3.0.21's four BT-23 values, `R004` rejects a BT-24 containing
+  `::`, and `CL008` holds 83 EAS schemes (was 94).
+- **Breaking:** BT-24 is classified exactly: an XRechnung identifier with an
+  unknown suffix is `Unknown`, as it is for KoSIT.
+- **Breaking:** rule ids no longer map `BR-IG-*` to `BR-AF-*` or `BR-IP-*` to
+  `BR-AG-*` (in `explain`, `Check::without`, overrides and the CLI). Use the ids
+  the reports print.
+- **Breaking:** `Identifier::eas` checks the value where the scheme's format is
+  checkable (the GLN, `0088`).
+- **Breaking:** `Date` converts from `chrono::NaiveDate` by `TryFrom` (was
+  `From`), refusing a year outside `0000..=9999` as `time::Date` does.
+- **Breaking:** `Profile` has two new fields, `aliases` and `core`.
+- **Breaking:** `validation::profile::Rejected` is a struct with `invoice()`,
+  `report()` and `into_parts()`, displayed as its report; it and
+  `ValidationReport` implement `std::error::Error`, so `Validated::new(invoice)?`
+  and `report.into_result()?` convert into `Box<dyn Error>`.
+- **Breaking:** `en16931::report::Report` has nine new public fields
+  (`relevelled`, `left_out`, `source`, `identity`, `declaration`,
+  `recommendation`, `reasons`, `layers`, `required`); `SCHEMA` is
+  `en16931-report/4` (was `/3`).
+- **Breaking:** `svrl::to_svrl` takes the interchange `&report::Report`: use
+  `to_svrl(&Report::of(&report))`.
+- **Breaking:** `Invoice` JSON is a versioned envelope, `{"en16931": "0.8",
+  "invoice": {…}}`; the bare 0.7 body is refused. Omitted list fields read as
+  empty.
+- **Breaking:** BT-8 read from CII is held as the UNTDID 2005 code (`5`, `29`,
+  `72` become `3`, `35`, `432`), and the CII writer writes CII's code. A lawful
+  CII invoice no longer fails `BR-CL-06` (#1).
+- **Breaking:** the `billing` feature requires `billing` 0.16; the adapter is
+  `billing_adapter::from_billing(&Document, header) -> Result<Invoice,
+  SeamError>`.
+- **Breaking:** `zugferd::extract` and `zugferd::embedded_files` take
+  `&Limits`. `Extracted::xml` is `Vec<u8>`; `zugferd::Error::Pdf` carries a
+  message and `Error::Encoding { found }` replaces `FromUtf8Error`. A corrupt
+  stream is now `Undecodable` instead of truncated or still-encoded bytes.
+- **Breaking:** no `roxmltree` or `lopdf` type in the public API;
+  `Error::Xml { message, line, column }`.
+- **Breaking (CLI):** `validate` checks each document as its BT-24 declares
+  it; `--require <profile>` adds a second report. Exit `0` accept, `1` reject
+  or undefined (including bytes that are not an invoice, hostile documents and
+  PDFs over a limit, which were `2`), `2` only for an unreadable file or a
+  misused command. `--format json` is an array of `en16931-report/4` reports;
+  `--format svrl` renders every layer.
+- **Breaking (CLI):** `convert` refuses a lossy conversion unless
+  `--allow-loss`, and writes every entry to stderr by its kind.
+  `inspect --format json` is `en16931-report/4` with no rules run.
+- An element's text includes the text around comments, and a whitespace-only
+  element is an absent term in both readers.
+- The CII element order is read from CEN's D16B schema; the UBL order table is
+  derived from 325 UBL instances (was 319).
+- `write_unchecked` writes the extension groups the invoice's declared profile
+  defines.
+- The CII reader reports a BT-7 written as `udt:DateTimeString` as a schema
+  entry, and still reads it.
+- The `zugferd` feature adds the optional dependency `flate2`.
+- `rust_decimal` 1.43; `chacha20` 0.10.2. `just audit` ignores no advisory.
+- For contributors: `just spec` is `just references`; the reference corpus
+  location is `EN16931_REFERENCE` in `.cargo/config.toml`. `cargo xtask fetch`
+  pins by tag or commit and also fetches the ZUGFeRD corpus and the OASIS UBL
+  2.1 schemas (needs `curl` and `unzip`). `cargo xtask watch` reports every
+  pin behind its source; a weekly workflow keeps one issue per moved source.
+
+### Removed
+
+Each with its replacement:
+
+- `profiles::lookup(name)` → `name.parse::<&Profile>()`.
+- `profiles::for_specification_id`, `xrechnung::detect`, `xrechnung::Flavour`
+  and their re-exports `en16931_formats::{detect, Flavour}` →
+  `profiles::classify`.
+- `InvoiceBuilder::coded_note` → `InvoiceBuilder::note`, which takes
+  `impl Into<InvoiceNote>`. `Identifier::eas_checked` → `Identifier::eas`.
+- `ubl::from_str`, `cii::from_str`, `ubl::Reader`, `cii::Reader`, `ubl::Read`,
+  `cii::Read`, `ubl::Error`, `cii::Error`, `sniff` → `read`, `Read`, `Error`.
+- `ubl::to_string`, `cii::to_string`, `ubl::write`, `cii::write`,
+  `ubl::Written`, `cii::Written` → `write_unchecked`, `Written`.
+- `ubl::write_validated`, `cii::write_validated` → `write(&proof, syntax)`.
+- `ubl::to_string_for`, `cii::to_string_for`, `ubl::write_for`,
+  `cii::write_for`, `NotValid` → `Validated::<P>::new` and `write`, or
+  `Check::new(profile).run`.
+- `ubl::MAX_DEPTH`, `cii::MAX_DEPTH` → `MAX_DEPTH`.
+- The modules `ubl::read`, `ubl::write`, `cii::read` and `cii::write` are
+  private → `read`, `write`, `write_unchecked`.
+- `zugferd::Extracted::{invoice, syntax_findings}` → `read(&pdf)`.
+- `Read::unmapped`, `Read::malformed`, `Written::dropped` → the typed
+  `entries`.
+- `billing_adapter::FromBilling`, `UnitResolver`, `ConversionError` →
+  `from_billing`, `SeamError`.
+- CLI `--profile` / `-p` on `validate` and `convert` → `--require` / `-r`;
+  `--profile auto` is gone (each document is checked as its BT-24 declares);
+  the JSON wrapper
+  `{schema, valid, documents}` → an array of `en16931-report/4` reports.
+- Types that served only a removed item go with it.
+
+### Fixed
+
+- `zugferd::extract` reads the XMP by namespace: the ZUGFeRD / Factur-X fields
+  only from their schemas, `pdfaid:` only from PDF/A's. A malformed packet reads
+  as `Divergence::NoXmp`.
+- `InvoiceAmount::parse` accepts the rendering of `InvoiceAmount::MIN`.
+- The UBL reader reports an amount, decimal or date it cannot hold as
+  `Malformed` instead of dropping it silently.
+- The writers report characters XML cannot represent as `Dropped`, and write
+  a carriage return (and a tab or line feed in an attribute) as a reference.
+- BT-110 with a blank or padded `@currencyID` is read as BT-110; a UBL VAT
+  total in a third currency, or a further one in a currency already read, is
+  reported as `Unmapped`.
+- The UBL writer derives BT-110 from BT-117 (reported as `Derived`) when BG-23
+  is present without it, as the UBL schema requires, and reports instead of
+  panicking when that sum overflows.
+- A CII invoice with two `ram:SpecifiedTradePaymentTerms` is invalid under
+  XRechnung (`CII-SR-452`/`453` at error, as KoSIT configures); a second,
+  different BT-8 in CII is a `Duplicate` citing `CII-SR-462`.
+- The CII writer writes BT-7 once (`CII-SR-461`) and follows the D16B element
+  order on every parent.
+- The UBL writer writes one buyer identifier (`UBL-SR-16`) and reports the
+  rest, gives a sub-invoice line its own VAT category, and keeps BT-8 on an
+  invoice without an invoicing period.
+- `BR-DE-17` and `BR-DE-21` fire on an absent BT-3 / BT-24.
+
+### Security
+
+- `zugferd::extract` (and everything built on it: `read`, `receive`, `embed` and
+  the CLI) is bounded by `Limits`. A 572-byte PDF whose embedded-files tree lists
+  itself no longer hangs it: each object is visited once and cycles are refused.
+  Nothing is inflated until the invoice is chosen by name, and then only the
+  invoice and the XMP, each cut off at the limit; object streams are measured
+  before the PDF parser inflates them. A 522 KB PDF can no longer make it
+  allocate over 1 GB.
+- An 840-byte PDF no longer aborts the process: a cross-reference stream's
+  `/W`, `/Size` and `/Index` are checked before the PDF parser allocates for
+  them, and an impossible one is refused as `zugferd::Error::Pdf`.
+- Input size and parse time remain the caller's to bound.
 
 ## [0.7.3] — 2026-10-10
 
@@ -961,7 +1161,8 @@ directions, ZUGFeRD / Factur-X extraction, and the command.
 - `en16931-cli`: `validate`, `convert`, `diff`, `extract`, `inspect`, `explain`,
   `rules`, `profiles`, and CI-shaped exit codes.
 
-[Unreleased]: https://github.com/hupe1980/en16931/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/hupe1980/en16931/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/hupe1980/en16931/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/hupe1980/en16931/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/hupe1980/en16931/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/hupe1980/en16931/compare/v0.7.0...v0.7.1

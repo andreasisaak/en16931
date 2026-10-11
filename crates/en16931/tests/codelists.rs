@@ -1,27 +1,8 @@
-//! Round-trip the committed code lists against the CEN artefacts.
+//! Checks the committed code lists, rule coverage and severities against the
+//! reference corpus (`cargo xtask fetch`); skips with a message when it is absent.
 //!
-//! # Why this test exists
-//!
-//! A Schematron `test` is a *program*, not a data structure. Two of the fourteen
-//! `BR-CL-*` rules carry more than one code list in a single expression, for two
-//! different reasons:
-//!
-//! - **`BR-CL-01`** is a disjunction over `self::` — 50 codes when the element is
-//!   `cbc:InvoiceTypeCode`, 13 when it is `cbc:CreditNoteTypeCode`.
-//! - **`BR-CL-10`** is the ISO 6523 list *plus* a contextual literal: `SEPA` is
-//!   admissible, but only on a party identification under
-//!   `cac:AccountingSupplierParty` or `cac:PayeeParty`.
-//!
-//! An extractor that takes the first `contains(…)` literal and stops is
-//! confidently, precisely wrong on both. That mistake was made during the design
-//! of this crate and produced an incorrect bug report against an upstream
-//! project, so the defence is a test rather than a promise to be careful.
-//!
-//! # Running it
-//!
-//! Needs the artefacts: run `cargo xtask fetch` first. Without `spec/` the test
-//! **skips** rather than fails, so a contributor without the artefacts — or CI
-//! without network — can still run the suite. The skip is printed, not silent.
+//! `BR-CL-01` (invoice vs credit-note type codes) and `BR-CL-10` (ICD plus a
+//! contextual `SEPA`) carry more than one list in one `test` expression.
 
 mod common;
 
@@ -30,7 +11,7 @@ use std::path::PathBuf;
 
 use en16931::codes::generated::*;
 
-/// Location of the code-list Schematron, relative to the crate root.
+/// The code-list Schematron, relative to the reference corpus.
 const CODES_SCH: &str = "eInvoicing-EN16931/ubl/schematron/codelist/EN16931-UBL-codes.sch";
 
 fn artefact() -> Option<PathBuf> {
@@ -38,14 +19,9 @@ fn artefact() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Every string literal in the `test` attribute of the assert with `id`, in
-/// source order, split into codes.
-///
-/// Deliberately does **not** stop at the first: see the module docs.
+/// Every string literal in the `test` of the assert with `id`, split into codes.
 fn literals_of(xml: &str, id: &str) -> Vec<Vec<String>> {
-    // Locate the assert by its id attribute, then walk back to the enclosing
-    // `test="` and forward to its closing quote. Attribute values in this file
-    // contain no escaped quotes, which the assertion below double-checks.
+    // Find the id, walk back to `test="` and forward to the closing quote.
     let mut out = Vec::new();
     let needle = format!("id=\"{id}\"");
     for (idx, _) in xml.match_indices(&needle) {
@@ -124,10 +100,7 @@ fn committed_tables_match_the_artefacts() {
     }
 }
 
-/// The two rules whose tests carry more than one list, pinned explicitly.
-///
-/// If a future artefact revision collapses or extends either, this fails loudly
-/// rather than letting the generator silently pick a different branch.
+/// The two multi-list rules keep the shape the generator assumes.
 #[test]
 fn the_multi_list_rules_still_have_the_shape_we_assume() {
     let Some(path) = artefact() else {
@@ -160,8 +133,7 @@ fn the_multi_list_rules_still_have_the_shape_we_assume() {
     );
 }
 
-/// `SEPA` is admissible under `BR-CL-10` but is deliberately absent from the
-/// table, because its admissibility depends on ancestry the table cannot see.
+/// `SEPA` is admissible under `BR-CL-10` only by ancestry, so it is not in the table.
 #[test]
 fn sepa_is_not_in_the_icd_table() {
     assert!(
@@ -171,14 +143,10 @@ fn sepa_is_not_in_the_icd_table() {
     );
 }
 
-// ── The artefact gap, measured rather than claimed ────────────────────────────
+// ── Rule coverage ─────────────────────────────────────────────────────────────
 
-/// Every rule id asserted anywhere in the syntax-independent artefacts.
-///
-/// Two files: the abstract model (`BR-*`, `BR-CO-*`, the category families) and
-/// the UBL code-list Schematron (`BR-CL-*`). Together these are the 223
-/// syntax-independent rules; the ~1 315 `UBL-*` / `CII-*` syntax rules are
-/// deliberately out of scope for a syntax-independent model.
+/// Every `BR-*` id in the abstract-model and code-list Schematrons: the
+/// syntax-independent rules.
 fn artefact_rule_ids() -> Option<BTreeSet<String>> {
     let root = common::spec_root()?;
     let files = [
@@ -201,8 +169,7 @@ fn artefact_rule_ids() -> Option<BTreeSet<String>> {
     Some(out)
 }
 
-/// `BR-1` and `BR-01` are the same rule: the standard's prose drops the leading
-/// zero, the artefacts keep it. Compare on the padded form.
+/// Pads a one-digit suffix (`BR-1` → `BR-01`).
 fn normalise(id: &str) -> String {
     match id.rsplit_once('-') {
         Some((head, tail)) if tail.len() < 2 && tail.chars().all(|c| c.is_ascii_digit()) => {
@@ -212,12 +179,7 @@ fn normalise(id: &str) -> String {
     }
 }
 
-/// The registry covers every syntax-independent artefact rule.
-///
-/// This is the number that matters and the easiest one to overstate, so it is
-/// asserted rather than reported in a README. It compares the **runtime**
-/// registry — not a grep of the source, which misses every macro-generated
-/// family and would have read 92 where the truth is 223.
+/// The runtime registry covers every syntax-independent artefact rule.
 #[test]
 fn the_registry_covers_the_syntax_independent_artefacts() {
     let Some(artefact) = artefact_rule_ids() else {
@@ -249,17 +211,9 @@ fn the_registry_covers_the_syntax_independent_artefacts() {
     );
 }
 
-/// The profile rule sets cover their own artefacts.
-///
-/// Same discipline as the core check above, and for the same reason: "XRechnung
-/// support" is easy to claim and easy to be 60 % of. Each profile is compared
-/// against the Schematron its authority publishes.
-///
-/// One family is deliberately out of scope and named here rather than silently
-/// dropped: **Peppol's national rules** (`DK-R-*`, `GR-R-*`, `IS-R-*`,
-/// `IT-R-*`, `NL-R-*`, `NO-R-*`, `SE-R-*`, `DE-R-*`) — country requirements
-/// layered on Peppol, each with its own registry formats and check digits.
-/// `DE-R-*` is XRechnung translated and is already covered under its own ids.
+/// Each profile covers the Schematron its authority publishes, except
+/// [`KOSIT_SYNTAX_ONLY_RULES`] and Peppol's national rules
+/// (`common::peppol::is_national`).
 #[test]
 fn the_profile_rule_sets_cover_their_artefacts() {
     let Some(root) = common::spec_root() else {
@@ -273,36 +227,26 @@ fn the_profile_rule_sets_cover_their_artefacts() {
         (
             "XRechnung 3.0",
             "xrechnung-schematron/src/validation/schematron/ubl/XRechnung-UBL-validation.sch",
-            // Everything, `BR-DEX-*` included — the Extension is shipped as
-            // `profiles::XRECHNUNG_EXTENSION` and its rules are registered.
-            |_| true,
+            // Everything (`BR-DEX-*` included) except syntax-only assertions.
+            |id| !KOSIT_SYNTAX_ONLY_RULES.iter().any(|(r, _)| *r == id),
         ),
-        // KoSIT publishes **two** Schematrons, and two assertions exist only
-        // in the CII one — so reading the UBL file alone makes "55 / 55" mean
-        // 55 of 57. Both are syntax rules by construction and stay out of
-        // scope, by decision rather than by oversight; see
-        // `CII_ONLY_SYNTAX_RULES`.
+        // Some KoSIT assertions exist only in the CII Schematron.
         (
             "XRechnung 3.0 (CII-only assertions)",
             "xrechnung-schematron/src/validation/schematron/cii/XRechnung-CII-validation.sch",
-            |id| !CII_ONLY_SYNTAX_RULES.iter().any(|(r, _)| *r == id),
+            |id| !KOSIT_SYNTAX_ONLY_RULES.iter().any(|(r, _)| *r == id),
         ),
-        // KoSIT's `rule-list.xml` — the Peppol asserts its build merges in.
-        // This file is the *only* place the merged set is written down, and
-        // reading the Schematron alone would miss all 21.
-        //
-        // It must be **parsed**, not scanned: eleven entries are commented out
-        // in the XML, and a text search matches straight through the comments.
+        // KoSIT's `rule-list.xml`: the Peppol asserts its build merges in. Parsed,
+        // because some entries are commented out.
         (
             "XRechnung 3.0 (merged Peppol rules)",
             "xrechnung-schematron/src/xsl/rule-list.xml",
             |id| id.starts_with("PEPPOL-EN16931-"),
         ),
-        (
-            "Peppol BIS Billing 3.0",
-            "peppol-bis-invoice-3/rules/sch/PEPPOL-EN16931-UBL.sch",
-            |id| id.starts_with("PEPPOL-EN16931-") && !id.contains("COMMON"),
-        ),
+        // Every Peppol assertion except the national rules.
+        ("Peppol BIS Billing 3.0", common::peppol::UBL_SCH, |id| {
+            !common::peppol::is_national(id)
+        }),
     ];
 
     // Every id this crate can report, from every shipped profile.
@@ -322,11 +266,8 @@ fn the_profile_rule_sets_cover_their_artefacts() {
             continue;
         }
         let xml = std::fs::read_to_string(&p).expect("read artefact");
-        // `<assert id=…>` only — `<pattern id=…>` and `<rule id=…>` are
-        // structure, not rules, and counting them would inflate the denominator.
         let mut want = BTreeSet::new();
-        // `rule-list.xml` names rules as `<r:rule>` text, not `<assert id=…>`.
-        // Commented-out entries must not count, so this branch parses.
+        // `rule-list.xml` names rules as element text, not `<assert id=…>`.
         if file.ends_with("rule-list.xml") {
             let doc = roxmltree::Document::parse(&xml).expect("parse rule-list");
             for e in doc.root_element().children().filter(|n| n.is_element()) {
@@ -350,23 +291,10 @@ fn the_profile_rule_sets_cover_their_artefacts() {
             );
             continue;
         }
-        let marker = "<assert";
-        for (idx, _) in xml.match_indices(marker) {
-            let id = if marker == "<r:rule" {
-                let rest = &xml[idx..];
-                let start = rest.find('>').expect("unclosed element") + 1;
-                let end = rest[start..].find('<').expect("unterminated text") + start;
-                rest[start..end].trim()
-            } else {
-                let Some(rel) = xml[idx..].find("id=\"") else {
-                    continue;
-                };
-                let rest = &xml[idx + rel + 4..];
-                let end = rest.find('"').expect("unterminated id");
-                &rest[..end]
-            };
-            if in_scope(id) {
-                want.insert(normalise(id));
+        // Parsed: a text scan would count asserts inside XML comments.
+        for id in common::peppol::flags(&xml).into_keys() {
+            if in_scope(&id) {
+                want.insert(normalise(&id));
             }
         }
         let missing: Vec<_> = want.difference(&known).cloned().collect();
@@ -384,35 +312,44 @@ fn the_profile_rule_sets_cover_their_artefacts() {
     }
 }
 
-/// KoSIT assertions that exist only in the CII Schematron, and why a
-/// syntax-independent model cannot hold them.
-///
-/// Both are about the **shape of the CII document**, not about the invoice: the
-/// model has one item base quantity and one line structure, so neither
-/// condition is expressible in it, let alone violable. They belong to
-/// `en16931-formats`, which is where the CII binding lives.
-///
-/// Named here rather than filtered by a pattern, so adding a third CII-only
-/// rule fails this suite and forces the same decision to be made again.
-const CII_ONLY_SYNTAX_RULES: &[(&str, &str)] = &[
+/// KoSIT assertions about the document's syntax, which the model cannot hold,
+/// with what the `en16931-formats` readers do instead.
+const KOSIT_SYNTAX_ONLY_RULES: &[(&str, &str)] = &[
     (
         "BR-TMP-3",
-        "BT-149 / BT-150 must agree between CII's Gross and Net price paths — \
+        "CII only. BT-149 / BT-150 must agree between CII's Gross and Net price paths — \
          the model carries one base quantity, so the two cannot disagree",
     ),
     (
+        "BR-TMP-4",
+        "CII only, warning. At most one `ram:Name` (BT-123) in a BG-24 document — the \
+         model holds one; the CII reader keeps the first and reports the second",
+    ),
+    (
+        "BR-TMP-5",
+        "CII only, warning. At most one `ram:AttachmentBinaryObject` (BT-125) in a BG-24 \
+         document — the model holds one; the CII reader keeps the first and reports the second",
+    ),
+    (
+        "BR-TMP-6",
+        "UBL only, warning. A date is written `YYYY-MM-DD` — `Date` holds a calendar day, \
+         not a spelling. The UBL reader accepts `xs:date` with a time zone (dropped) and \
+         leaves a value it cannot read as a date absent",
+    ),
+    (
+        "BR-TMP-7",
+        "CII only, warning. A date carries `format=\"102\"` and `YYYYMMDD` — the CII \
+         reader accepts a missing `format`, and records any other format or a \
+         non-`CCYYMMDD` value as malformed and leaves the term absent",
+    ),
+    (
         "BR-DEX-15",
-        "ram:ParentLineID must not appear — a CII element for sub invoice lines. \
+        "CII only. ram:ParentLineID must not appear — a CII element for sub invoice lines. \
          The Extension model carries them; whether a syntax can is the syntax's question",
     ),
 ];
 
-/// The syntax-rule count this crate quotes is the one the artefacts carry.
-///
-/// `README.md`, `lib.rs` and the documentation site all name a figure for the
-/// rules that belong to `en16931-formats`, and a number repeated in three
-/// documents and checked in none is how it came to be **1 315**: the sum omitted
-/// `UBL-DT-*` while including `CII-DT-*`.
+/// The documented syntax-rule (`UBL-*` / `CII-*`) count matches the artefacts.
 #[test]
 fn the_syntax_rule_count_is_measured() {
     let Some(root) = common::spec_root() else {
@@ -429,7 +366,7 @@ fn the_syntax_rule_count_is_measured() {
             return;
         };
         for sub in walk.flatten() {
-            // `preprocessed/` is the same rules again, resolved.
+            // `preprocessed/` repeats the same rules.
             if sub.file_name() == "preprocessed" {
                 continue;
             }
@@ -467,26 +404,9 @@ fn the_syntax_rule_count_is_measured() {
     );
 }
 
-/// CEN's own unit-test suite agrees with this crate's dispositions.
-///
-/// `spec/eInvoicing-EN16931/test/{Invoice,CreditNote}-unit-UBL/` holds one XML
-/// instance per rule CEN considers worth testing — 208 of them. It is a
-/// different kind of artefact from the Schematron: the Schematron says what CEN
-/// *specifies*, the suite says what CEN *exercises*. Where this crate declines
-/// to evaluate a rule, the suite is independent evidence for or against.
-///
-/// Two claims are checked, and only two, because only two hold:
-///
-/// * **Every rule this crate calls undecidable has no CEN unit test.**
-///   `BR-CO-05` … `BR-CO-08` are bound to `value="true()"` in the Schematron
-///   (§34.3) *and* CEN ships no instance for them. Two independent artefacts,
-///   same conclusion.
-/// * **No `BR-DEC-*` rule has a CEN unit test.** They constrain decimal places,
-///   which `InvoiceAmount`'s `i64` minor units make unrepresentable.
-///
-/// The converse does **not** hold and is not asserted: 53 artefact rules have no
-/// unit test, most of them simply because the suite predates the `BR-AF-*` /
-/// `BR-AG-*` / `BR-B-*` families. "Untested by CEN" is not "unimplementable".
+/// CEN's UBL unit-test suite in the reference corpus agrees with this crate:
+/// the undecidable `BR-CO-05` … `BR-CO-08` and the type-retired `BR-DEC-*`
+/// rules have no CEN unit test. (The converse is not asserted.)
 #[test]
 fn cen_unit_tests_agree_with_our_dispositions() {
     let Some(root) = common::spec_root() else {
@@ -518,10 +438,15 @@ fn cen_unit_tests_agree_with_our_dispositions() {
                 }
                 _ => stem,
             };
-            // CEN's filenames use the **standard's** family spelling (`BR-IG-*`,
-            // `BR-IP-*`) where the Schematron uses the artefacts' (`BR-AF-*`,
-            // `BR-AG-*`). That this crate has to alias them is not a theory:
-            // here are 22 files proving both spellings are in live use.
+            // CEN 1.3.16's test files say `BR-IG-*` / `BR-IP-*` where the
+            // Schematron says `BR-AF-*` / `BR-AG-*`; mapped here only, not in `RuleId`.
+            let base = if let Some(rest) = base.strip_prefix("BR-IG-") {
+                format!("BR-AF-{rest}")
+            } else if let Some(rest) = base.strip_prefix("BR-IP-") {
+                format!("BR-AG-{rest}")
+            } else {
+                base
+            };
             tested.insert(en16931::validation::RuleId::new(Box::leak(
                 base.into_boxed_str(),
             )));
@@ -554,18 +479,62 @@ fn cen_unit_tests_agree_with_our_dispositions() {
          them, which is worth a look: {dec_with_tests:?}"
     );
 
-    // The alias claim, stated as an assertion rather than a comment.
     assert!(
         has_test("BR-AF-01") && has_test("BR-AG-01"),
-        "CEN's suite spells these BR-IG-01 / BR-IP-01; RuleId must alias them"
+        "CEN's suite spells these BR-IG-01 / BR-IP-01, mapped above"
     );
     eprintln!("CEN unit-test instances: {} rules exercised", tested.len());
 }
 
-// ── Severity overrides, against the authority's own configuration ────────────
+// ── Severities against each authority's configuration ────────────────────────
 
-/// KoSIT's validator configuration, relative to `spec/`.
+/// KoSIT's validator configuration, relative to the reference corpus.
 const XR_SCENARIOS: &str = "validator-configuration-xrechnung/scenarios.xml";
+
+/// The `customLevel` overrides in KoSIT's `scenarios.xml` this crate does not
+/// apply: each re-levels a syntax rule no rule set here registers.
+const OUT_OF_SCOPE_LEVELS: &[(&str, &str)] = &[
+    (
+        "UBL-CR-470",
+        "UBL syntax rule (cac:PrepaidPayment); the UBL writer waives it for the \
+         XRechnung Extension, which is what the override is for",
+    ),
+    (
+        "UBL-CR-646",
+        "UBL syntax rule (cac:SubInvoiceLine); the UBL writer waives it for the \
+         XRechnung Extension, which is what the override is for",
+    ),
+    (
+        "CII-SR-452",
+        "CII syntax rule; registered by no rule set here",
+    ),
+    (
+        "CII-SR-453",
+        "CII syntax rule; registered by no rule set here",
+    ),
+    (
+        "CII-SR-454",
+        "CII syntax rule; registered by no rule set here",
+    ),
+    (
+        "CII-SR-465",
+        "CII syntax rule, raised to error in v2026-08-31; registered by no rule set here",
+    ),
+    (
+        "CII-SR-466",
+        "CII syntax rule, raised to error in v2026-08-31; registered by no rule set here",
+    ),
+    (
+        "CII-SR-475",
+        "CII syntax rule, lowered to information in v2026-08-31; registered by no rule \
+         set here",
+    ),
+    (
+        "CII-SR-476",
+        "CII syntax rule, lowered to information in v2026-08-31; registered by no rule \
+         set here",
+    ),
+];
 
 /// Every `<customLevel>` in a named scenario, as `(rule id, level)`.
 fn custom_levels(xml: &str, scenario: &str) -> Vec<(String, String)> {
@@ -590,17 +559,14 @@ fn custom_levels(xml: &str, scenario: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// KoSIT's Schematrons, relative to `spec/`. Both of them.
+/// KoSIT's UBL and CII Schematrons, relative to the reference corpus.
 const XR_SCHEMATRONS: [&str; 2] = [
     "xrechnung-schematron/src/validation/schematron/ubl/XRechnung-UBL-validation.sch",
     "xrechnung-schematron/src/validation/schematron/cii/XRechnung-CII-validation.sch",
 ];
 
 /// Every `<assert>`/`<report>` id in KoSIT's own Schematrons, with its `flag`.
-///
-/// Parsed, not scanned: several `test` expressions contain a literal `>`
-/// (`count(cac:SubInvoiceLine) > 0`), so a regular expression over the tag
-/// stops early and reports the wrong flag for `BR-DEX-02`.
+/// Parsed, since some `test` expressions contain a literal `>`.
 fn kosit_flags(root: &std::path::Path) -> std::collections::BTreeMap<String, en16931::Severity> {
     let mut out = std::collections::BTreeMap::new();
     for file in XR_SCHEMATRONS {
@@ -638,23 +604,9 @@ fn kosit_flags(root: &std::path::Path) -> std::collections::BTreeMap<String, en1
     out
 }
 
-/// Every KoSIT rule must run at the severity **KoSIT's Schematron** gives it.
-///
-/// # A second file publishes severity, and it was never read
-///
-/// [`the_severity_overrides_are_kosits_own`] checks `scenarios.xml`, which
-/// re-levels *CEN's* rules. KoSIT's own rules carry their severity in the
-/// Schematron's `flag` attribute instead, and nothing compared that — so five
-/// checks ran as fatal that KoSIT publishes as warnings:
-///
-/// | | |
-/// |---|---|
-/// | `BR-DE-26` | *"soll … übermittelt werden"* — a corrected invoice **should** cite the original |
-/// | `BR-DE-27`, `BR-DE-28` | a telephone number with two digits, an address that is not quite one |
-/// | `BR-DE-17`, `BR-DE-21` | scoping: a lawful EN 16931 type code or another CIUS's BT-24 |
-///
-/// Each of those rejected an invoice the German reference validator accepts,
-/// which is the exact failure this crate exists not to have.
+/// Every KoSIT rule runs at the severity its Schematron `flag` gives it.
+/// (CEN rules re-levelled in `scenarios.xml` are checked by
+/// [`the_severity_overrides_are_kosits_own`].)
 #[test]
 fn every_kosit_check_runs_at_the_severity_kosit_publishes() {
     let Some(root) = common::require("XRechnung rule severities") else {
@@ -687,71 +639,52 @@ fn every_kosit_check_runs_at_the_severity_kosit_publishes() {
             checked += 1;
         }
     }
-    assert!(checked > 100, "only {checked} severities compared");
+    // Exact: the sources are pinned, so this moves only with a pin.
+    assert_eq!(checked, 121, "KoSIT severities compared");
     eprintln!("KoSIT rule severities: {checked} compared against the Schematron");
 }
 
-/// Peppol publishes every one of its rules as **fatal**, and one of them stops
-/// being fatal when XRechnung merges it.
-///
-/// The companion to
-/// [`every_kosit_check_runs_at_the_severity_kosit_publishes`], for the other
-/// authority whose rules this crate carries. It also pins the single
-/// consequence-changing rewrite in KoSIT's `peppol-into-xr.xsl`:
-///
-/// ```xslt
-/// <xsl:when test="@id='PEPPOL-EN16931-R120'">
-///   <xsl:attribute name="flag">warning</xsl:attribute>
-/// ```
-///
-/// Same id, same text, different consequence — a line whose net amount does not
-/// follow from its price **rejects** a Peppol invoice and merely annotates an
-/// XRechnung one. That is why severity belongs to the rule instance a profile
-/// holds rather than to a global registry, and why this is asserted from the
-/// stylesheet rather than remembered.
+/// Every Peppol rule runs at the flag Peppol's Schematron gives it, plus the
+/// two rewrites in KoSIT's `peppol-into-xr.xsl`: `R120` becomes a warning under
+/// XRechnung, and `R008` (retired by the model) is one shared instance.
 #[test]
 fn every_peppol_rule_runs_at_the_severity_its_authority_publishes() {
     let Some(root) = common::require("Peppol rule severities") else {
         return;
     };
-    let sch = root.join("peppol-bis-invoice-3/rules/sch/PEPPOL-EN16931-UBL.sch");
+    let sch = root.join(common::peppol::UBL_SCH);
     if !sch.exists() {
         eprintln!("note: {} absent — skipped", sch.display());
         return;
     }
-    let xml = std::fs::read_to_string(&sch).expect("read Peppol Schematron");
-    let doc = roxmltree::Document::parse(&xml).expect("Schematron is XML");
-    let mut published = std::collections::BTreeMap::new();
-    for n in doc.descendants() {
-        if !matches!(n.tag_name().name(), "assert" | "report") {
-            continue;
-        }
-        if let Some(id) = n
-            .attribute("id")
-            .filter(|i| i.starts_with("PEPPOL-EN16931"))
-        {
-            published.insert(id.to_owned(), n.attribute("flag").unwrap_or("fatal"));
-        }
-    }
+    let published =
+        common::peppol::flags(&std::fs::read_to_string(&sch).expect("read Peppol Schematron"));
     assert!(!published.is_empty(), "no Peppol assertions found");
 
+    let level = |flag: &str| match flag {
+        "fatal" => en16931::Severity::Fatal,
+        "warning" => en16931::Severity::Warning,
+        "information" => en16931::Severity::Info,
+        other => panic!("unknown flag {other:?}"),
+    };
     let mut checked = 0usize;
+    let mut warnings = 0usize;
     for id in en16931::profiles::PEPPOL_BIS_3.check_ids() {
         let Some(flag) = published.get(id) else {
             continue;
         };
-        assert_eq!(*flag, "fatal", "{id}: Peppol publishes everything fatal");
         assert_eq!(
             en16931::profiles::PEPPOL_BIS_3.severity_of(id),
-            Some(en16931::Severity::Fatal),
-            "{id} under Peppol BIS Billing 3.0"
+            Some(level(flag)),
+            "{id} under Peppol BIS Billing 3.0: Peppol publishes {flag}"
         );
         checked += 1;
+        warnings += usize::from(flag == "warning");
     }
-    assert_eq!(checked, 46, "every Peppol rule this crate runs");
+    assert_eq!(checked, 63, "every Peppol rule this crate runs");
+    assert_eq!(warnings, 9, "the PEPPOL-COMMON-* warnings");
 
-    // …and the one XRechnung's build rewrites, read out of the stylesheet that
-    // rewrites it rather than trusted from a comment.
+    // The rewrites, read from the stylesheet.
     let xsl = std::fs::read_to_string(root.join("xrechnung-schematron/src/xsl/peppol-into-xr.xsl"))
         .expect("read peppol-into-xr.xsl");
     let rewrite = xsl
@@ -766,26 +699,29 @@ fn every_peppol_rule_runs_at_the_severity_its_authority_publishes() {
         en16931::profiles::XRECHNUNG.severity_of("PEPPOL-EN16931-R120"),
         Some(en16931::Severity::Warning),
     );
-    eprintln!("Peppol rule severities: {checked} compared, plus XRechnung's R120 rewrite");
+    assert!(
+        xsl.contains("@id='PEPPOL-EN16931-R008' and $syntax='UBL'"),
+        "the stylesheet no longer rewrites R008 for UBL; re-read what it does now"
+    );
+    let r008 = |p: &en16931::Profile| {
+        p.extra_rules
+            .iter()
+            .find(|r| r.id.as_str() == "PEPPOL-EN16931-R008")
+            .map(|r| std::ptr::from_ref::<en16931::validation::Rule>(*r))
+    };
+    assert_eq!(
+        r008(&en16931::profiles::XRECHNUNG),
+        r008(&en16931::profiles::PEPPOL_BIS_3),
+        "both profiles hold the one retired R008"
+    );
+    eprintln!(
+        "Peppol rule severities: {checked} compared, plus XRechnung's R120 and R008 rewrites"
+    );
 }
 
-/// The profiles' [`Profile::levels`] must be what KoSIT publishes — not a
-/// reconstruction of "which core rule does each `BR-DEX-*` widen?".
-///
-/// That reconstruction goes wrong twice over: it names
-/// `PEPPOL-EN16931-CL001`, a rule XRechnung's build does not merge in, where
-/// CEN's `BR-CL-24` is meant; and it misses `BR-CL-21` and `BR-CL-23`
-/// entirely, which reports as **fatal** two rules the German reference
-/// validator reports as warnings. So the mapping is measured against
-/// `scenarios.xml`, the file the validator actually loads.
-///
-/// # `levels` has two sources, and this test owns one of them
-///
-/// `scenarios.xml`'s `customLevel` covers CEN's rules. KoSIT's *own* rules
-/// carry their severity in the Schematron `flag`, and two of them are
-/// restrictions with no severity of their own, so `levels` states theirs —
-/// see `XR_LEVELS`. Those entries are partitioned out here and checked by
-/// [`every_kosit_check_runs_at_the_severity_kosit_publishes`] instead.
+/// The XRechnung profiles' `levels` for CEN rules equal the `customLevel`s in
+/// KoSIT's `scenarios.xml`. KoSIT's own ids (`BR-DE*`, `BR-TMP*`) are checked by
+/// [`every_kosit_check_runs_at_the_severity_kosit_publishes`].
 #[test]
 fn the_severity_overrides_are_kosits_own() {
     let Some(root) = common::require("XRechnung severity overrides") else {
@@ -798,10 +734,32 @@ fn the_severity_overrides_are_kosits_own() {
     }
     let xml = std::fs::read_to_string(&path).expect("read scenarios.xml");
 
-    // `UBL-CR-*` and `CII-SR-*` are syntax rules and belong to
-    // `en16931-formats`; this crate holds the syntax-independent set only.
-    let semantic =
-        |(id, level): &(String, String)| id.starts_with("BR-").then(|| (id.clone(), level.clone()));
+    // Every non-`BR-*` override must be listed in `OUT_OF_SCOPE_LEVELS`, and vice versa.
+    let all: BTreeSet<String> = roxmltree::Document::parse(&xml)
+        .expect("scenarios.xml is XML")
+        .descendants()
+        .filter(|n| n.tag_name().name() == "customLevel")
+        .filter_map(|n| n.text().map(|t| t.trim().to_owned()))
+        .filter(|id| !id.starts_with("BR-"))
+        .collect();
+    let listed: BTreeSet<String> = OUT_OF_SCOPE_LEVELS
+        .iter()
+        .map(|(id, _)| (*id).to_owned())
+        .collect();
+    assert_eq!(
+        all, listed,
+        "customLevel overrides that are neither BR-* nor recorded out of scope (left), \
+         or recorded but no longer configured (right)"
+    );
+    assert!(
+        OUT_OF_SCOPE_LEVELS
+            .iter()
+            .all(|(_, why)| !why.trim().is_empty())
+    );
+
+    let semantic = |(id, level): &(String, String)| {
+        (!listed.contains(id)).then(|| (id.clone(), level.clone()))
+    };
     let name = |s: &str| match s {
         "warning" => en16931::Severity::Warning,
         "information" => en16931::Severity::Info,
@@ -832,7 +790,6 @@ fn the_severity_overrides_are_kosits_own() {
         let mut got: Vec<_> = profile
             .levels
             .iter()
-            // KoSIT's own ids are the Schematron's business, not this file's.
             .filter(|(id, _)| !id.starts_with("BR-DE") && !id.starts_with("BR-TMP"))
             .map(|(id, level)| ((*id).to_owned(), *level))
             .collect();

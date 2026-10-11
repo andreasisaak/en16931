@@ -1,931 +1,419 @@
-//! Conversion from [`billing::BillingDocument`] — behind the `billing` feature.
+//! A derived [`billing::Document`] and a header become one invoice — behind the
+//! `billing` feature, against `billing` 0.16.
 //!
-//! # Why there is no `TryFrom`
+//! `billing` derives the amounts; the caller supplies the header (number, dates,
+//! BT-3, BT-24, parties, payment instructions, notes and so on).
+//! [`from_billing`] combines them:
 //!
-//! A `BillingDocument` has no seller (BR-06), no buyer (BR-07), no postal
-//! addresses (BR-08/BR-10), no country codes (BR-09/BR-11), no electronic
-//! addresses (BR-62/BR-63) and no item names — `LineItem::description` is not
-//! BT-153, it is display text. A `TryFrom` would fail on every input that is not
-//! pathologically pre-annotated, which makes it a trait impl whose only
-//! behaviour is `Err` while inviting the reader to believe conversion is total.
+//! ```
+//! use billing::{Adjust, AdjustmentKind, AmountScale, Currency, Document, Line, Percent, Vat};
+//! use en16931::billing_adapter::from_billing;
+//! use en16931::{Date, Invoice};
+//! use rust_decimal::dec;
 //!
-//! So: a builder that takes the document for its *arithmetic* and the caller for
-//! everything the standard needs and a calculation engine has no business
-//! knowing.
-//!
-//! ```no_run
-//! # use en16931::billing_adapter::FromBilling;
-//! # fn demo(doc: &billing::BillingDocument, seller: en16931::invoice::Party,
-//! #         buyer: en16931::invoice::Party) -> Result<(), Box<dyn std::error::Error>> {
-//! let invoice = FromBilling::new(doc)
-//!     .specification_id("urn:cen.eu:en16931:2017")
-//!     .seller(seller)
-//!     .buyer(buyer)
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let doc = Document::builder(Currency::EUR, AmountScale::EN16931)
+//!     .default_vat(Vat::standard(Percent::new(dec!(19)))?)
+//!     .line(Line::fixed("Grundpreis", dec!(400)))
+//!     .line(Line::fixed("Bücher", dec!(100)).with_vat(Vat::standard(Percent::new(dec!(7)))?))
+//!     .apportion(AdjustmentKind::Allowance, "10 % Rabatt", Adjust::Percent(Percent::new(dec!(10))))
 //!     .build()?;
+//!
+//! // Everything `billing` does not derive. BT-5 may be stated if it agrees.
+//! let header = Invoice::builder(
+//!     "urn:cen.eu:en16931:2017", "R-2026-0001", Date::parse("2026-07-31")?, "380", "EUR",
+//! )
+//! .due_in_days(14)
+//! .build();
+//!
+//! let invoice = from_billing(&doc, header)?;
+//! assert_eq!(invoice.totals.vat_total.unwrap().to_string(), "74.70"); // 360 × 19 % + 90 × 7 %
+//! assert_eq!(invoice.lines[1].id, "2");                                // BT-126 = index + 1
 //! # Ok(()) }
 //! ```
 //!
-//! # Three traps, and the accessor that avoids each
+//! It maps without validating; run [`crate::validate`] or
+//! [`Profile::validate`](crate::Profile::validate) on the result.
 //!
-//! Each is a `billing` field whose obvious EN 16931 counterpart is the wrong
-//! one. The engine answers all three itself — it knows which layer produced
-//! which position and which predicate selected its base, and an adapter looking
-//! at a finished document never can.
+//! # What crosses
 //!
-//! | Trap | Read this instead |
+//! Every amount is taken from the `Document` accessor as is, converted exactly
+//! to two decimals, never recomputed or rounded.
+//!
+//! | `billing` | Business term |
 //! |---|---|
-//! | `tax_total` is **not** BT-110 — a levy is a BG-21 charge inside the taxable base, so mapping it to BT-110 breaks `BR-CO-14` on every levy-bearing invoice | `vat_total()` / `charge_total()` |
-//! | `net_total` is neither BT-106 nor BT-109 — it is `BT-106 − BT-107`, which EN 16931 has no term for | `line_total()` / `taxable_total()` |
-//! | Per-line VAT attribution was unrecoverable after assembly | `LineItem::vat`, derived from `TaxLayer::covers` |
+//! | `currency()` | BT-5 |
+//! | `lines()[i]` | BG-25 line *i*, BT-126 = *i* + 1, order kept (bound lines last) |
+//! | `line_net(i)` | BT-131 |
+//! | `quantity()` value / unit | BT-129 / BT-130 (the unit *is* the code) |
+//! | `price()` price / base quantity / unit | BT-146 / BT-149 / BT-150 (BT-149 stated when not 1 or when BT-150 is) |
+//! | the line's `Vat` | BT-151 / BT-152 (no BT-152 for `O`) |
+//! | `description()` | BT-153 |
+//! | line adjustments + `line_adjustment_amounts(i)` | BG-27 / BG-28 |
+//! | `adjustments()` + `adjustment_amount(i)` | BG-20 / BG-21 (description → BT-97/104) |
+//! | `vat_groups()` | BG-23, BT-116 … BT-121, in `billing`'s order |
+//! | `line_total()` … `payable()` | BT-106 … BT-115 |
+//! | `vat_accounting_total()` | BT-6 and BT-111, together |
+//! | each `Payment::Advance` | one [`crate::AdvancePayment`] (ZUGFeRD EXTENDED's `BG-X-45`) |
 //!
-//! # What crosses the seam
+//! BT-107 / BT-108 are stated when an allowance / charge exists, BT-113 /
+//! BT-114 when non-zero, BT-6 / BT-111 only with VAT accounting.
 //!
-//! | | From | To |
-//! |---|---|---|
-//! | BT-1, BT-2, BT-9 | `meta` | header |
-//! | BT-3, and the document *kind* | `meta.kind` / `is_credit_note()` | header — the kind is the semantics, BT-3 its rendering |
-//! | BT-5 | `meta.currency` | header — refused when still `XXX` |
-//! | BT-6, BT-111 | `vat_accounting_currency()` | header and BG-22, together |
-//! | BT-20 | `meta.payment_terms` | header, terminator checked |
-//! | BT-29, BT-46 | `meta.issuer_id` / `recipient_id` | merged into the caller's [`Party`] |
-//! | BG-1 (BT-21, BT-22) | `meta.notes` | notes, with their subject codes |
-//! | BG-3 (BT-25, BT-26) | `meta.preceding` | preceding invoice references |
-//! | BG-14 | `meta.period` | header |
-//! | BG-25 | `net_positions()` | lines |
-//! | BG-20 | `discount_positions()` | allowances, sign flipped |
-//! | BG-21 | `charge_positions()` | charges |
-//! | BG-23 | `tax_breakdown()` | breakdown |
-//! | BG-22 | the totals accessors | totals |
-//! | `BG-X-45` | `advances()` | [`crate::extensions`] |
+//! An advance's reference and dates are not in `billing`; set them on
+//! `invoice.extensions.advance_payments[k]` afterwards. Its gross is net plus tax.
 //!
-//! **Deliberately not mapped**, because there is nothing to map them to:
-//! `meta.period_label` and `meta.labels` are display text and arbitrary
-//! key/value pairs, with no business term at all.
+//! Not mapped (no business term): line labels, `residual_vat()`, the credit
+//! ledger (`credits()`, `credit_applications()`), and the itemisation of
+//! `Payment::Gross` entries (part of BT-113).
 //!
-//! A **late-payment penalty** is not mapped for a sharper reason. `billing`
-//! models one — simple interest under art. 2(6) of Directive 2011/7/EU plus the
-//! art. 6(1) recovery fee — and deliberately keeps it off `PaymentTerms`,
-//! because `BR-DE-18` gives a Skonto a micro-syntax inside BT-20 and gives a
-//! penalty none. Rendering it into BT-20 anyway would produce a `#…#` line the
-//! German regex rejects; putting it in the prose half would make it text no
-//! system reads. Default interest is generally outside the scope of VAT
-//! (art. 63 of the VAT Directive; CJEU C-222/81 *BAZ Bausystem*), so a penalty
-//! billed later is its own document with its own totals.
+//! # What is refused
 //!
-//! Three rows depend on the engine modelling more than a string. BT-29 and
-//! BT-46 need the ISO 6523 scheme to travel with the value — "MP-ID, GLN, BDEW
-//! code, or free-form" cannot be given a `@schemeID` without guessing, and
-//! `BR-CL-10` checks that guess. BG-1 needs notes to be `0..n` with a subject
-//! code, because BT-21 is what a routing system reads. BG-3 is filled in by
-//! `reverse` from the document it reverses, which is why a credit note arrives
-//! here already saying what it credits.
+//! Each refusal is a [`SeamError`] naming the business term:
 //!
-//! # The cap, and the sign convention it lands on
-//!
-//! `billing`'s `maximum_charge` settles a *Preisobergrenze* as a **credit
-//! invoice line**, and a credit line is where EN 16931's sign conventions bite
-//! from both directions: `BR-27` forbids a negative BT-146, and
-//! `PEPPOL-EN16931-R120` requires `BT-131 = BT-129 × BT-146 ÷ BT-149`. The
-//! negative can go neither on the price nor nowhere — `1 × 140` does not
-//! reproduce `−140` — so it goes on the **quantity**: BT-129 = −1,
-//! BT-146 = +140, BT-131 = −140, and both rules hold.
-//!
-//! `tests/billing_roundtrip.rs` pins it, because either crate could change its
-//! sign convention without the other's fixtures noticing.
-//!
-//! # What the adapter still owes
-//!
-//! Three obligations `billing` deliberately leaves here:
-//!
-//! 1. **Call `verify_vat_attribution()`.** It is not part of `validate()`,
-//!    because `AllocationRule` splits positions and breakdown with independent
-//!    penny corrections and cannot preserve it. It is `BR-S-08`, and nothing
-//!    downstream will catch a failure.
-//! 2. **Reject `LineItem::vat == None` by name.** Lawful in `billing`, fatal in
-//!    EN 16931 (`BR-CO-04`). Never default it.
-//! 3. **Check BT-20's terminator.** See below. `billing` supplies it now; the
-//!    adapter verifies it rather than assuming it.
-//!
-//! `PEPPOL-EN16931-R120` is deliberately *not* a fourth. Both crates can check
-//! it and only one should: BT-146 crosses as an uncapped `UnitPriceAmount` and
-//! BT-131 as an `InvoiceAmount`, so the rule sees the same two numbers either
-//! way — and its tolerance belongs to a *profile*, not to a conversion.
-//! Peppol allows ±0.02, XRechnung ±0.5 in HUF, and the core model never ties
-//! BT-131 to price × quantity at all. [`crate::Profile::validate`] is where
-//! that question has an answer.
-//!
-//! # The BT-20 newline, which is not a nicety
-//!
-//! `billing::PaymentTerms` renders EN 16931's BT-20 including Germany's Skonto
-//! micro-syntax:
-//!
-//! ```text
-//! Zahlbar in 30 Tagen.\n#SKONTO#TAGE=10#PROZENT=2.00#\n
-//! ```
-//!
-//! `BR-DE-18` has two halves, and the second is easy to miss because it is
-//! folded into the same `satisfies` as the first rather than being its own
-//! `<assert>`:
-//!
-//! ```xpath
-//! every $line in cac:PaymentTerms/cbc:Note[1]/tokenize(., '(\r?\n)')[starts-with(normalize-space(.), '#')]
-//!   satisfies matches(normalize-space($line), $XR-SKONTO-REGEX)
-//!         and matches(cac:PaymentTerms/cbc:Note[1]/tokenize(., '#.+#')[last()], '^\s*\n')
-//! ```
-//!
-//! Everything after the **last** `#…#` must begin with a newline. Without one,
-//! `tokenize(…)[last()]` is the empty string, the second `matches` is false, and
-//! every German invoice carrying a Skonto is rejected — fatally.
-//!
-//! `billing` terminates the field upstream, which is where it belongs: the
-//! `#SKONTO#…#` syntax has no core EN 16931 form, so a rendering that omits the
-//! terminator is valid nowhere. What is here is a **guard**, idempotent, and
-//! paired with a test that asserts the upstream behaviour.
+//! - a header carrying a term `billing` derives (a line, an allowance or charge,
+//!   a BG-23 entry, a BG-22 amount, BT-6, an advance payment, or a different BT-5);
+//! - a scale finer than two decimals — build with `AmountScale::EN16931`;
+//! - a VAT-free document (`BR-CO-04`);
+//! - a credit note (kind [`DocumentKind::CreditNote`] or BT-3 `381`) over a
+//!   negative BT-115, which would reverse the document twice.
 
-use billing::{BillingDocument, LineItem, Sign};
 use rust_decimal::Decimal;
 
-use crate::extensions::{AdvancePayment, Extensions};
+use crate::bt::{BtId, Group, Path};
+use crate::extensions::AdvancePayment;
 use crate::invoice::{
-    Code, DocumentAllowanceCharge, DocumentTotals, Invoice, Item, LineAllowanceCharge, LineVat,
-    Party, Period, PriceDetails, VatBreakdown,
+    Code, DocumentAllowanceCharge, DocumentKind, DocumentTotals, Invoice, Item,
+    LineAllowanceCharge, LineVat, PriceDetails, VatBreakdown,
 };
-use crate::{Date, InvoiceAmount, InvoiceLine, Percentage, Quantity, UnitPriceAmount};
+use crate::{InvoiceAmount, InvoiceLine, Percentage, Quantity, UnitPriceAmount};
 
-// ── Errors ────────────────────────────────────────────────────────────────────
-
-/// Conversion failed.
+/// Why a document and a header cannot become one invoice. Every variant names
+/// the business term concerned ([`paths`](Self::paths)).
 ///
-/// **Not** a validation finding. These say "the document you handed me cannot be
-/// expressed as an EN 16931 invoice at all"; a [`crate::ValidationReport`] says
-/// "this invoice does not satisfy BR-CO-14". Conflating them makes both harder
-/// to act on.
+/// Not a validation finding: these say the inputs cannot be combined at all.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum ConversionError {
-    /// An amount carries more than two decimals.
-    ///
-    /// Rounding here is the mistake `AmountScale` exists to prevent: it breaks
-    /// `BR-CO-10` and `BR-CO-15`, which are exact equalities over sums. Fix it
-    /// at the source with `.amount_scale(AmountScale::EN16931)` on the builder.
+pub enum SeamError {
+    /// The header carries a term `billing` derives; the document's value would
+    /// compete with it. Leave it out of the header.
     #[error(
-        "{what} = {value} needs more than two decimals; rebuild the document with \
-         `.amount_scale(AmountScale::EN16931)` rather than rounding here"
+        "the header carries {0}, which the billing document derives; leave it out of the header"
     )]
-    PrecisionLoss {
-        /// Which field.
-        what: String,
-        /// Its value.
-        value: String,
-    },
+    DerivedInHeader(Path),
 
-    /// A position carries no VAT attribution.
-    ///
-    /// Lawful in `billing`; fatal in EN 16931 under `BR-CO-04`. Set it with
-    /// `LineItemBuilder::vat`, or ensure a `TaxLayer` covers the position.
-    #[error("position {index} ({description:?}) has no VAT attribution; BR-CO-04 requires BT-151")]
-    NoVatAttribution {
-        /// Which position.
-        index: usize,
-        /// Its description, for finding it.
-        description: String,
-    },
-
-    /// A quantity unit could not be resolved to a UN/ECE Rec 20 code.
-    ///
-    /// Guessing produces an invoice that validates and describes the wrong
-    /// thing — and unlike a wrong amount, nobody notices.
+    /// The document's amounts carry more decimals than EN 16931's two.
     #[error(
-        "unit label {label:?} on position {index} has no BT-130 code; set `Quantity::code` \
-         or extend the `UnitResolver`"
+        "the document is derived at {decimals} decimals; EN 16931 amounts have two — build it \
+         with `AmountScale::EN16931` rather than rounding here"
     )]
-    UnresolvedUnit {
-        /// Which position.
-        index: usize,
-        /// The unresolved label.
-        label: String,
+    ScaleTooFine {
+        /// The document's scale.
+        decimals: u8,
     },
 
-    /// A date string is not an ISO 8601 calendar date.
-    #[error("{field} = {value:?} is not an ISO 8601 calendar date")]
-    UnparsableDate {
-        /// Which field.
-        field: &'static str,
-        /// Its value.
-        value: String,
-    },
+    /// The document (or this line or adjustment) carries no VAT; EN 16931
+    /// requires BT-151 on every line (`BR-CO-04`).
+    #[error("{0}: the billing document is VAT-free; EN 16931 requires a VAT category (BR-CO-04)")]
+    VatFree(Path),
 
-    /// The document has no currency, or still carries ISO 4217 `XXX`.
+    /// A credit-note header over a document whose BT-115 is negative: the
+    /// document would be reversed twice, once by BT-3 and once by its signs.
     #[error(
-        "the document's currency is {0}; XXX means \"no currency involved\" and a document \
-         still carrying it was never configured"
+        "BT-3 says credit note and BT-115 is {payable}: that reverses the document twice; \
+         send the original amounts under 381, or the negated ones under 380"
     )]
-    NoCurrency(String),
-
-    /// `billing` reported an arithmetic problem.
-    #[error("billing: {0}")]
-    Billing(String),
+    NegatedCreditNote {
+        /// The document's BT-115.
+        payable: InvoiceAmount,
+    },
 }
 
-// ── Unit resolution ───────────────────────────────────────────────────────────
-
-/// Maps a display unit label to a UN/ECE Rec 20 code, for documents that predate
-/// `Quantity::code` or whose caller only set the label.
-///
-/// `billing::Quantity::unit` is display text and is load-bearing for
-/// `PerUnitLevy` base matching; BT-130 is a code list. Different namespaces, and
-/// the mapping is not mechanical — `"Stk"`, `"Stück"`, `"pcs"` and `"pieces"`
-/// are all `H87`.
-#[derive(Debug, Clone, Default)]
-pub struct UnitResolver {
-    extra: Vec<(String, String)>,
-}
-
-/// The mappings that are unambiguous enough to build in.
-///
-/// Deliberately short. A resolver that guessed widely would produce invoices
-/// that validate and describe the wrong thing.
-const BUILT_IN: &[(&str, &str)] = &[
-    ("kWh", "KWH"),
-    ("MWh", "MWH"),
-    ("Wh", "WHR"),
-    ("kW", "KWT"),
-    ("m³", "MTQ"),
-    ("m3", "MTQ"),
-    ("m²", "MTK"),
-    ("m", "MTR"),
-    ("km", "KMT"),
-    ("kg", "KGM"),
-    ("g", "GRM"),
-    ("t", "TNE"),
-    ("l", "LTR"),
-    ("h", "HUR"),
-    ("d", "DAY"),
-    ("Monat", "MON"),
-    ("month", "MON"),
-    ("Stk", "H87"),
-    ("Stück", "H87"),
-    ("pcs", "H87"),
-    ("piece", "H87"),
-    ("Stunde", "HUR"),
-    ("%", "P1"),
-    ("Pauschale", "C62"),
-    ("one", "C62"),
-];
-
-impl UnitResolver {
-    /// A resolver with only the built-in table.
+impl SeamError {
+    /// The business terms (or groups) the refusal concerns.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add or override a mapping.
-    #[must_use]
-    pub fn with(mut self, label: impl Into<String>, code: impl Into<String>) -> Self {
-        self.extra.push((label.into(), code.into()));
-        self
-    }
-
-    /// Resolve a label, caller-supplied mappings first.
-    #[must_use]
-    pub fn resolve(&self, label: &str) -> Option<&str> {
-        self.extra
-            .iter()
-            .find(|(l, _)| l == label)
-            .map(|(_, c)| c.as_str())
-            .or_else(|| BUILT_IN.iter().find(|(l, _)| *l == label).map(|(_, c)| *c))
+    pub fn paths(&self) -> Vec<Path> {
+        match self {
+            Self::DerivedInHeader(p) | Self::VatFree(p) => vec![*p],
+            Self::ScaleTooFine { .. } => vec![Path::group(Group::Totals)],
+            Self::NegatedCreditNote { .. } => {
+                vec![Path::term(BtId(3)), Path::term(BtId(115))]
+            }
+        }
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Narrow a `billing` amount to two decimals **without rounding**.
-fn amount(a: billing::Amount<5>, what: &str) -> Result<InvoiceAmount, ConversionError> {
-    a.exact_to::<2>()
-        .map_err(|_| ConversionError::PrecisionLoss {
-            what: what.to_owned(),
-            value: a.to_string(),
-        })
-        .map(|v: billing::Amount<2>| InvoiceAmount::from_minor_units(v.to_raw()))
-}
-
-/// `billing` stores VAT rates as fractions (`0.19`) because that is what you
-/// multiply by; EN 16931 stores what you print (`19`). Convert once, here.
-fn rate(fraction: Decimal) -> Percentage {
-    Percentage::from_fraction(fraction).unwrap_or_else(|| Percentage::new(fraction))
-}
-
-fn date(s: Option<&str>, field: &'static str) -> Result<Option<Date>, ConversionError> {
-    s.map(|v| {
-        Date::parse(v).map_err(|_| ConversionError::UnparsableDate {
-            field,
-            value: v.to_owned(),
-        })
-    })
-    .transpose()
-}
-
-fn period(
-    p: Option<&billing::Period>,
-    what: &'static str,
-) -> Result<Option<Period>, ConversionError> {
-    p.map(|p| {
-        Ok(Period {
-            start: date(Some(&p.from), what)?,
-            end: date(Some(&p.to), what)?,
-        })
-    })
-    .transpose()
-}
-
-/// BT-20, checked for the terminator `BR-DE-18` requires.
+/// Combine a derived `billing` document with a header into one invoice.
 ///
-/// A **guard**, not a fix. `billing` terminates the field itself, which is the
-/// right place: the `#SKONTO#…#` micro-syntax *is* the German CIUS convention
-/// and has no core EN 16931 form, so a rendering without the terminator is
-/// valid nowhere. The guard is idempotent, and stays because the alternative is
-/// trusting a convention across a crate boundary with nothing checking it —
-/// and this is the one field where getting it wrong is invisible until a
-/// counterparty's validator says no.
-/// `billing_renders_bt_20_with_the_terminator_br_de_18_needs` asserts the
-/// upstream behaviour, so a regression there fails this build rather than a
-/// customer's invoice.
-fn payment_terms(t: Option<&billing::terms::PaymentTerms>) -> Option<String> {
-    let t = t.filter(|t| !t.is_empty())?;
-    let rendered = t.to_string();
-    // Idempotent: `ends_with` is what makes this a guard rather than a second
-    // opinion about how BT-20 should be spelled.
-    if t.discounts().is_empty() || rendered.ends_with('\n') {
-        return Some(rendered);
+/// `header` is an ordinary [`Invoice`] holding the terms `billing` does not
+/// own; they are kept unchanged. Lines, allowances, charges, the VAT breakdown,
+/// the totals, BT-5, BT-6 and the advance payments come from `doc`. See the
+/// [module docs](self) for the mapping and the refusals.
+///
+/// # Errors
+/// A [`SeamError`] naming the term that cannot cross.
+pub fn from_billing(doc: &billing::Document, header: Invoice) -> Result<Invoice, SeamError> {
+    check_header(doc, &header)?;
+    let decimals = doc.scale().decimals;
+    if decimals > 2 {
+        return Err(SeamError::ScaleTooFine { decimals });
     }
-    Some(format!("{rendered}\n"))
-}
-
-/// Add the document's BT-29 / BT-46 to a party, without duplicating one the
-/// caller already supplied.
-///
-/// # Why merge rather than choose
-///
-/// Both are legitimate and they are not the same fact. The caller's `Party`
-/// carries master data — the identifiers a customer record holds — and the
-/// document's carries the party code the *billing run* was keyed on: an MP-ID in
-/// the energy market, a GLN in retail. Overwriting either way loses one.
-///
-/// EN 16931 makes BT-29 and BT-46 repeatable precisely because a party has more
-/// than one identity, so carrying both is what the model is for. The scheme is
-/// compared alongside the value: the same digits under `0088` and under `0293`
-/// are two different registries saying two different things.
-fn with_identifier(mut party: Party, id: Option<&billing::PartyIdentifier>) -> Party {
-    let Some(id) = id.filter(|i| !i.value.trim().is_empty()) else {
-        return party;
-    };
-    let scheme = id.scheme.as_deref().filter(|s| !s.trim().is_empty());
-    let already = party
-        .identifiers
-        .iter()
-        .any(|existing| existing.content() == id.value && existing.scheme() == scheme);
-    if !already {
-        party.identifiers.push(match scheme {
-            Some(s) => crate::Identifier::schemed(&id.value, s),
-            None => crate::Identifier::new(&id.value),
+    if doc.vat_groups().is_empty() {
+        let at = if doc.lines().is_empty() {
+            Path::term(BtId(151))
+        } else {
+            Path::at_term(Group::Line, 0, BtId(151))
+        };
+        return Err(SeamError::VatFree(at));
+    }
+    let is_credit_note = header.kind == DocumentKind::CreditNote
+        || header
+            .type_code
+            .as_ref()
+            .is_some_and(|c| c.as_str() == "381");
+    if is_credit_note && doc.payable().is_negative() {
+        return Err(SeamError::NegatedCreditNote {
+            payable: amount(doc.payable(), decimals)?,
         });
     }
-    party
+
+    let mut inv = header;
+    inv.currency = Some(Code::new(doc.currency().code()));
+
+    for (i, line) in doc.lines().iter().enumerate() {
+        inv.lines.push(map_line(doc, i, line, decimals)?);
+    }
+
+    for (i, adj) in doc.adjustments().iter().enumerate() {
+        let (group, vat_term) = match adj.kind() {
+            billing::AdjustmentKind::Allowance => (Group::DocumentAllowance, BtId(95)),
+            billing::AdjustmentKind::Charge => (Group::DocumentCharge, BtId(102)),
+        };
+        let target = match group {
+            Group::DocumentAllowance => &mut inv.allowances,
+            _ => &mut inv.charges,
+        };
+        let vat = adj
+            .vat()
+            .map(line_vat)
+            .ok_or_else(|| SeamError::VatFree(Path::at_term(group, target.len(), vat_term)))?;
+        let (base_amount, percentage) = basis(adj.basis(), decimals)?;
+        target.push(DocumentAllowanceCharge {
+            amount: amount(doc.adjustment_amount(i), decimals)?,
+            base_amount,
+            percentage,
+            vat,
+            reason: Some(adj.description().to_owned()).filter(|d| !d.is_empty()),
+            reason_code: adj.reason_code().map(Code::new),
+        });
+    }
+
+    for g in doc.vat_groups() {
+        inv.vat_breakdown.push(VatBreakdown {
+            taxable_amount: amount(g.taxable_base(), decimals)?,
+            tax_amount: amount(g.tax(), decimals)?,
+            category: Code::new(g.category().code()),
+            // BT-119 is stated for every category, `O` included (0 %).
+            rate: Some(Percentage::new(g.rate_percent().value())),
+            exemption_reason: g.exemption().and_then(|e| e.text()).map(str::to_owned),
+            exemption_reason_code: g.exemption().and_then(|e| e.code()).map(Code::new),
+        });
+    }
+
+    let accounting = doc
+        .vat_accounting_total()
+        .map(|(currency, total)| Ok((currency, amount(total, decimals)?)))
+        .transpose()?;
+    inv.vat_accounting_currency = accounting.map(|(c, _)| Code::new(c.code()));
+    let kinds = || {
+        doc.adjustments()
+            .iter()
+            .map(billing::DocumentAdjustment::kind)
+    };
+    let has = |k: billing::AdjustmentKind| kinds().any(|x| x == k);
+    inv.totals = DocumentTotals {
+        line_total: amount(doc.line_total(), decimals)?,
+        allowance_total: has(billing::AdjustmentKind::Allowance)
+            .then(|| amount(doc.allowance_total(), decimals))
+            .transpose()?,
+        charge_total: has(billing::AdjustmentKind::Charge)
+            .then(|| amount(doc.charge_total(), decimals))
+            .transpose()?,
+        taxable_total: amount(doc.tax_exclusive_total(), decimals)?,
+        vat_total: Some(amount(doc.vat_total(), decimals)?),
+        vat_total_accounting: accounting.map(|(_, a)| a),
+        gross_total: amount(doc.tax_inclusive_total(), decimals)?,
+        paid: non_zero(doc.prepaid(), decimals)?,
+        rounding: non_zero(doc.rounding(), decimals)?,
+        due: amount(doc.payable(), decimals)?,
+    };
+
+    for p in doc.payments() {
+        let billing::Payment::Advance(a) = p else {
+            continue;
+        };
+        let net = decimal(a.net, decimals)?;
+        let tax = decimal(a.tax, decimals)?;
+        inv.extensions.advance_payments.push(AdvancePayment {
+            // `billing`'s own definition of an advance's gross; exact.
+            gross: net
+                .checked_add(tax)
+                .map_err(|_| SeamError::ScaleTooFine { decimals })?,
+            received_on: None,
+            tax: vec![VatBreakdown {
+                taxable_amount: net,
+                tax_amount: tax,
+                category: Code::new(a.vat.category().code()),
+                rate: Some(Percentage::new(a.vat.rate_percent().value())),
+                exemption_reason: a.vat.exemption().and_then(|e| e.text()).map(str::to_owned),
+                exemption_reason_code: a.vat.exemption().and_then(|e| e.code()).map(Code::new),
+            }],
+            reference: None,
+            reference_date: None,
+        });
+    }
+
+    Ok(inv)
 }
 
-fn line_vat(v: Option<&billing::vat::LineVat>) -> Option<LineVat> {
-    v.map(|v| LineVat {
-        category: Code::new(v.category.code()),
-        // Category `O` states no rate at all — BR-O-05/06/07 say the element
-        // "shall not contain" it, where every other zero-tax category says it
-        // "shall be 0". `billing` stores a plain `Decimal`, so an `O` position
-        // holds `0`; `states_rate` is what tells us to drop it.
-        rate: crate::VatCategory::from_code(v.category.code())
-            .is_none_or(crate::VatCategory::states_rate)
-            .then(|| rate(v.rate)),
+/// The first term the header carries that `billing` derives.
+fn check_header(doc: &billing::Document, h: &Invoice) -> Result<(), SeamError> {
+    let refuse = |p: Path| Err(SeamError::DerivedInHeader(p));
+    if h.currency
+        .as_ref()
+        .is_some_and(|c| c.as_str() != doc.currency().code())
+    {
+        return refuse(Path::term(BtId(5)));
+    }
+    if h.vat_accounting_currency.is_some() {
+        return refuse(Path::term(BtId(6)));
+    }
+    if !h.allowances.is_empty() {
+        return refuse(Path::group(Group::DocumentAllowance));
+    }
+    if !h.charges.is_empty() {
+        return refuse(Path::group(Group::DocumentCharge));
+    }
+    let t = &h.totals;
+    let zero = InvoiceAmount::default();
+    let totals = [
+        (t.line_total != zero, 106),
+        (t.allowance_total.is_some(), 107),
+        (t.charge_total.is_some(), 108),
+        (t.taxable_total != zero, 109),
+        (t.vat_total.is_some(), 110),
+        (t.vat_total_accounting.is_some(), 111),
+        (t.gross_total != zero, 112),
+        (t.paid.is_some(), 113),
+        (t.rounding.is_some(), 114),
+        (t.due != zero, 115),
+    ];
+    if let Some((_, bt)) = totals.into_iter().find(|(set, _)| *set) {
+        return refuse(Path::term(BtId(bt)));
+    }
+    if !h.extensions.advance_payments.is_empty() {
+        return refuse(Path::term(BtId(113)));
+    }
+    if !h.vat_breakdown.is_empty() {
+        return refuse(Path::group(Group::VatBreakdown));
+    }
+    if !h.lines.is_empty() {
+        return refuse(Path::group(Group::Line));
+    }
+    Ok(())
+}
+
+fn map_line(
+    doc: &billing::Document,
+    i: usize,
+    line: &billing::Line,
+    decimals: u8,
+) -> Result<InvoiceLine, SeamError> {
+    let vat = line
+        .vat()
+        .map(line_vat)
+        .ok_or_else(|| SeamError::VatFree(Path::at_term(Group::Line, i, BtId(151))))?;
+    let mut allowances = Vec::new();
+    let mut charges = Vec::new();
+    for (adj, reduced) in line
+        .adjustments()
+        .iter()
+        .zip(doc.line_adjustment_amounts(i))
+    {
+        let (base_amount, percentage) = basis(adj.basis(), decimals)?;
+        let mapped = LineAllowanceCharge {
+            amount: amount(*reduced, decimals)?,
+            base_amount,
+            percentage,
+            reason: adj.reason().map(str::to_owned),
+            reason_code: adj.reason_code().map(Code::new),
+        };
+        match adj.kind() {
+            billing::AdjustmentKind::Allowance => allowances.push(mapped),
+            billing::AdjustmentKind::Charge => charges.push(mapped),
+        }
+    }
+    let price = line.price();
+    let base = price.base_quantity();
+    Ok(InvoiceLine {
+        id: (i + 1).to_string(),
+        note: None,
+        order_line_reference: None,
+        accounting_reference: None,
+        object_identifier: None,
+        quantity: Quantity::new(line.quantity().value()),
+        unit_code: Code::new(line.quantity().unit()),
+        net_amount: amount(doc.line_net(i), decimals)?,
+        period: None,
+        allowances,
+        charges,
+        price: PriceDetails {
+            net_price: UnitPriceAmount::new(price.price().value()),
+            price_discount: None,
+            gross_price: None,
+            base_quantity: (base != Decimal::ONE || price.unit().is_some())
+                .then(|| Quantity::new(base)),
+            base_quantity_code: price.unit().map(Code::new),
+        },
+        vat,
+        item: Item {
+            name: Some(line.description().to_owned()),
+            ..Default::default()
+        },
     })
 }
 
-fn allowance_charge(item: &LineItem) -> (Option<InvoiceAmount>, Option<Percentage>, Option<Code>) {
-    match &item.allowance_charge {
-        Some(ac) => (
-            ac.base_amount
-                .and_then(|b| b.exact_to::<2>().ok())
-                .map(|v: billing::Amount<2>| InvoiceAmount::from_minor_units(v.to_raw())),
-            ac.percentage.map(Percentage::new),
-            ac.reason_code.as_deref().map(Code::new),
-        ),
-        None => (None, None, None),
+fn line_vat(v: &billing::Vat) -> LineVat {
+    LineVat {
+        category: Code::new(v.category().code()),
+        // `None` for `O`: BR-O-05/06/07 say the rate "shall not" be stated.
+        rate: v.stated_rate().map(|p| Percentage::new(p.value())),
     }
 }
 
-// ── The builder ───────────────────────────────────────────────────────────────
-
-/// Builds an [`Invoice`] from a [`BillingDocument`] plus the terms the standard
-/// requires and a calculation engine does not hold.
-pub struct FromBilling<'a> {
-    doc: &'a BillingDocument,
-    specification_id: Option<String>,
-    seller: Party,
-    buyer: Party,
-    units: UnitResolver,
-    verify_attribution: bool,
-}
-
-impl<'a> FromBilling<'a> {
-    /// Start from a document. Borrowed, not consumed — callers routinely keep the
-    /// billing document for archival.
-    #[must_use]
-    pub fn new(doc: &'a BillingDocument) -> Self {
-        Self {
-            doc,
-            specification_id: None,
-            seller: Party::default(),
-            buyer: Party::default(),
-            units: UnitResolver::new(),
-            verify_attribution: true,
-        }
-    }
-
-    /// BT-24 — the profile this invoice declares.
-    #[must_use]
-    pub fn specification_id(mut self, id: impl Into<String>) -> Self {
-        self.specification_id = Some(id.into());
-        self
-    }
-
-    /// BG-4 — the seller.
-    #[must_use]
-    pub fn seller(mut self, seller: Party) -> Self {
-        self.seller = seller;
-        self
-    }
-
-    /// BG-7 — the buyer.
-    #[must_use]
-    pub fn buyer(mut self, buyer: Party) -> Self {
-        self.buyer = buyer;
-        self
-    }
-
-    /// Supply unit-code mappings for documents whose quantities carry only a
-    /// display label.
-    #[must_use]
-    pub fn units(mut self, units: UnitResolver) -> Self {
-        self.units = units;
-        self
-    }
-
-    /// Skip `verify_vat_attribution`.
-    ///
-    /// Only correct for a document produced by `AllocationRule`, which splits
-    /// positions and breakdown with independent penny corrections and therefore
-    /// cannot preserve BR-S-08 exactly. For anything else, leaving this on is
-    /// what catches a mis-tagged tax layer before the counterparty does.
-    #[must_use]
-    pub fn allow_unverified_attribution(mut self) -> Self {
-        self.verify_attribution = false;
-        self
-    }
-
-    /// Convert.
-    ///
-    /// # Errors
-    /// [`ConversionError`] when the document cannot be expressed as an
-    /// EN 16931 invoice at all. Whether the *result* is valid is a separate
-    /// question — run [`crate::validate`] on it.
-    pub fn build(self) -> Result<Invoice, ConversionError> {
-        let doc = self.doc;
-
-        // Order matters, and it is cheapest-and-most-unambiguous first. A
-        // document that was never given a currency should be told so, not told
-        // about its VAT attribution: `verify_vat_attribution` is a deep
-        // arithmetic check and its message, while correct, is the least
-        // actionable thing a caller with a configuration problem can be handed.
-        let currency = doc.currency();
-        if currency.is_unset() {
-            return Err(ConversionError::NoCurrency(currency.code().to_owned()));
-        }
-
-        if self.verify_attribution {
-            doc.verify_vat_attribution()
-                .map_err(|e| ConversionError::Billing(e.to_string()))?;
-        }
-
-        // Totals first: `self` is consumed by the party moves below, and the
-        // borrow checker is right that reading it afterwards is a mistake
-        // waiting to happen.
-        let totals = self.totals()?;
-
-        // Struct-update rather than default-then-assign: `Invoice` is
-        // `#[non_exhaustive]`, but this crate is inside its own boundary, so the
-        // functional-update form is available here and states every mapped term
-        // in one place.
-        let mut inv = Invoice {
-            // **Not derived from BT-3.** `billing::DocumentKind::is_credit_note`
-            // is the semantic statement; the code is its rendering. Leaving this
-            // at the default turns a `billing` credit note into an EN 16931
-            // *invoice* carrying BT-3 = 381 — which fails `BR-CL-01`, wrongly
-            // runs `BR-CO-25`, and serialises as `<ubl:Invoice>`, because
-            // `en16931-formats` picks the root element from this field.
-            kind: if doc.meta.kind.is_credit_note() {
-                crate::DocumentKind::CreditNote
-            } else {
-                crate::DocumentKind::Invoice
-            },
-            specification_id: self.specification_id.clone(),
-            number: Some(doc.meta.invoice_number.clone()).filter(|s| !s.is_empty()),
-            issue_date: date(doc.meta.issue_date.as_deref(), "issue_date")?,
-            due_date: date(doc.meta.due_date.as_deref(), "due_date")?,
-            type_code: Some(Code::new(doc.meta.kind.code().to_string())),
-            currency: Some(Code::new(currency.code())),
-            // BT-20. One of the two ways to satisfy `BR-CO-25`, and the only
-            // machine-readable home a Skonto has before EN 16931-1:2026 gives it
-            // fields of its own.
-            payment_terms: payment_terms(doc.meta.payment_terms.as_ref()),
-            // BT-6. `billing` will not construct a `VatAccountingCurrency` with
-            // `XXX`, so this cannot introduce the currency hazard BT-5 is
-            // guarded against above.
-            vat_accounting_currency: doc
-                .vat_accounting_currency()
-                .map(|a| Code::new(a.currency().code())),
-            invoicing_period: period(doc.meta.period.as_ref(), "period")?,
-            // BG-1, both terms. Notes are `0..n` with an optional UNCL 4451
-            // subject code on both sides, which is what the standard has.
-            // BT-21 is not decoration: a reverse-charge sentence and a payment
-            // instruction are both free text, and only the code says which is
-            // which to a system routing on it.
-            notes: doc
-                .meta
-                .notes
-                .iter()
-                .map(|n| crate::invoice::InvoiceNote {
-                    subject_code: n.subject_code.as_deref().map(Code::new),
-                    note: Some(n.text.clone()),
-                })
-                .collect(),
-            // BG-4 / BG-7 are the caller's — a tariff engine has no business
-            // knowing a postal address — but BT-29 and BT-46 are the document's,
-            // and they carry the ISO 6523 scheme that makes them mappable at
-            // all. Merged rather than overwritten: the
-            // caller's master data and the document's party code are both real,
-            // and neither is a substitute for the other.
-            seller: with_identifier(self.seller.clone(), doc.meta.issuer_id.as_ref()),
-            buyer: with_identifier(self.buyer.clone(), doc.meta.recipient_id.as_ref()),
-            ..Default::default()
-        };
-
-        // BG-3 — what this document credits or corrects. `reverse` fills it in
-        // from the document being reversed, so a credit note arrives here
-        // already knowing which invoice it answers: the difference between a
-        // credit note and an unexplained payment.
-        //
-        // BT-25 is not an `Option` upstream and its constructor refuses a blank
-        // string, so `BR-55` is satisfied by construction and there is nothing
-        // to check here. BT-26 is parsed like every other date rather than
-        // carried as text — a preceding invoice's date that will not parse is a
-        // conversion failure, not a field to drop.
-        for p in &doc.meta.preceding {
-            inv.preceding_invoices
-                .push(crate::invoice::PrecedingInvoice {
-                    reference: crate::DocumentReference::new(p.number()),
-                    // The field name is fixed rather than indexed because
-                    // `UnparsableDate` already carries the offending value, and
-                    // a BG-3 is identified by its number far better than by its
-                    // position.
-                    issue_date: date(p.issue_date(), "preceding invoice issue_date (BT-26)")?,
-                });
-        }
-
-        // BG-25 — the net positions become invoice lines.
-        for (i, item) in doc.net_positions().iter().enumerate() {
-            inv.lines.push(self.line(i, item)?);
-        }
-
-        // BG-20 — discounts. Allowances are stated **positive**; `billing`
-        // carries them as credits.
-        for (i, item) in doc.discount_positions().iter().enumerate() {
-            let (base, pct, reason_code) = allowance_charge(item);
-            inv.allowances.push(DocumentAllowanceCharge {
-                amount: amount(
-                    item.net_amount
-                        .checked_neg()
-                        .map_err(|e| ConversionError::Billing(e.to_string()))?,
-                    &format!("discount[{i}] BT-92"),
-                )?,
-                base_amount: base,
-                percentage: pct,
-                vat: line_vat(item.vat.as_ref()).ok_or_else(|| {
-                    ConversionError::NoVatAttribution {
-                        index: i,
-                        description: item.description.clone(),
-                    }
-                })?,
-                // BT-97 falls back to the position's description, which is what
-                // a human reads on the rendered invoice anyway. BR-33 accepts
-                // either the text or the code.
-                reason: Some(item.description.clone()),
-                reason_code,
-            });
-        }
-
-        // BG-21 — the tax positions that are NOT VAT. A per-unit levy or a
-        // commission is part of the taxable base, so EN 16931 calls it a
-        // document level charge, not tax.
-        for (i, item) in doc.charge_positions().enumerate() {
-            let (base, pct, reason_code) = allowance_charge(item);
-            inv.charges.push(DocumentAllowanceCharge {
-                amount: amount(item.net_amount, &format!("charge[{i}] BT-99"))?,
-                base_amount: base,
-                percentage: pct,
-                vat: line_vat(item.vat.as_ref()).ok_or_else(|| {
-                    ConversionError::NoVatAttribution {
-                        index: i,
-                        description: item.description.clone(),
-                    }
-                })?,
-                reason: Some(item.description.clone()),
-                reason_code,
-            });
-        }
-
-        // BG-23.
-        for (i, e) in doc.tax_breakdown().iter().enumerate() {
-            let category = Code::new(e.category.code());
-            let states_rate = crate::VatCategory::from_code(e.category.code()).is_none_or(|_| true); // BT-119 is not BT-152; BR-48 governs it.
-            inv.vat_breakdown.push(VatBreakdown {
-                taxable_amount: amount(e.taxable_base, &format!("BG-23[{i}] BT-116"))?,
-                tax_amount: amount(e.tax_amount, &format!("BG-23[{i}] BT-117"))?,
-                category,
-                rate: states_rate.then(|| rate(e.rate)),
-                exemption_reason: e.exemption_reason.clone(),
-                exemption_reason_code: e.exemption_reason_code.as_deref().map(Code::new),
-            });
-        }
-
-        // The per-advance tax has no core business term. Carrying it into
-        // `Extensions` rather than dropping it is the difference between a
-        // lawful final invoice and a §14c Abs. 1 UStG liability — see
-        // `crate::extensions`. `EN-EXT-01` then warns if the target profile
-        // cannot represent it.
-        inv.extensions = self.advances()?;
-
-        inv.totals = totals;
-        Ok(inv)
-    }
-
-    /// One BG-25 line.
-    fn line(&self, i: usize, item: &LineItem) -> Result<InvoiceLine, ConversionError> {
-        let quantity = item.quantity.as_ref();
-
-        // BT-130. `Quantity::code` first; the resolver only as a fallback.
-        let unit_code = match quantity {
-            Some(q) => match q.code.as_deref() {
-                Some(c) => c.to_owned(),
-                None => self
-                    .units
-                    .resolve(&q.unit)
-                    .ok_or_else(|| ConversionError::UnresolvedUnit {
-                        index: i,
-                        label: q.unit.clone(),
-                    })?
-                    .to_owned(),
-            },
-            // A flat charge with no quantity: `1` of `C62` ("one"), so BR-22 and
-            // BR-23 hold and `1 × amount` reproduces the amount exactly.
-            None => "C62".to_owned(),
-        };
-
-        let net = amount(item.net_amount, &format!("line[{i}] BT-131"))?;
-
-        // The sign convention flips here. `billing` models a return as
-        // `Sign::Credit` with a NON-negative quantity; EN 16931 puts the sign on
-        // BT-129 and forbids a negative BT-146 (BR-27). Annex A.1.6 shows it:
-        // 25 cases invoiced, −10 returned, one ordinary invoice.
-        let (bt_129, bt_146) = match (quantity, item.unit_price.as_ref()) {
-            (Some(q), Some(p)) => {
-                let mut qty = q.value;
-                let mut price = p.value;
-                if item.sign == Sign::Credit {
-                    qty = -qty;
-                }
-                // A negative unit price — lawful in `billing` for spot markets —
-                // violates BR-27. Flip it onto the quantity instead of dropping
-                // the line: `1000 kWh × −0.005` becomes `−1000 kWh × 0.005`.
-                if price < Decimal::ZERO {
-                    price = -price;
-                    qty = -qty;
-                }
-                (Quantity::new(qty), UnitPriceAmount::new(price))
-            }
-            // Fixed amount: quantity 1 (or −1 for a credit) at the full amount.
-            _ => {
-                let one = if item.sign == Sign::Credit {
-                    Decimal::NEGATIVE_ONE
-                } else {
-                    Decimal::ONE
-                };
-                let abs = net.into_decimal().abs();
-                (Quantity::new(one), UnitPriceAmount::new(abs))
-            }
-        };
-
-        Ok(InvoiceLine {
-            id: (i + 1).to_string(),
-            note: None,
-            // BT-132 / BT-133 have no `billing` analogue: it is a financial
-            // document and these are the buyer's procurement and bookkeeping
-            // handles. A caller who has them sets them after conversion.
-            order_line_reference: None,
-            accounting_reference: None,
-            object_identifier: None,
-            quantity: bt_129,
-            unit_code: Code::new(unit_code),
-            net_amount: net,
-            period: period(item.period.as_ref(), "line period")?,
-            allowances: self.line_allowances(item, billing::AllowanceKind::Allowance)?,
-            charges: self.line_allowances(item, billing::AllowanceKind::Charge)?,
-            price: PriceDetails {
-                net_price: bt_146,
-                price_discount: item
-                    .unit_price
-                    .as_ref()
-                    .and_then(|p| p.price_discount)
-                    .map(UnitPriceAmount::new),
-                gross_price: item
-                    .unit_price
-                    .as_ref()
-                    .and_then(|p| p.gross_price)
-                    .map(UnitPriceAmount::new),
-                base_quantity: item
-                    .unit_price
-                    .as_ref()
-                    .and_then(|p| p.base_quantity)
-                    .map(Quantity::new),
-                base_quantity_code: item
-                    .unit_price
-                    .as_ref()
-                    .and_then(|p| p.base_quantity_code.clone())
-                    .map(Code::new),
-            },
-            vat: line_vat(item.vat.as_ref()).ok_or_else(|| ConversionError::NoVatAttribution {
-                index: i,
-                description: item.description.clone(),
-            })?,
-            // BT-153. `description` is the only thing `billing` has, and an
-            // unlabelled position is already rejected there, so this is always
-            // non-empty — but BR-25 is checked by the engine regardless.
-            item: Item {
-                name: Some(item.description.clone()),
-                ..Default::default()
-            },
-        })
-    }
-
-    /// BG-27 or BG-28 for one line.
-    fn line_allowances(
-        &self,
-        item: &LineItem,
-        kind: billing::AllowanceKind,
-    ) -> Result<Vec<LineAllowanceCharge>, ConversionError> {
-        item.line_allowances
-            .iter()
-            .filter(|a| a.kind == kind)
-            .map(|a| {
-                Ok(LineAllowanceCharge {
-                    amount: amount(a.amount, "line allowance/charge")?,
-                    base_amount: a
-                        .base_amount
-                        .map(|b| amount(b, "line allowance/charge base"))
-                        .transpose()?,
-                    percentage: a.percentage.map(Percentage::new),
-                    reason: a.reason.clone(),
-                    reason_code: a.reason_code.as_deref().map(Code::new),
-                })
-            })
-            .collect()
-    }
-
-    /// ZUGFeRD EXTENDED `BG-X-45`, from `billing`'s itemised advances.
-    ///
-    /// Empty for an ordinary invoice, and empty for a *residual* invoice, which
-    /// bills only the remainder and deliberately lists no advances. Non-empty
-    /// makes this a **final invoice**.
-    fn advances(&self) -> Result<Extensions, ConversionError> {
-        let billing_err = |e: billing::BillingError| ConversionError::Billing(e.to_string());
-        let mut out = Vec::new();
-        for a in self.doc.advances() {
-            out.push(AdvancePayment {
-                gross: amount(a.checked_gross().map_err(billing_err)?, "BT-X-291")?,
-                received_on: date(a.received_on(), "advance received_on")?,
-                tax: a
-                    .tax()
-                    .iter()
-                    .map(|e| {
-                        Ok(VatBreakdown {
-                            taxable_amount: amount(e.taxable_base, "BG-X-46 base")?,
-                            tax_amount: amount(e.tax_amount, "BG-X-46 tax")?,
-                            category: Code::new(e.category.code()),
-                            rate: Some(rate(e.rate)),
-                            exemption_reason: e.exemption_reason.clone(),
-                            exemption_reason_code: e
-                                .exemption_reason_code
-                                .as_deref()
-                                .map(Code::new),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, ConversionError>>()?,
-                reference: a.reference().map(crate::DocumentReference::new),
-                reference_date: date(a.reference_date(), "advance reference_date")?,
-            });
-        }
-        Ok(Extensions {
-            // `billing` models neither sub-lines nor third-party settlement.
-            sub_invoice_lines: Vec::new(),
-            third_party_payments: Vec::new(),
-            advance_payments: out,
-        })
-    }
-
-    /// BG-22, taking each term from the accessor that actually means it.
-    fn totals(&self) -> Result<DocumentTotals, ConversionError> {
-        let doc = self.doc;
-        let billing_err = |e: billing::BillingError| ConversionError::Billing(e.to_string());
-
-        let line_total = amount(doc.line_total().map_err(billing_err)?, "BT-106")?;
-        let allowances = doc.discount_total();
-        let charges = doc.charge_total().map_err(billing_err)?;
-        let vat = doc.vat_total().map_err(billing_err)?;
-
-        Ok(DocumentTotals {
-            line_total,
-            // Absent is not zero: BT-107 may be omitted only when there are no
-            // allowances at all, and BR-CO-13 branches on its presence.
-            allowance_total: (!doc.discount_positions().is_empty())
-                .then(|| amount(allowances.checked_neg().map_err(billing_err)?, "BT-107"))
-                .transpose()?,
-            charge_total: (doc.charge_positions().next().is_some())
-                .then(|| amount(charges, "BT-108"))
-                .transpose()?,
-            taxable_total: amount(doc.taxable_total().map_err(billing_err)?, "BT-109")?,
-            vat_total: (!doc.tax_breakdown().is_empty())
-                .then(|| amount(vat, "BT-110"))
-                .transpose()?,
-            // BT-111. `BR-53` makes it mandatory whenever BT-6 is present, and
-            // the two now come from one place — an adapter that mapped the
-            // currency and left the amount `None` would manufacture a `BR-53`
-            // finding out of a document that carries both.
-            vat_total_accounting: doc
-                .vat_accounting_currency()
-                .map(|a| amount(a.vat_total(), "BT-111"))
-                .transpose()?,
-            gross_total: amount(doc.gross_total(), "BT-112")?,
-            paid: (!doc.prepaid().is_zero())
-                .then(|| amount(doc.prepaid(), "BT-113"))
-                .transpose()?,
-            rounding: (!doc.rounding().is_zero())
-                .then(|| amount(doc.rounding(), "BT-114"))
-                .transpose()?,
-            due: amount(doc.amount_due().map_err(billing_err)?, "BT-115")?,
-        })
+fn basis(
+    b: Option<(Decimal, billing::Percent)>,
+    decimals: u8,
+) -> Result<(Option<InvoiceAmount>, Option<Percentage>), SeamError> {
+    match b {
+        Some((base, pct)) => Ok((
+            Some(decimal(base, decimals)?),
+            Some(Percentage::new(pct.value())),
+        )),
+        None => Ok((None, None)),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn amount(a: billing::Amount, decimals: u8) -> Result<InvoiceAmount, SeamError> {
+    decimal(a.to_decimal(), decimals)
+}
 
-    #[test]
-    fn the_resolver_prefers_caller_mappings_and_refuses_to_guess() {
-        let r = UnitResolver::new().with("kWh", "XXX").with("Kiste", "BX");
-        assert_eq!(r.resolve("kWh"), Some("XXX"), "caller overrides built-in");
-        assert_eq!(r.resolve("Kiste"), Some("BX"));
-        assert_eq!(r.resolve("Stk"), Some("H87"), "built-in still reachable");
-        assert_eq!(r.resolve("Furlong"), None, "never guesses");
-    }
+fn decimal(d: Decimal, decimals: u8) -> Result<InvoiceAmount, SeamError> {
+    InvoiceAmount::from_decimal_exact(d).map_err(|_| SeamError::ScaleTooFine { decimals })
+}
 
-    #[test]
-    fn every_built_in_unit_code_is_real() {
-        for (label, code) in BUILT_IN {
-            assert!(
-                crate::codes::contains(crate::codes::generated::UNIT_CODES, code),
-                "{label} maps to {code}, which is not in BR-CL-23's list"
-            );
-        }
-    }
-
-    #[test]
-    fn rates_convert_from_fraction_to_per_cent() {
-        // The most common transcription bug when bridging the two crates.
-        assert_eq!(
-            rate(rust_decimal::dec!(0.19)),
-            Percentage::new(rust_decimal::dec!(19))
-        );
-        assert_eq!(
-            rate(rust_decimal::dec!(0.075)),
-            Percentage::new(rust_decimal::dec!(7.5))
-        );
-        assert_eq!(rate(Decimal::ZERO), Percentage::ZERO);
+fn non_zero(a: billing::Amount, decimals: u8) -> Result<Option<InvoiceAmount>, SeamError> {
+    if a.is_zero() {
+        Ok(None)
+    } else {
+        amount(a, decimals).map(Some)
     }
 }

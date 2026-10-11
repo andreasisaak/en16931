@@ -1,10 +1,8 @@
 //! Presence, conditionality and code-list rules that are not VAT-category
 //! specific.
 //!
-//! # What is *not* here, and why
-//!
-//! Several rules the artefacts ship are satisfied by the model's own types and
-//! have nothing left to check at runtime:
+//! Rules the model's types already satisfy are registered with a constant-pass
+//! evaluation in [`STRUCTURAL_BY_TYPE`] and [`DECIMALS`]:
 //!
 //! | Rule | Why it cannot fire |
 //! |---|---|
@@ -13,12 +11,9 @@
 //! | `BR-45`, `BR-46` | BT-116 and BT-117 are non-`Option` on `VatBreakdown` |
 //! | `BR-12` … `BR-15` | BT-106, BT-109, BT-112 and BT-115 are non-`Option` on `DocumentTotals` |
 //! | `BR-31`, `BR-36`, `BR-41`, `BR-43` | the amount is non-`Option` on every allowance and charge |
+//! | `BR-32`, `BR-37` | the VAT category code is non-`Option` on document allowances and charges |
+//! | `BR-CL-03` | every amount is in BT-5's currency; there is no per-amount currency |
 //! | `BR-DEC-*` (21 rules) | a third decimal is not representable in [`crate::InvoiceAmount`] |
-//!
-//! That is thirty-odd rules retired by the type system rather than by a
-//! predicate — the crate's central claim, made concrete. They are registered in
-//! [`STRUCTURAL_BY_TYPE`] with a constant-pass evaluation so `explain` still
-//! works and a report can state they were checked.
 
 use super::{Findings, Rule, RuleId, Severity, Source};
 use crate::Identifier;
@@ -66,17 +61,9 @@ macro_rules! by_type {
 
 // ── Addresses and parties ─────────────────────────────────────────────────────
 
-/// Whether a postal address carries nothing at all.
-///
-/// The group exists in a document when *any* of its terms does, so all seven are
-/// consulted — not the four an earlier version happened to list. An address with
-/// only a subdivision (BT-39) or only a third address line (BT-162, added by
-/// A1:2019) is a present BG-5, invalid for want of BT-40, and `BR-09` is the
-/// rule that says so. Reporting `BR-08` there as well would blame the group for
-/// the missing field.
-///
-/// Whitespace counts as absent, as it does everywhere else in this module: a
-/// `Some("  ")` is what a careless mapping produces, not an address line.
+/// Whether a postal address carries nothing at all: all seven terms absent or
+/// blank. An address with any one term is present, and a missing BT-40 is
+/// `BR-09`'s finding, not `BR-08`'s.
 fn address_is_empty(a: &crate::invoice::PostalAddress) -> bool {
     let blank = |v: &Option<String>| v.as_deref().is_none_or(|s| s.trim().is_empty());
     a.country
@@ -129,8 +116,7 @@ terms: [bt::SELLER_VAT_ID, bt::BUYER_VAT_ID, BtId(63)],
  alpha-2 by which the country of issue may be identified. Nevertheless, Greece may use the \
  prefix 'EL'.",
 |inv, f| {
-    // `EL` is Greece's own prefix and is deliberately not ISO 3166-1 — the
-    // rule names the exception explicitly, so the check must too.
+    // `EL` (Greece) is not ISO 3166-1; the rule names the exception.
     let ok = |id: &str| {
         let p: String = id.chars().take(2).collect::<String>().to_ascii_uppercase();
         p == "EL" || crate::codes::contains(lists::COUNTRY_CODES, &p)
@@ -144,9 +130,7 @@ terms: [bt::SELLER_VAT_ID, bt::BUYER_VAT_ID, BtId(63)],
             inv.buyer.vat_identifier.as_deref(),
             Path::group_term(Group::Buyer, bt::BUYER_VAT_ID),
         ),
-        // BT-63. The rule text names it and it is easy to miss, because the tax
-        // representative is not a `Party` — CEN's own conformance suite has a
-        // case for exactly this.
+        // BT-63, on the tax representative (not a `Party`).
         (
             inv.tax_representative
                 .as_ref()
@@ -160,9 +144,7 @@ terms: [bt::SELLER_VAT_ID, bt::BUYER_VAT_ID, BtId(63)],
     }
 });
 
-// BT-29 and BT-30 are named as well as BT-31: the rule is a disjunction over
-// all three, and `touching(BtId(29))` returning nothing for the one rule that
-// requires BT-29 makes the index lie about its own registry.
+// All three terms are listed so `touching` finds the rule for each.
 rule!(BR_CO_26, "BR-CO-26", Fatal, Both,
 terms: [BtId(29), BtId(30), bt::SELLER_VAT_ID],
 "In order for the buyer to automatically identify a supplier, the Seller identifier (BT-29), \
@@ -279,13 +261,8 @@ rule!(BR_51, "BR-51", Warning, Both, terms: [BtId(87)],
  defined that the first 6 digits and last 4 digits are the maximum number of digits to be \
  shown.",
 |inv, f| {
-    // The **only** warning in the 201-rule CEN abstract model, and the only
-    // rule there about a security property rather than a semantic one.
-    //
-    // PCI DSS permits at most the first six and the last four digits, so a
-    // PAN showing more than ten is not masked. Counting digits rather than
-    // characters is deliberate: `4111 11** **** 1111` is masked despite
-    // being nineteen characters long.
+    // PCI DSS permits at most ten digits (first six, last four). Digits are
+    // counted, not characters: `4111 11** **** 1111` is masked.
     if let Some(crate::invoice::PaymentMeans::Card(card)) =
         inv.payment.as_ref().and_then(|p| p.means.as_ref())
         && let Some(pan) = card.primary_account_number.as_deref()
@@ -419,27 +396,9 @@ rule!(BR_CL_22, "BR-CL-22", Fatal, ArtefactOnly, terms: [bt::EXEMPTION_REASON_CO
 "Tax exemption reason code identifier scheme identifier MUST belong to the CEF VATEX code \
  list.",
 |inv, f| {
-    // **Case-insensitive**, and this is the one code-list rule that is.
-    //
-    // The codelist *source* (`EN16931-UBL-codes.sch`) compares verbatim; the
-    // **released** artefact wraps the value:
-    //
-    // ```xpath
-    // contains(' VATEX-EU-… ', concat(' ', normalize-space(upper-case(.)), ' '))
-    // ```
-    //
-    // So `vatex-eu-132-1g` is valid, and CEN's own `Invoice-Max_content.xml`
-    // reference file relies on it. Generating this rule's semantics from the
-    // source file — as this crate did — made it reject two of CEN's own
-    // examples. Same lesson as XRechnung's Peppol merge: the file in source
-    // control is not the artefact that ships.
-    //
-    // It also brings this rule into line with Peppol's `P0104`…`P0111`, which
-    // already fold BT-121's case.
-    //
-    // §6.5.8 says *"Codes shall be entered exactly as shown in the selected code
-    // list"*, so the standard and the artefact disagree here. This crate follows
-    // the artefact, because that is what every deployed validator runs.
+    // Case-insensitive, the only such code-list rule: the released artefact
+    // compares `upper-case(.)`, against §6.5.8's "exactly as shown". CEN's
+    // `Invoice-Max_content.xml` relies on it.
     for (i, e) in inv.vat_breakdown.iter().enumerate() {
         if e.exemption_reason_code.as_ref().is_some_and(|c| {
             !c.is_blank() && !crate::codes::contains(lists::VATEX_CODES, &c.as_str().to_uppercase())
@@ -527,12 +486,8 @@ by_type!(
     "Each VAT breakdown (BG-23) shall have a VAT category tax amount (BT-117)."
 );
 
-/// The `BR-DEC-*` family: *"The allowed maximum number of decimals for BT-x
-/// is 2."*
-///
-/// All twenty-one are retired by [`crate::InvoiceAmount`], which is `i64` minor
-/// units and physically cannot hold a third decimal. They are registered so
-/// `explain("BR-DEC-12")` works and a report can state they were checked.
+/// The `BR-DEC-*` family (*"maximum number of decimals … is 2"*), retired by
+/// [`crate::InvoiceAmount`], which cannot hold a third decimal.
 macro_rules! dec_rules {
     ($($konst:ident, $id:literal, $bt:literal;)*) => {
         $(by_type!($konst, $id,
@@ -568,8 +523,6 @@ dec_rules! {
 
 /// Rules satisfied by the model's types rather than by a predicate.
 pub static STRUCTURAL_BY_TYPE: &[&Rule] = &[
-    // Every amount in the model is implicitly in BT-5's currency, so there is
-    // no per-amount `@currencyID` that could disagree with it.
     &BR_CL_03, &BR_12, &BR_13, &BR_14, &BR_15, &BR_22, &BR_24, &BR_26, &BR_31, &BR_32, &BR_36,
     &BR_37, &BR_41, &BR_43, &BR_45, &BR_46,
 ];
@@ -592,7 +545,6 @@ mod tests {
     fn the_type_system_retires_thirty_seven_rules() {
         assert_eq!(STRUCTURAL_BY_TYPE.len(), 16);
         assert_eq!(DECIMALS.len(), 21, "Table 26 has 21 rows in the artefacts");
-        // They pass unconditionally — that is the point.
         for r in STRUCTURAL_BY_TYPE.iter().chain(DECIMALS.iter()) {
             let mut out = Vec::new();
             let mut sink = crate::validation::Findings::for_test(&mut out, r);
@@ -601,8 +553,7 @@ mod tests {
         }
     }
 
-    /// The four rules CEN itself binds to `true()` must also never fire —
-    /// registering them is a disposition, not a check.
+    /// The four rules CEN binds to `true()` never fire.
     #[test]
     fn the_undecidable_four_never_fire() {
         for r in [&BR_CO_05, &BR_CO_06, &BR_CO_07, &BR_CO_08] {
@@ -615,7 +566,6 @@ mod tests {
 
     #[test]
     fn greece_may_use_el_which_is_not_iso_3166_1() {
-        // BR-CO-09 names the exception explicitly, so the check must too.
         assert!(!crate::codes::contains(lists::COUNTRY_CODES, "EL"));
         assert!(crate::codes::contains(lists::COUNTRY_CODES, "GR"));
     }
@@ -627,12 +577,8 @@ rule!(BR_17, "BR-17", Fatal, Both, terms: [BtId(59)],
 "The Payee name (BT-59) shall be provided in the Invoice, if the Payee (BG-10) is different \
  from the Seller (BG-4).",
 |inv, f| {
-    // The artefact binds this to the *presence of the group* (`cac:PayeeParty`),
-    // not to a comparison with BG-4: a syntax carries a payee only when there is
-    // one to carry, so "different from the Seller" is the standard's prose for a
-    // condition the document has already answered by the time a validator sees
-    // it. A payee whose name happens to repeat the seller's is still a payee and
-    // still needs BT-59.
+    // As in the artefact: bound to the presence of BG-10, not a comparison
+    // with BG-4.
     if let Some(p) = &inv.payee
         && p.name.as_deref().is_none_or(str::is_empty)
     {
@@ -655,9 +601,7 @@ rule!(BR_19, "BR-19", Fatal, Both, terms: [],
 "The Seller tax representative postal address (BG-12) shall be provided in the Invoice, if \
  the Seller (BG-4) has a Seller tax representative party (BG-11).",
 |inv, f| {
-    // BG-12, the address — not BT-62, which is the *name* and belongs to
-    // `BR-18`. Both rules pointed at BT-62, so a tax representative with neither
-    // said "the name is missing" twice and never mentioned the address at all.
+    // Reported at BG-12; the name (BT-62) is `BR-18`'s.
     if inv
         .tax_representative
         .as_ref()
@@ -695,9 +639,8 @@ rule!(BR_56, "BR-56", Fatal, Both, terms: [BtId(63)],
 
 // ── Allowance and charge reasons, under their own ids ─────────────────────────
 //
-// `BR-33` / `-38` / `-42` / `-44` say the same thing as `BR-CO-21` … `-24`. The
-// artefacts ship both, so both are registered: a report that named only one
-// would send half its readers to a rule index entry that does not exist.
+// `BR-33` / `-38` / `-42` / `-44` restate `BR-CO-21` … `-24`; the artefacts
+// ship both, so both are registered.
 
 rule!(BR_33, "BR-33", Fatal, Both, terms: [bt::ALLOWANCE_REASON, bt::ALLOWANCE_REASON_CODE],
 "Each Document level allowance (BG-20) shall have a Document level allowance reason (BT-97) \
@@ -834,11 +777,8 @@ rule!(BR_IC_12, "BR-IC-12", Fatal, Both, terms: [bt::DELIVER_TO_COUNTRY],
 rule!(BR_CL_15, "BR-CL-15", Fatal, ArtefactOnly, terms: [BtId(159)],
 "Country codes in an invoice MUST be coded using ISO code list 3166-1.",
 |inv, f| {
-    // `cac:OriginCountry/cbc:IdentificationCode` — **BT-159**, the item's
-    // country of origin. Not BT-80: that is `cac:Country`, which is
-    // `BR-CL-14`'s context. The two rules share a message and check different
-    // terms, and reading the message rather than the context is how this rule
-    // spent several revisions duplicating its neighbour.
+    // Context `cac:OriginCountry` — BT-159, the item's country of origin.
+    // Same message as `BR-CL-14`, different term.
     for (i, line) in inv.lines.iter().enumerate() {
         if line
             .item
@@ -891,9 +831,7 @@ terms: [bt::SELLER_ELECTRONIC_ADDRESS, bt::BUYER_ELECTRONIC_ADDRESS],
         (&inv.seller, Path::group_term(Group::Seller, bt::SELLER_ELECTRONIC_ADDRESS), 0),
         (&inv.buyer, Path::group_term(Group::Buyer, bt::BUYER_ELECTRONIC_ADDRESS), 1),
     ] {
-        // Hinted, because "not in the CEF EAS code list" is the least useful
-        // true thing to say about `9958`: it *was* in the list, it is the code
-        // every German integrator reaches for, and the answer is `0204`.
+        // Hinted: e.g. withdrawn `9958` → `0204`.
         if let Some(s) = party.electronic_address.as_ref().and_then(crate::Identifier::scheme)
             && !crate::codes::guard::EAS.accepts(s)
         {
@@ -920,18 +858,8 @@ rule!(BR_CL_10, "BR-CL-10", Fatal, ArtefactOnly, terms: [BtId(29), BtId(46), BtI
 "Any identifier identification scheme identifier MUST be coded using one of the ISO 6523 ICD \
  list.",
 |inv, f| {
-    // The artefact's context is `cac:PartyIdentification/cbc:ID[@schemeID]` —
-    // **any** party's, so BT-29, BT-46 *and* the payee's BT-60. The literal
-    // `SEPA` is admitted on top of the ICD list, and its own test scopes that to
-    //
-    // ```xpath
-    // (ancestor::cac:AccountingSupplierParty) or (ancestor::cac:PayeeParty)
-    // ```
-    //
-    // — the seller and the payee, and **not** the buyer. Checking the seller
-    // and the buyer instead would let a buyer identifier schemed `SEPA` pass
-    // and never look at the payee at all: two false negatives on a fatal
-    // rule.
+    // Context `cac:PartyIdentification` on any party: BT-29, BT-46 and the
+    // payee's BT-60. `SEPA` is also admitted, for the seller and payee only.
     const SEPA: &str = "SEPA";
     let bad = |scheme: &str, sepa_ok: bool| {
         !(crate::codes::contains(lists::ICD_SCHEMES, scheme) || (sepa_ok && scheme == SEPA))
@@ -961,9 +889,8 @@ rule!(BR_CL_11, "BR-CL-11", Fatal, ArtefactOnly, terms: [BtId(30), BtId(47), BtI
 "Any registration identifier identification scheme identifier MUST be coded using one of the \
  ISO 6523 ICD list.",
 |inv, f| {
-    // `cac:PartyLegalEntity/cbc:CompanyID[@schemeID]`, again on **any** party:
-    // BT-30, BT-47 and the payee's BT-61. No `SEPA` carve-out here — that one
-    // belongs to `BR-CL-10`'s context alone.
+    // Context `cac:PartyLegalEntity` on any party: BT-30, BT-47 and the
+    // payee's BT-61. No `SEPA` exception.
     let bad = |s: &str| !crate::codes::contains(lists::ICD_SCHEMES, s);
     for (party, group) in [(&inv.seller, Group::Seller), (&inv.buyer, Group::Buyer)] {
         if party
@@ -989,8 +916,7 @@ rule!(BR_CL_11, "BR-CL-11", Fatal, ArtefactOnly, terms: [BtId(30), BtId(47), BtI
 rule!(BR_CL_24, "BR-CL-24", Fatal, ArtefactOnly, terms: [],
 "For Mime code in attribute use MIMEMediaType.",
 |inv, f| {
-    // The artefact checks membership of a short list; §6.5.11's normative
-    // receiver obligation names the same six types.
+    // The six MIME types of §6.5.11.
     for d in &inv.attachments {
         if let Some(a) = &d.attachment
             && !crate::Attachment::RECEIVER_MUST_ACCEPT.contains(&a.mime_code())
@@ -1018,9 +944,7 @@ rule!(BR_CL_07, "BR-CL-07", Fatal, ArtefactOnly, terms: [BtId(18), BtId(128)],
 "Object identifier identification scheme identifier MUST be coded using a restriction of UNTDID \
  1153.",
 |inv, f| {
-    // The artefact context is a **union**: `cac:AdditionalDocumentReference`
-    // with document type 130 (BT-18, document level) *and* the line's
-    // `cac:DocumentReference` with the same code (BT-128).
+    // Both BT-18 (document level) and BT-128 (line level).
     let bad = |id: &Identifier| {
         id.scheme()
             .is_some_and(|s| !crate::codes::contains(lists::REFERENCE_QUALIFIERS, s))
@@ -1050,27 +974,13 @@ rule!(BR_CL_08, "BR-CL-08", Fatal, ArtefactOnly, terms: [BtId(21)],
 
 // ── Rules no validator can decide — CEN's own included ────────────────────────
 
-/// Register a rule that **CEN's own Schematron binds to a constant `true()`**.
-///
-/// `BR-CO-05` … `BR-CO-08` all say some variant of *"the reason code and the
-/// reason shall indicate the same type"* — they ask whether a code and a piece
-/// of free text mean the same thing. No validator can answer that, and CEN's
-/// UBL binding says so out loud:
-///
-/// ```text
-/// <let name="BR-CO-05" value="true()"/>
-/// ```
-///
-/// So these are not gaps in this crate relative to the artefacts. Registering
-/// them, with the binding quoted, matches CEN exactly — and, unlike silence,
-/// tells a reader that the rule was read and dispositioned rather than missed.
+/// Register a rule CEN's Schematron binds to `true()` (`BR-CO-05` …
+/// `BR-CO-08`: whether a reason code and free-text reason agree).
 macro_rules! undecidable {
     ($konst:ident, $id:literal, $text:literal) => {
         #[doc = $text]
         #[doc = ""]
-        #[doc = "**Not mechanically decidable.** CEN's own UBL binding is"]
-        #[doc = "`value=\"true()\"` — the artefacts register this rule and never"]
-        #[doc = "evaluate it. Neither does this crate."]
+        #[doc = "Not mechanically decidable: CEN binds it to `true()`, and so does this crate."]
         pub static $konst: Rule = Rule {
             id: RuleId::new($id),
             severity: Severity::Fatal,

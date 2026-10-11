@@ -1,33 +1,10 @@
-//! Numbers the documentation quotes, checked against the code that produces them.
-//!
-//! # Why this exists
-//!
-//! Every figure in this project is measured — and then *written down*, in as
-//! many as six places: two crate READMEs, the CLI's, two `lib.rs` headers and
-//! the documentation site. Measuring something once and copying it six times is
-//! how a project ends up asserting, in prose, things that stopped being true.
-//!
-//! The prose stays — it is what makes the numbers mean something — and the
-//! numbers in it are read back and compared. `just deps` does the same for the
-//! dependency-graph sizes, and `tests/artefact_pin.rs` for the artefact
-//! revision; this covers what is countable from the library itself.
-//!
-//! # What is deliberately *not* checked here
-//!
-//! Anything needing `spec/`. The corpus sizes, the CEN assertion totals and the
-//! mutation counts are measured by the suites that read those artefacts, and
-//! they skip when it is absent. Duplicating them here would mean this test also
-//! skipped, and a test that quietly does nothing is worse than none —
-//! `crates/en16931-formats/tests/subset.rs` asserts the prohibition total,
-//! `tests/codelists.rs` the syntax-rule total, `tests/conformance.rs` the
-//! agreement figures.
-//!
-//! # Scanning rather than listing
+//! Numbers the documentation quotes (READMEs, site, source prose), checked
+//! against the code that produces them.
 //!
 //! Each claim is a pattern with one number slot, applied to every
-//! documentation file. That way a *new* mention of a figure is checked the day
-//! it is written, which a list of known locations cannot manage — and adding a
-//! seventh copy of a number stops being a risk worth avoiding.
+//! documentation file, and must match at least once. Figures that need the
+//! reference corpus are asserted by the suites that read it; the CEN
+//! assertion count is read from the conformance suite's `CEN_ASSERTIONS`.
 
 use std::collections::BTreeSet;
 
@@ -36,12 +13,8 @@ use common::docs::{Claim, check, documentation, find_all};
 
 #[test]
 fn every_number_the_documentation_quotes_is_the_one_the_code_produces() {
-    // ── measure ──────────────────────────────────────────────────────────────
-    // `check_ids` includes a profile's *restrictions*, which carry real
-    // published ids (`BR-DE-3`) and are counted in the CHECKS column — but they
-    // are §7.3.2 narrowings, not rules, and the figure the prose calls "business
-    // rules" is the registry. Counting the union of `check_ids` gives 329, and
-    // the twelve extra are exactly the restrictions.
+    // "Business rules" is the registry; a profile's restrictions count only
+    // among its checks.
     let registered: BTreeSet<&str> = en16931::validation::rules::CORE
         .iter()
         .map(|r| r.id.as_str())
@@ -57,10 +30,7 @@ fn every_number_the_documentation_quotes_is_the_one_the_code_produces() {
     let checks = |p: &en16931::Profile| p.check_ids().count();
 
     let claims = [
-        // The five profile check counts, as the comparison tables in five files
-        // print them. `tests/profiles.rs` measures the same figures against the
-        // registry; this measures the *prose* against them, which is the half
-        // that drifts.
+        // The five profile check counts, as the comparison tables print them.
         Claim {
             what: "checks the core profile runs",
             pattern: "| EN 16931 core | <N> |",
@@ -102,6 +72,22 @@ fn every_number_the_documentation_quotes_is_the_one_the_code_produces() {
             expected: registered.len(),
         },
         Claim {
+            what: "rules registered, as the landing page's figure",
+            pattern: "{ n = \"<N>\", k = \"rules registered\" }",
+            expected: registered.len(),
+        },
+        // The constant `en16931-formats`' conformance suite asserts.
+        Claim {
+            what: "CEN unit-test assertions run",
+            pattern: "<N> CEN unit-test assertions",
+            expected: cen_assertions(),
+        },
+        Claim {
+            what: "CEN unit-test assertions run, as the landing page's figure",
+            pattern: "{ n = \"<N>\", k = \"CEN unit-test assertions",
+            expected: cen_assertions(),
+        },
+        Claim {
             what: "this crate's own `EN-*` rules",
             pattern: "**<N>** of those are this crate's own",
             expected: crate_own,
@@ -131,10 +117,7 @@ fn every_number_the_documentation_quotes_is_the_one_the_code_produces() {
             pattern: "Eighteen lists, **<N> values**",
             expected: code_values,
         },
-        // Two figures that live in module headers rather than in a README, and
-        // are load-bearing there. The first is the crate's central thesis stated
-        // as a number — a *type* retires this many rules — and the second is
-        // quoted in a hint the validator prints to users.
+        // Two figures quoted in module prose.
         Claim {
             what: "`BR-DEC-*` assertions the two-decimal type retires",
             pattern: "as <N> separate assertions",
@@ -143,38 +126,93 @@ fn every_number_the_documentation_quotes_is_the_one_the_code_produces() {
                 .filter(|r| r.id.as_str().starts_with("BR-DEC-"))
                 .count(),
         },
-        // A pattern has to fit on one line. Prose in a `//` comment is wrapped,
-        // and the wrap inserts a newline and a comment marker in the middle of
-        // the sentence — so this one starts at `list of`, not at `a list of`.
+        // A pattern fits on one line of wrapped comment prose.
         Claim {
             what: "UN/ECE Rec 20/21 unit codes",
             pattern: "list of <N> values",
             expected: en16931::codes::generated::UNIT_CODES.len(),
+        },
+        Claim {
+            what: "files `cargo xtask codegen` writes",
+            pattern: "has <N> generated files",
+            expected: generated_files(),
+        },
+        Claim {
+            what: "files `cargo xtask check` re-derives",
+            pattern: "re-derives all <N> and",
+            expected: generated_files(),
+        },
+        Claim {
+            what: "`cargo-fuzz` targets",
+            pattern: "<N> `cargo-fuzz` targets",
+            expected: fuzz_targets(),
         },
     ];
 
     check(&claims);
 }
 
-/// The family table is a **partition** of the registry, and is checked as one.
-///
-/// Nine rows of "how many rules start with this prefix" is nine numbers that can
-/// each be wrong on their own, and one of them is easy to get wrong by hand:
-/// `PEPPOL-EN16931-R120` exists **twice**, once fatal for Peppol and once
-/// rewritten to a warning for XRechnung, so counting instances rather than
-/// distinct ids makes the nine rows sum to 318 against a registry of 317.
-///
-/// So this does not check nine numbers. It classifies every registered rule into
-/// exactly one bucket, asserts the buckets sum to the registry, and *then*
-/// compares each against the prose. A row that drifts fails; a row that is
-/// quietly dropped fails; and a rule family nobody thought to document fails,
-/// because it would land in a bucket with no claim behind it.
+/// Source files carrying the generator's do-not-edit header.
+fn generated_files() -> usize {
+    let root = common::docs::workspace_root();
+    let mut stack = vec![root.join("crates")];
+    let mut n = 0;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if !path.ends_with("tests") {
+                    stack.push(path);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let head: String = text.lines().take(6).collect::<Vec<_>>().join(" ");
+                n += usize::from(
+                    head.contains("Do not edit") && head.contains("cargo xtask codegen"),
+                );
+            }
+        }
+    }
+    n
+}
+
+/// The `cargo-fuzz` targets under `fuzz/fuzz_targets/`.
+fn fuzz_targets() -> usize {
+    std::fs::read_dir(common::docs::workspace_root().join("fuzz/fuzz_targets"))
+        .map(|dir| {
+            dir.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// `CEN_ASSERTIONS` in `en16931-formats`' conformance suite: the number of CEN
+/// unit-test assertions that suite runs and asserts exactly.
+fn cen_assertions() -> usize {
+    let path = common::docs::workspace_root().join("crates/en16931-formats/tests/conformance.rs");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let line = source
+        .lines()
+        .find(|l| l.starts_with("const CEN_ASSERTIONS: usize = "))
+        .expect("the conformance suite declares CEN_ASSERTIONS");
+    line.trim_start_matches("const CEN_ASSERTIONS: usize = ")
+        .trim_end_matches(';')
+        .replace('_', "")
+        .parse()
+        .expect("CEN_ASSERTIONS is an integer literal")
+}
+
+/// The family table is a partition of the registry of distinct ids: every
+/// registered rule lands in exactly one bucket, the buckets sum to the
+/// registry, and each is compared with the prose.
 #[test]
 fn the_family_table_partitions_the_registry() {
-    /// Longest prefix first, so `BR-DEC-` and `BR-DEX-` are not swallowed by
-    /// `BR-DE-`, which is a real hazard rather than a hypothetical one.
+    /// Longest prefix first, so `BR-DE-` does not swallow `BR-DEC-` / `BR-DEX-`.
     const FAMILIES: &[(&str, &str)] = &[
         ("PEPPOL-EN16931-", "| `PEPPOL-EN16931-*` | <N> |"),
+        ("PEPPOL-COMMON-", "| `PEPPOL-COMMON-*` | <N> |"),
         ("BR-DEC-", "| `BR-DEC-*` | <N> |"),
         ("BR-DEX-", "| `BR-DEX-*` | <N> |"),
         ("BR-DE-", "| `BR-DE-*` | <N> |"),
@@ -233,28 +271,42 @@ fn the_family_table_partitions_the_registry() {
     check(&claims);
 }
 
-/// Sample **output** in the documentation is produced, not transcribed.
-///
-/// A claim pattern checks one number in a sentence. A pasted terminal block is a
-/// whole line of them — a rule count, a finding count, a verdict — and it is
-/// exactly the kind of thing that is copied once and never rerun. The
-/// deviations block in `crates/en16931/README.md` had drifted two of its three:
-/// it showed `280 rule(s) checked` beside prose saying the count drops to 281,
-/// and neither was what the code printed.
-///
-/// So the line is regenerated here and the file is asked whether it contains it.
+/// A pasted sample report's header line is regenerated here, and some
+/// documentation file must contain it verbatim.
 #[test]
 fn the_pasted_sample_reports_are_the_ones_the_code_prints() {
     use en16931::validation::Check;
-    use en16931::{Invoice, profiles};
+    use en16931::{AdvancePayment, Invoice, examples, profiles, validate};
 
-    let samples = [Check::new(&profiles::XRECHNUNG)
-        .without("BR-DE-15")
-        .run(&Invoice::default())];
+    // The billing page's final invoice: a valid core invoice carrying an
+    // itemised advance, so `EN-EXT-01` warns.
+    let mut final_invoice = examples::for_profile(&profiles::EN16931).expect("shipped");
+    final_invoice
+        .extensions
+        .advance_payments
+        .push(AdvancePayment {
+            gross: final_invoice.totals.gross_total,
+            received_on: None,
+            tax: final_invoice.vat_breakdown.clone(),
+            reference: None,
+            reference_date: None,
+        });
+
+    let samples = [
+        Check::new(&profiles::XRECHNUNG)
+            .without("BR-DE-15")
+            .run(&Invoice::default()),
+        validate(&final_invoice),
+        // The CLI's sample: an XRechnung invoice without BT-10.
+        profiles::XRECHNUNG.validate(&{
+            let mut inv = examples::for_profile(&profiles::XRECHNUNG).expect("shipped");
+            inv.buyer_reference = None;
+            inv
+        }),
+    ];
 
     for report in samples {
-        // The header line only: the finding list below it is elided in the
-        // documentation on purpose, and the header carries every figure.
+        // The header line carries every figure.
         let header = report
             .to_string()
             .lines()
@@ -266,13 +318,12 @@ fn the_pasted_sample_reports_are_the_ones_the_code_prints() {
                 .iter()
                 .any(|(_, text)| text.contains(&header)),
             "no documentation file contains the line this run prints:\n  {header}\n\
-             A sample report was pasted and has since gone stale."
+             A sample report was pasted and has since gone stale.\n{report}"
         );
     }
 }
 
-/// The matcher itself, because a silently-never-matching pattern would make the
-/// test above pass by doing nothing.
+/// The matcher itself.
 #[test]
 fn the_matcher_finds_what_it_should_and_nothing_else() {
     assert_eq!(find_all("<N> business rules", "317 business rules"), [317]);
@@ -284,9 +335,7 @@ fn the_matcher_finds_what_it_should_and_nothing_else() {
     assert_eq!(
         find_all("<N> business rules", "the 1\u{a0}339 business rules here"),
         [1339],
-        "…including an invisible one. This comment claimed a non-breaking space \
-         was handled while the scanner split on it, so a figure typed with one \
-         silently stopped being checked."
+        "…including a non-breaking space"
     );
     assert_eq!(
         find_all("<N> business rules", "the 1\u{202f}339 business rules here"),
@@ -318,8 +367,7 @@ fn the_matcher_finds_what_it_should_and_nothing_else() {
             "## Code lists — 4 887 values, generated"
         ),
         [4887],
-        "a pattern ending in a space has already made its own word boundary; \
-         demanding a second one made this one match nothing at all"
+        "a pattern ending in a space has made its own word boundary"
     );
     assert_eq!(
         find_all("about <N>%", "about 91% of them"),
@@ -331,4 +379,143 @@ fn the_matcher_finds_what_it_should_and_nothing_else() {
         [1, 2],
         "every occurrence, not just the first"
     );
+}
+
+/// The national-rules sentence on the site's profiles page, measured.
+///
+/// National = every assert id in Peppol's pinned Schematron of the form
+/// `XX-R-*` / `XX-S-*`. A German one is covered when its KoSIT equivalent is
+/// registered under XRechnung.
+#[test]
+fn national_rules_figures_are_measured() {
+    let Some(root) = common::require("Peppol national-rule figures") else {
+        return;
+    };
+    let path = root.join(common::peppol::UBL_SCH);
+    let flags = common::peppol::flags(
+        &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+    );
+    let national: Vec<(&String, &String)> = flags
+        .iter()
+        .filter(|(id, _)| common::peppol::is_national(id))
+        .collect();
+    // The release named in the pinned Schematron's header.
+    let sch = std::fs::read_to_string(&path).expect("read the Peppol Schematron");
+    let release = sch
+        .split_once("release ")
+        .and_then(|(_, rest)| {
+            rest.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .next()
+        })
+        .map(|v| v.trim_end_matches('.'))
+        .filter(|v| !v.is_empty())
+        .expect("the Peppol Schematron header names its release");
+    let page = std::fs::read_to_string(
+        common::docs::workspace_root().join("site/content/docs/profiles.md"),
+    )
+    .expect("read the profiles page");
+    assert!(
+        page.contains(&format!("national rules in Peppol BIS Billing {release},")),
+        "the profiles page's national-rules sentence does not name the pinned release {release}"
+    );
+
+    // `is_national` and "not `PEPPOL-*`" pick the same set.
+    let neither: Vec<&String> = flags
+        .keys()
+        .filter(|id| !id.starts_with("PEPPOL-") && !common::peppol::is_national(id))
+        .collect();
+    assert!(
+        neither.is_empty(),
+        "ids that are neither PEPPOL-* nor national by shape: {neither:?}"
+    );
+
+    let xr = &en16931::profiles::XRECHNUNG;
+    let mut covered = 0usize;
+    let mut absent: Vec<(&str, &str)> = Vec::new();
+    for (id, flag) in &national {
+        if id.starts_with("DE-") {
+            let eq = common::peppol::kosit_equivalent(id)
+                .unwrap_or_else(|| panic!("{id}: no KoSIT equivalent by its numbering"));
+            assert!(
+                xr.check_ids().any(|c| c == eq),
+                "{id} maps to {eq}, which XRechnung does not run"
+            );
+            covered += 1;
+        } else {
+            absent.push((&id[..2], flag.as_str()));
+        }
+    }
+    let country = |c: &str| absent.iter().filter(|(k, _)| *k == c).count();
+    let level = |l: &str| absent.iter().filter(|(_, f)| *f == l).count();
+    assert_eq!(
+        absent.len(),
+        ["DK", "GR", "IS", "IT", "NL", "NO", "SE"]
+            .iter()
+            .map(|c| country(c))
+            .sum::<usize>(),
+        "a country appeared that the sentence does not list"
+    );
+
+    check(&[
+        Claim {
+            what: "Peppol national rules",
+            pattern: "Of the **<N>** national rules",
+            expected: national.len(),
+        },
+        Claim {
+            what: "German national rules, covered",
+            pattern: "the <N> German",
+            expected: covered,
+        },
+        Claim {
+            what: "national rules not implemented",
+            pattern: "**<N> are not implemented**",
+            expected: absent.len(),
+        },
+        Claim {
+            what: "absent, Denmark",
+            pattern: "(DK <N>,",
+            expected: country("DK"),
+        },
+        Claim {
+            what: "absent, Greece",
+            pattern: "GR <N>, IS",
+            expected: country("GR"),
+        },
+        Claim {
+            what: "absent, Iceland",
+            pattern: "IS <N>, IT",
+            expected: country("IS"),
+        },
+        Claim {
+            what: "absent, Italy",
+            pattern: "IT <N>, NL",
+            expected: country("IT"),
+        },
+        Claim {
+            what: "absent, Netherlands",
+            pattern: "NL <N>, NO",
+            expected: country("NL"),
+        },
+        Claim {
+            what: "absent, Norway",
+            pattern: "NO <N>,",
+            expected: country("NO"),
+        },
+        Claim {
+            what: "absent, Sweden",
+            pattern: "SE <N>;",
+            expected: country("SE"),
+        },
+        Claim {
+            what: "absent, fatal",
+            pattern: "; <N> fatal and",
+            expected: level("fatal"),
+        },
+        Claim {
+            what: "absent, warning",
+            pattern: "fatal and <N> warning",
+            expected: level("warning"),
+        },
+    ]);
 }

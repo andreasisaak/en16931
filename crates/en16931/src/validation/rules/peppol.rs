@@ -1,38 +1,10 @@
-//! Peppol BIS Billing 3.0's own rules — the **third and fourth** tolerance
-//! regimes.
+//! Peppol BIS Billing 3.0's own rules, attached through
+//! [`crate::Profile::extra_rules`] rather than the core set (EN 16931 has no
+//! rule tying BT-131 to quantity × price).
 //!
-//! # ±0.02, and why it is not the other three
-//!
-//! | Regime | Rules | Tolerance | Whose |
-//! |---|---|---|---|
-//! | Totals chain | `BR-CO-10` … `BR-CO-16` | **exact** | CEN |
-//! | VAT derivation | `BR-CO-17`, `BR-*-08/09` | **±1.00**, on absolute values | CEN artefacts |
-//! | **Line & allowance derivation** | **`R120`, `R040`** | **±0.02** | **Peppol** |
-//! | **…the same, in HUF** | **[`XR_R120`], [`XR_R040`]** | **±0.5** | **XRechnung** |
-//!
-//! Peppol implements its slack with a helper in its own Schematron:
-//!
-//! ```xslt
-//! <function name="u:slack" as="xs:boolean">
-//!   <param name="exp"/><param name="val"/><param name="slack"/>
-//!   <sequence select="($exp + $slack) >= $val and ($exp - $slack) <= $val"/>
-//! </function>
-//! ```
-//!
-//! Exactly two rules use it, both at `0.02` — and XRechnung, when it merges
-//! them, replaces that constant with `if($documentCurrencyCode = 'HUF') then
-//! 0.5 else 0.02`. Everything else in this module is **exact**, including
-//! `R046`, which is the trap: it looks like `R040`'s sibling and carries no
-//! slack at all, so a caller who computes the net price themselves and lands a
-//! cent out fails it.
-//!
-//! # `R120` is not a CEN rule
-//!
-//! EN 16931 has **no** rule tying BT-131 to quantity × price. Under
-//! [`crate::profiles::EN16931`] a line whose amount does not follow from its
-//! price is perfectly valid. That is why these live in
-//! [`crate::Profile::extra_rules`] rather than in the core set — and why
-//! tolerance is a property of the *rule*, never a crate-wide constant.
+//! Only `R120` and `R040` have slack: Peppol's `u:slack` at ±0.02, which
+//! XRechnung's merged instances ([`XR_R120`], [`XR_R040`]) widen to ±0.5 for
+//! HUF. Everything else here is exact, including `R046`.
 
 use rust_decimal::Decimal;
 
@@ -46,19 +18,9 @@ use crate::{InvoiceAmount, Percentage};
 /// Peppol's `u:slack`, verbatim.
 pub const SLACK: Decimal = Decimal::from_parts(2, 0, 0, false, 2); // 0.02
 
-/// XRechnung's slack for Hungarian forint — **a fourth tolerance regime**.
-///
-/// When XRechnung merges Peppol's rules it rewrites the constant:
-///
-/// ```xslt
-/// <let name="slackValue" value="if($documentCurrencyCode = 'HUF') then 0.5 else 0.02"/>
-/// ```
-///
-/// HUF has no minor unit in practice — prices are whole forint — so 0.02 is
-/// tighter than the currency can express. **Peppol does not do this**: its own
-/// Schematron hardcodes `0.02` for every currency, so the same HUF invoice can
-/// pass XRechnung and fail Peppol. That is why the two profiles get their own
-/// instances of `R040` and `R120` rather than sharing one.
+/// XRechnung's slack for Hungarian forint, as its merge rewrites `u:slack`
+/// (`if($documentCurrencyCode = 'HUF') then 0.5 else 0.02`). Peppol itself
+/// uses 0.02 for every currency.
 pub const HUF_SLACK: Decimal = Decimal::from_parts(5, 0, 0, false, 1); // 0.5
 
 /// Peppol's policy: 0.02, whatever the currency.
@@ -93,7 +55,6 @@ macro_rules! rule {
             severity: Severity::Fatal,
             text: $text,
             terms: &[$($t),*],
-            // Peppol's own additions: neither CEN's standard nor its artefacts.
             source: Source::ArtefactOnly,
             eval: |$inv: &Invoice, $f: &mut Findings<'_>| $body,
         };
@@ -204,8 +165,7 @@ pub(crate) fn check_allowance_basis(
             tolerance,
         );
     }
-    // The Schematron's context lists the line-level element alongside the
-    // document-level one, so the same rule governs BG-27 and BG-28.
+    // The Schematron context includes line-level BG-27 and BG-28 too.
     for (i, line) in inv.lines.iter().enumerate() {
         for a in line.allowances.iter().chain(&line.charges) {
             check_basis(
@@ -293,8 +253,7 @@ terms: [bt::ITEM_NET_PRICE, bt::ITEM_GROSS_PRICE, bt::ITEM_PRICE_DISCOUNT],
             .price_discount
             .map_or(Decimal::ZERO, |d| d.into_decimal());
         let expected = gross.into_decimal() - discount;
-        // **Exact.** Unlike R040 this carries no `u:slack`, which is why a
-        // producer should derive BT-146 rather than compute and state it.
+        // Exact: no `u:slack`, unlike R040.
         if expected != line.price.net_price.into_decimal() {
             f.arithmetic(
                 Path::at_term(Group::Line, i, bt::ITEM_NET_PRICE),
@@ -310,7 +269,7 @@ terms: [bt::PRICE_BASE_QUANTITY],
 "Base quantity MUST be a positive number above zero.",
 |inv, f| {
     for (i, line) in inv.lines.iter().enumerate() {
-        // It is a divisor in R120, so zero is not merely odd but undefined.
+        // A divisor in R120.
         if line.price.base_quantity.is_some_and(|q| !q.is_positive()) {
             f.at(Path::at_term(Group::Line, i, bt::PRICE_BASE_QUANTITY));
         }
@@ -322,9 +281,7 @@ terms: [bt::PRICE_BASE_QUANTITY_CODE, bt::LINE_UNIT_CODE],
 "Unit code of price base quantity MUST be same as invoiced quantity.",
 |inv, f| {
     for (i, line) in inv.lines.iter().enumerate() {
-        // A cross-field rule: BT-130 lives on the quantity and BT-150 on the
-        // price, so only the line can check it. Only when both are stated —
-        // supplying one is not a contradiction.
+        // BT-150 against BT-130, only when BT-150 is stated.
         if line
             .price
             .base_quantity_code
@@ -355,17 +312,512 @@ terms: [],
     }
 });
 
-/// Every rule this module defines.
+// ── PEPPOL-COMMON-* — identifier checks, by scheme ────────────────────────────
+
+/// Every schemed party identifier `PEPPOL-COMMON-*` reaches, with where it sits.
 ///
-/// Attached to [`crate::profiles::PEPPOL_BIS_3`] through
-/// [`crate::Profile::extra_rules`], **not** to the core set — `R120` in
-/// particular has no CEN counterpart.
+/// Peppol's UBL contexts are `cbc:EndpointID[@schemeID]` (BT-34, BT-49),
+/// `cac:PartyIdentification/cbc:ID[@schemeID]` (BT-29, BT-46, BT-60) and
+/// `cbc:CompanyID[@schemeID]` (BT-30, BT-47, BT-61). `endpoints_only` is
+/// `PEPPOL-COMMON-R046`'s narrower context.
+fn party_identifiers(inv: &Invoice, endpoints_only: bool) -> Vec<(&crate::Identifier, Path)> {
+    let mut out = Vec::new();
+    for (party, group, [ident, legal, endpoint]) in [
+        (&inv.seller, Group::Seller, [29, 30, 34]),
+        (&inv.buyer, Group::Buyer, [46, 47, 49]),
+    ] {
+        if let Some(e) = &party.electronic_address {
+            out.push((e, Path::group_term(group, BtId(endpoint))));
+        }
+        if endpoints_only {
+            continue;
+        }
+        for i in &party.identifiers {
+            out.push((i, Path::group_term(group, BtId(ident))));
+        }
+        if let Some(r) = &party.legal_registration {
+            out.push((r, Path::group_term(group, BtId(legal))));
+        }
+    }
+    if let Some(payee) = inv.payee.as_ref().filter(|_| !endpoints_only) {
+        if let Some(i) = &payee.identifier {
+            out.push((i, Path::group_term(Group::Payee, BtId(60))));
+        }
+        if let Some(r) = &payee.legal_registration {
+            out.push((r, Path::group_term(Group::Payee, BtId(61))));
+        }
+    }
+    out
+}
+
+/// Report every identifier in `scheme` whose content `ok` refuses.
+fn check_scheme(
+    inv: &Invoice,
+    f: &mut Findings<'_>,
+    scheme: &str,
+    endpoints_only: bool,
+    ok: fn(&str) -> bool,
+) {
+    for (id, path) in party_identifiers(inv, endpoints_only) {
+        if id.scheme() == Some(scheme) && !ok(id.content()) {
+            f.at(path);
+        }
+    }
+}
+
+/// XPath's `normalize-space()`: trimmed, inner whitespace runs collapsed.
+fn normalize_space(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Every byte an ASCII digit, and at least one.
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `s castable as xs:integer`: optional sign, then digits, surrounding
+/// whitespace allowed.
+fn castable_integer(s: &str) -> bool {
+    let t = s.trim();
+    all_digits(t.strip_prefix(['+', '-']).unwrap_or(t))
+}
+
+/// The value of each ASCII digit, in order.
+fn digit_values(s: &str) -> impl DoubleEndedIterator<Item = u32> + '_ {
+    s.bytes().map(|b| u32::from(b - b'0'))
+}
+
+/// Peppol's `u:gln` — the GS1 mod-10 check digit. Caller ensures digits only.
+fn gln(v: &str) -> bool {
+    let Some((body, check)) = v.len().checked_sub(1).and_then(|n| v.split_at_checked(n)) else {
+        return false;
+    };
+    let sum: u32 = digit_values(body)
+        .rev()
+        .enumerate()
+        .map(|(i, d)| d * if i % 2 == 0 { 3 } else { 1 })
+        .sum();
+    digit_values(check).next() == Some((10 - sum % 10) % 10)
+}
+
+/// Peppol's `u:mod11` — weights 2…7 from the right; a value of zero fails.
+fn mod11(v: &str) -> bool {
+    let Some((body, check)) = v.len().checked_sub(1).and_then(|n| v.split_at_checked(n)) else {
+        return false;
+    };
+    let sum: u32 = digit_values(body)
+        .rev()
+        .enumerate()
+        .map(|(i, d)| d * (u32::try_from(i % 6).unwrap_or(0) + 2))
+        .sum();
+    v.bytes().any(|b| b != b'0') && digit_values(check).next() == Some((11 - sum % 11) % 11)
+}
+
+/// Peppol's `u:mod97-0208` — the Belgian enterprise number's check pair.
+fn mod97_0208(v: &str) -> bool {
+    let (Some(body), Some(check)) = (v.get(..8), v.get(8..10)) else {
+        return false;
+    };
+    let (Ok(body), Ok(check)) = (body.parse::<u64>(), check.parse::<u64>()) else {
+        return false;
+    };
+    97 - body % 97 == check
+}
+
+/// Peppol's `u:checkCodiceIPA` — six ASCII letters or digits.
+fn codice_ipa(v: &str) -> bool {
+    v.len() == 6 && v.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Peppol's `u:checkCF` — an Italian *codice fiscale*: 16 characters in the
+/// personal shape, or 11 castable as an integer.
+fn codice_fiscale(v: &str) -> bool {
+    match v.chars().count() {
+        16 => {
+            let c: Vec<char> = v.chars().collect();
+            let letters = |r: std::ops::Range<usize>| c[r].iter().all(char::is_ascii_alphabetic);
+            let int =
+                |r: std::ops::Range<usize>| castable_integer(&c[r].iter().collect::<String>());
+            letters(0..6)
+                && int(6..8)
+                && letters(8..9)
+                && int(9..11)
+                && int(14..15)
+                && letters(15..16)
+        }
+        11 => castable_integer(v),
+        _ => false,
+    }
+}
+
+/// Peppol's `u:checkPIVAseIT` — an `IT` *partita IVA* is 11 digits with a Luhn
+/// check digit; any other prefix passes.
+fn partita_iva(v: &str) -> bool {
+    match v.get(..2) {
+        Some("IT" | "it") => {
+            let code = &v[2..];
+            code.len() == 11 && all_digits(code) && {
+                let sum: u32 = digit_values(code)
+                    .enumerate()
+                    .map(|(i, d)| {
+                        if i % 2 == 1 {
+                            [0, 2, 4, 6, 8, 1, 3, 5, 7, 9][d as usize]
+                        } else {
+                            d
+                        }
+                    })
+                    .sum();
+                sum.is_multiple_of(10)
+            }
+        }
+        _ => true,
+    }
+}
+
+/// Peppol's `u:checkSEOrgnr` — ten digits, the last a Luhn check over the nine
+/// before it.
+fn se_orgnr(v: &str) -> bool {
+    if v.len() != 10 || !all_digits(v) {
+        return false;
+    }
+    let sum: u32 = digit_values(&v[..9])
+        .rev()
+        .enumerate()
+        .map(|(i, d)| {
+            if i % 2 == 0 {
+                (d * 2) % 10 + (d * 2) / 10
+            } else {
+                d
+            }
+        })
+        .sum();
+    digit_values(&v[9..]).next() == Some((10 - sum % 10) % 10)
+}
+
+/// Peppol's `u:abn` — the Australian Business Number's weighted mod-89 sum.
+fn abn(v: &str) -> bool {
+    const WEIGHTS: [i64; 11] = [10, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+    v.len() == 11
+        && all_digits(v)
+        && digit_values(v)
+            .zip(WEIGHTS)
+            .enumerate()
+            // The first digit is reduced by one before weighting, so a leading
+            // zero contributes -10 — and XPath's `mod` keeps the dividend's sign.
+            .map(|(i, (d, w))| (i64::from(d) - i64::from(i == 0)) * w)
+            .sum::<i64>()
+            % 89
+            == 0
+}
+
+/// `^[0-9]{n}$` over `normalize-space()`.
+fn n_digits(v: &str, n: usize) -> bool {
+    let v = normalize_space(v);
+    v.len() == n && all_digits(&v)
+}
+
+/// `DK` followed by eight digits, over `string()`.
+fn dk_and_eight(v: &str) -> bool {
+    v.len() == 10 && v.starts_with("DK") && all_digits(&v[2..])
+}
+
+/// `^NL[0-9]{9}B[0-9]{2}$` over `normalize-space()`.
+fn dutch_vat(v: &str) -> bool {
+    let v = normalize_space(v);
+    let b = v.as_bytes();
+    // On bytes, so a multi-byte character cannot put a slice mid-character.
+    b.len() == 14
+        && b.starts_with(b"NL")
+        && b[2..11].iter().all(u8::is_ascii_digit)
+        && b[11] == b'B'
+        && b[12..].iter().all(u8::is_ascii_digit)
+}
+
+/// A `PEPPOL-COMMON-*` rule: one scheme, one predicate, its published flag.
+macro_rules! common_rule {
+    ($konst:ident, $id:literal, $severity:ident, $scheme:literal, $endpoints_only:literal,
+     $text:literal, $ok:expr) => {
+        #[doc = $text]
+        #[doc = ""]
+        #[doc = concat!("Identifiers with scheme `", $scheme, "`.")]
+        pub static $konst: Rule = Rule {
+            id: RuleId::new($id),
+            severity: Severity::$severity,
+            text: $text,
+            terms: &[
+                BtId(29),
+                BtId(30),
+                BtId(34),
+                BtId(46),
+                BtId(47),
+                BtId(49),
+                BtId(60),
+                BtId(61),
+            ],
+            source: Source::ArtefactOnly,
+            eval: |inv, f| check_scheme(inv, f, $scheme, $endpoints_only, $ok),
+        };
+    };
+}
+
+common_rule!(
+    COMMON_R040,
+    "PEPPOL-COMMON-R040",
+    Fatal,
+    "0088",
+    false,
+    "GLN must have a valid format according to GS1 rules.",
+    |v| {
+        let v = normalize_space(v);
+        all_digits(&v) && gln(&v)
+    }
+);
+common_rule!(
+    COMMON_R041,
+    "PEPPOL-COMMON-R041",
+    Fatal,
+    "0192",
+    false,
+    "Norwegian organization number MUST be stated in the correct format.",
+    |v| n_digits(v, 9) && mod11(&normalize_space(v))
+);
+common_rule!(
+    COMMON_R042,
+    "PEPPOL-COMMON-R042",
+    Fatal,
+    "0184",
+    false,
+    "Danish organization number (CVR) MUST be stated in the correct format.",
+    // UBL's test, `(DK + 8 digits) or (8 characters and 8 digits)`. CII's drops
+    // the second alternative; this profile follows the UBL file.
+    |v| dk_and_eight(v) || (v.len() == 8 && all_digits(v))
+);
+common_rule!(
+    COMMON_R043,
+    "PEPPOL-COMMON-R043",
+    Fatal,
+    "0208",
+    false,
+    "Belgian enterprise number MUST be stated in the correct format.",
+    |v| n_digits(v, 10) && mod97_0208(&normalize_space(v))
+);
+common_rule!(
+    COMMON_R044,
+    "PEPPOL-COMMON-R044",
+    Warning,
+    "0201",
+    false,
+    "IPA Code (Codice Univoco Unità Organizzativa) must be stated in the correct format",
+    |v| codice_ipa(&normalize_space(v))
+);
+common_rule!(
+    COMMON_R045,
+    "PEPPOL-COMMON-R045",
+    Warning,
+    "0210",
+    false,
+    "Tax Code (Codice Fiscale) must be stated in the correct format",
+    |v| codice_fiscale(&normalize_space(v))
+);
+common_rule!(
+    COMMON_R046,
+    "PEPPOL-COMMON-R046",
+    Warning,
+    "9907",
+    true,
+    "Tax Code (Codice Fiscale) must be stated in the correct format",
+    |v| codice_fiscale(&normalize_space(v))
+);
+common_rule!(
+    COMMON_R047,
+    "PEPPOL-COMMON-R047",
+    Warning,
+    "0211",
+    false,
+    "Italian VAT Code (Partita Iva) must be stated in the correct format",
+    |v| partita_iva(&normalize_space(v))
+);
+common_rule!(
+    COMMON_R049,
+    "PEPPOL-COMMON-R049",
+    Fatal,
+    "0007",
+    false,
+    "Swedish organization number MUST be stated in the correct format.",
+    |v| se_orgnr(&normalize_space(v))
+);
+common_rule!(
+    COMMON_R050,
+    "PEPPOL-COMMON-R050",
+    Fatal,
+    "0151",
+    false,
+    "Australian Business Number (ABN) MUST be stated in the correct format.",
+    // UBL adds `^[0-9]{11}$` before the checksum; CII does not.
+    |v| abn(&normalize_space(v))
+);
+common_rule!(
+    COMMON_R052,
+    "PEPPOL-COMMON-R052",
+    Fatal,
+    "0096",
+    false,
+    "Danish chamber of commerce number (P) MUST be stated in the correct format.",
+    |v| v.len() == 10 && all_digits(v)
+);
+common_rule!(
+    COMMON_R053,
+    "PEPPOL-COMMON-R053",
+    Fatal,
+    "0198",
+    false,
+    "Danish ERSTORG number (SE) MUST be stated in the correct format.",
+    dk_and_eight
+);
+common_rule!(
+    COMMON_R054,
+    "PEPPOL-COMMON-R054",
+    Warning,
+    "0106",
+    false,
+    "Dutch Chamber of Commerce (KVK) numbers (0106) MUST be stated in the correct format \
+     (12345678).",
+    |v| n_digits(v, 8)
+);
+common_rule!(
+    COMMON_R055,
+    "PEPPOL-COMMON-R055",
+    Warning,
+    "0190",
+    false,
+    "Dutch organization identification numbers (0190) MUST be stated in the correct format \
+     (12345678901234567890).",
+    |v| n_digits(v, 20)
+);
+common_rule!(
+    COMMON_R056_1,
+    "PEPPOL-COMMON-R056-1",
+    Warning,
+    "9944",
+    false,
+    "Dutch VAT numbers (9944) MUST be stated in the correct format (NL123456789B12).",
+    dutch_vat
+);
+common_rule!(
+    COMMON_R057,
+    "PEPPOL-COMMON-R057",
+    Warning,
+    "0217",
+    false,
+    "Dutch Chamber of Commerce Establishment numbers (0217) MUST be stated in the correct \
+     format (123456789012).",
+    |v| n_digits(v, 12)
+);
+
+/// `PEPPOL-COMMON-R056-2` — a Dutch **VAT identifier** (BT-31, BT-48, BT-63), not
+/// a schemed identifier: `PartyTaxScheme[TaxScheme = 'VAT']/CompanyID` starting
+/// `NL`.
+pub static COMMON_R056_2: Rule = Rule {
+    id: RuleId::new("PEPPOL-COMMON-R056-2"),
+    severity: Severity::Warning,
+    text: "Dutch VAT numbers MUST have the format (NL123456789B12).",
+    terms: &[BtId(31), BtId(48), BtId(63)],
+    source: Source::ArtefactOnly,
+    eval: |inv, f| {
+        let tax_rep = inv
+            .tax_representative
+            .as_ref()
+            .and_then(|t| t.vat_identifier.as_deref());
+        for (vat, path) in [
+            (
+                inv.seller.vat_identifier.as_deref(),
+                Path::group_term(Group::Seller, BtId(31)),
+            ),
+            (
+                inv.buyer.vat_identifier.as_deref(),
+                Path::group_term(Group::Buyer, BtId(48)),
+            ),
+            (
+                tax_rep,
+                Path::group_term(Group::TaxRepresentative, BtId(63)),
+            ),
+        ] {
+            if let Some(v) = vat
+                && normalize_space(v).starts_with("NL")
+                && !dutch_vat(v)
+            {
+                f.at(path);
+            }
+        }
+    },
+};
+
+/// Every rule this module defines; [`crate::profiles::PEPPOL_BIS_3`]'s
+/// `extra_rules`.
 pub static ALL: &[&Rule] = &[
-    &R040, &R041, &R042, &R046, &R061, &R120, &R121, &R130, //
-    &R001, &R002, &R003, &R004, &R005, &R007, &R010, &R020, &R055, &R110, &R111, //
-    &P0104, &P0105, &P0106, &P0107, &P0108, &P0109, &P0110, &P0111, &P0112, //
-    &CL001, &CL002, &CL003, &CL006, &CL008, &P0100, &P0101, //
-    &F001, &R008, &R043, &R044, &R051, &CL007, &R053, &R054, &R080, &R100, &R101,
+    &R040,
+    &R041,
+    &R042,
+    &R046,
+    &R061,
+    &R120,
+    &R121,
+    &R130, //
+    &R001,
+    &R002,
+    &R003,
+    &R004,
+    &R005,
+    &R007,
+    &R010,
+    &R020,
+    &R055,
+    &R110,
+    &R111, //
+    &P0104,
+    &P0105,
+    &P0106,
+    &P0107,
+    &P0108,
+    &P0109,
+    &P0110,
+    &P0111,
+    &P0112, //
+    &CL001,
+    &CL002,
+    &CL003,
+    &CL006,
+    &CL008,
+    &P0100,
+    &P0101, //
+    &F001,
+    &R008,
+    &R043,
+    &R044,
+    &R051,
+    &CL007,
+    &R053,
+    &R054,
+    &R080,
+    &R100,
+    &R101, //
+    &COMMON_R040,
+    &COMMON_R041,
+    &COMMON_R042,
+    &COMMON_R043,
+    &COMMON_R044,
+    &COMMON_R045,
+    &COMMON_R046,
+    &COMMON_R047,
+    &COMMON_R049,
+    &COMMON_R050,
+    &COMMON_R052,
+    &COMMON_R053,
+    &COMMON_R054,
+    &COMMON_R055,
+    &COMMON_R056_1,
+    &COMMON_R056_2,
+    &COMMON_R057,
 ];
 
 /// The Peppol rules the model retires — registered, never fired.
@@ -377,6 +829,64 @@ pub static BY_TYPE: &[&Rule] = &[
 mod tests {
     use super::*;
 
+    /// Runs `rule` alone on `inv` and returns its findings' paths.
+    fn fired(rule: &'static Rule, inv: &Invoice) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut sink = crate::validation::Findings::for_test(&mut out, rule);
+        (rule.eval)(inv, &mut sink);
+        out.iter().map(|f| f.path.to_string()).collect()
+    }
+
+    /// Each segment of a codice fiscale, partita IVA and Swedish number fails
+    /// on its own.
+    #[test]
+    fn each_identifier_segment_is_checked_on_its_own() {
+        for bad in [
+            "1SSMRA85T10A562S", // letters 0..6
+            "RSSMRAX5T10A562S", // digits 6..8
+            "RSSMRA85110A562S", // letter 8
+            "RSSMRA85TX0A562S", // digits 9..11
+            "RSSMRA85T10A56XS", // digit 14
+            "RSSMRA85T10A5621", // letter 15
+        ] {
+            assert!(!codice_fiscale(bad), "{bad}");
+        }
+        assert!(partita_iva("IT37783533740"));
+        assert!(se_orgnr("8889964378"));
+        assert!(!se_orgnr("556036079A"));
+    }
+
+    /// `R002` and `P0112` exempt a document only when **both** parties are
+    /// German.
+    #[test]
+    fn the_german_exemption_needs_both_parties() {
+        let mut inv = Invoice {
+            notes: vec!["one".into(), "two".into()],
+            type_code: Some(crate::invoice::Code::new("326")),
+            ..Default::default()
+        };
+        inv.seller.address.country = Some(crate::invoice::Code::new("DE"));
+        inv.buyer.address.country = Some(crate::invoice::Code::new("DE"));
+        assert!(fired(&R002, &inv).is_empty());
+        assert!(fired(&P0112, &inv).is_empty());
+        inv.buyer.address.country = Some(crate::invoice::Code::new("FR"));
+        assert_eq!(fired(&R002, &inv).len(), 1);
+        assert_eq!(fired(&P0112, &inv).len(), 1);
+    }
+
+    /// `P0100` constrains BT-3 only on a Peppol billing process.
+    #[test]
+    fn the_type_code_list_applies_to_billing_processes_only() {
+        let mut inv = Invoice {
+            type_code: Some(crate::invoice::Code::new("999")),
+            business_process: Some("urn:example:another-process".to_owned()),
+            ..Default::default()
+        };
+        assert!(fired(&P0100, &inv).is_empty());
+        inv.business_process = Some("urn:fdc:peppol.eu:2017:poacc:billing:01:1.0".to_owned());
+        assert_eq!(fired(&P0100, &inv).len(), 1);
+    }
+
     #[test]
     fn slack_is_exactly_two_hundredths() {
         assert_eq!(SLACK, Decimal::from_str_exact("0.02").unwrap());
@@ -387,20 +897,65 @@ mod tests {
         assert!(!within(d("10.00"), d("10.03"), SLACK));
     }
 
+    /// The ported `u:*` helpers accept published real identifiers and reject
+    /// the same with the check digit changed.
+    #[test]
+    fn the_identifier_checks_agree_with_real_identifiers() {
+        for (check, good, bad) in [
+            (gln as fn(&str) -> bool, "4006381333931", "4006381333932"), // GS1's EAN-13 example
+            (mod11, "923609016", "923609017"),                           // a Norwegian org. number
+            (mod97_0208, "0403170701", "0403170702"), // a Belgian enterprise number
+            (partita_iva, "IT00743110157", "IT00743110158"),
+            (se_orgnr, "5560360793", "5560360794"), // a Swedish org. number
+            (abn, "51824753556", "51824753557"),    // the ATO's example ABN
+            (codice_fiscale, "RSSMRA85T10A562S", "RSSMRA85T10A562"),
+            (codice_ipa, "UFY9MH", "UFY9M-"),
+            (dutch_vat, "NL123456789B12", "NL123456789C12"),
+        ] {
+            assert!(check(good), "{good}");
+            assert!(!check(bad), "{bad}");
+        }
+        // `u:checkPIVAseIT` only checks Italian numbers.
+        assert!(partita_iva("DE123"));
+        // `u:checkCF`'s eleven-character form is "castable as xs:integer".
+        assert!(codice_fiscale("12345678901"));
+        assert!(!codice_fiscale("1234567890A"));
+        // `u:mod11` refuses an all-zero number whose check digit happens to fit.
+        assert!(!mod11("000000000"));
+        // Empty or multi-byte input is refused, not a panic.
+        assert!(!gln("") && !mod11(""));
+        assert!(!dutch_vat("NL1234567äB12") && !partita_iva("IT0074311015ä"));
+    }
+
+    /// Each `PEPPOL-COMMON-*` rule reaches every schemed party identifier, and
+    /// only those with its scheme.
+    #[test]
+    fn a_common_rule_reads_every_party_identifier_with_its_scheme() {
+        use crate::Identifier;
+        let bad = Identifier::schemed("124", "0088"); // "123" happens to be a valid GLN
+        let mut inv = Invoice::default();
+        inv.seller.identifiers = vec![Identifier::schemed("123", "0089"), bad.clone()];
+        inv.buyer.legal_registration = Some(bad.clone());
+        inv.payee = Some(crate::invoice::Payee {
+            identifier: Some(bad),
+            ..Default::default()
+        });
+        let mut out = Vec::new();
+        let mut sink = crate::validation::Findings::for_test(&mut out, &COMMON_R040);
+        (COMMON_R040.eval)(&inv, &mut sink);
+        let at: Vec<String> = out.iter().map(|f| f.path.to_string()).collect();
+        assert_eq!(at.len(), 3, "{at:?}");
+    }
+
     #[test]
     fn these_are_peppols_rules_not_cens() {
-        // R120 has no CEN counterpart at all: EN 16931 never ties BT-131 to
-        // quantity x price. Registering it in the core set would reject invoices
-        // the standard permits.
         for r in ALL {
             assert!(
                 r.id.as_str().starts_with("PEPPOL-"),
                 "{} is not namespaced",
                 r.id
             );
-            // Against `CORE` directly rather than through `explain`, which
-            // resolves profile rules too and would therefore find every id
-            // here. Assert the thing meant.
+            // `CORE` directly: `explain` resolves profile rules too.
             assert!(
                 !super::super::CORE.iter().any(|c| c.id == r.id),
                 "{} leaked into CORE",
@@ -412,17 +967,8 @@ mod tests {
 
 // ── The VATEX ⇒ category rules, P0104 … P0111 ─────────────────────────────────
 
-/// Peppol pins eight VATEX codes to the category they may appear under.
-///
-/// EN 16931 has nothing like this: `BR-CL-22` checks that BT-121 is *in* the
-/// VATEX list and stops. Peppol goes further, because the CEF list encodes the
-/// legal basis and the basis determines the category — `VATEX-EU-IC` is an
-/// intra-community supply, so the category can only be `K`. A document that
-/// says `K`-exempt-because-`VATEX-EU-AE` is internally contradictory in a way
-/// core EN 16931 cannot see.
-///
-/// Note `VATEX-EU-D`, `-F`, `-I` and `-J` all pin to `E`: four different Article
-/// bases for the same category.
+/// Peppol pins eight VATEX codes to the category they may appear under (e.g.
+/// `VATEX-EU-IC` only with `K`); core `BR-CL-22` checks list membership only.
 const VATEX_CATEGORY: &[(&str, &str, &str)] = &[
     ("PEPPOL-EN16931-P0104", "VATEX-EU-G", "G"),
     ("PEPPOL-EN16931-P0105", "VATEX-EU-O", "O"),
@@ -494,10 +1040,7 @@ rule!(R001, "PEPPOL-EN16931-R001", terms: [bt::BUSINESS_PROCESS],
 rule!(R003, "PEPPOL-EN16931-R003", terms: [bt::BUYER_REFERENCE, BtId(13)],
 "A buyer reference or purchase order reference MUST be provided.",
 |inv, f| {
-    // **A disjunction, not a mandatory term.** `cbc:BuyerReference or
-    // cac:OrderReference/cbc:ID` — eight of CEN's published Peppol test
-    // invoices carry only the order reference, and a flat "BT-10 is mandatory"
-    // restriction rejects every one of them.
+    // BT-10 or BT-13, not BT-10 alone.
     let buyer_ref = inv.buyer_reference.as_deref().is_some_and(|r| !r.trim().is_empty());
     let order_ref = inv
         .purchase_order_reference
@@ -509,17 +1052,16 @@ rule!(R003, "PEPPOL-EN16931-R003", terms: [bt::BUYER_REFERENCE, BtId(13)],
 });
 
 rule!(R004, "PEPPOL-EN16931-R004", terms: [bt::SPECIFICATION_ID],
-"Specification identifier MUST have the value \
- 'urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0'.",
+"Specification identifier MUST begin with the value \
+ 'urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0' and follow the \
+ format rules for the identifier.",
 |inv, f| {
-    // A **value** constraint, and a prefix one at that — the artefact uses
-    // `starts-with`, so a CIUS of Peppol may append its own suffix. Modelling
-    // this as "BT-24 is present" accepted any string whatsoever.
-    if inv
-        .specification_id
-        .as_deref()
-        .is_none_or(|s| !s.trim().starts_with(crate::profiles::PEPPOL_SPEC_ID))
-    {
+    // A prefix (`starts-with`), so a CIUS of Peppol may append a suffix; the
+    // suffix may not contain `::`.
+    if inv.specification_id.as_deref().is_none_or(|s| {
+        let s = s.trim();
+        !s.starts_with(crate::profiles::PEPPOL_SPEC_ID) || s.contains("::")
+    }) {
         f.at(Path::term(bt::SPECIFICATION_ID));
     }
 });
@@ -528,9 +1070,6 @@ rule!(R002, "PEPPOL-EN16931-R002", terms: [BtId(22)],
 "No more than one note is allowed on document level, unless both the buyer and seller are German \
  organizations.",
 |inv, f| {
-    // The German exemption is real and in Peppol's own test: XRechnung needs
-    // several document-level notes, so Peppol carves DE-DE out rather than
-    // forcing German invoices into a single blob.
     if inv.notes.len() > 1 && !both_german(inv) {
         f.at(Path::term(BtId(22)));
     }
@@ -543,16 +1082,14 @@ terms: [bt::VAT_ACCOUNTING_CURRENCY, bt::CURRENCY],
     if let (Some(tax), Some(doc)) = (&inv.vat_accounting_currency, &inv.currency)
         && tax == doc
     {
-        // BT-6 exists to report VAT in a *second* currency. Equal to BT-5 it
-        // says nothing and duplicates BT-110 into BT-111.
         f.at(Path::term(bt::VAT_ACCOUNTING_CURRENCY));
     }
 });
 
 rule!(R007, "PEPPOL-EN16931-R007", terms: [bt::BUSINESS_PROCESS],
-"Business process MUST be in the format 'urn:fdc:peppol.eu:2017:poacc:billing:NN:1.0' where NN \
- indicates the process number.",
+"Business process MUST have an approved identifier.",
 |inv, f| {
+    // An absent BT-23 is `R001`'s finding.
     if let Some(p) = inv.business_process.as_deref()
         && !p.is_empty()
         && peppol_process(p).is_none()
@@ -561,14 +1098,25 @@ rule!(R007, "PEPPOL-EN16931-R007", terms: [bt::BUSINESS_PROCESS],
     }
 });
 
-/// The `NN` of `urn:fdc:peppol.eu:2017:poacc:billing:NN:1.0`, if it parses.
-///
-/// Peppol derives `$profile` from BT-23 and `P0100` / `P0101` then branch on it,
-/// so this is shared rather than re-parsed per rule.
-fn peppol_process(business_process: &str) -> Option<&str> {
-    let rest = business_process.strip_prefix("urn:fdc:peppol.eu:2017:poacc:billing:")?;
-    let (nn, tail) = rest.split_once(':')?;
-    (tail == "1.0" && !nn.is_empty() && nn.bytes().all(|b| b.is_ascii_digit())).then_some(nn)
+/// The Peppol billing process BT-23 names — the Schematron's `$profile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Process {
+    /// `01`, billing.
+    Billing,
+    /// `02`, billing with response.
+    BillingWithResponse,
+}
+
+/// BT-23 → [`Process`], as Peppol 3.0.21 derives `$profile`: four listed
+/// identifiers, nothing else.
+fn peppol_process(business_process: &str) -> Option<Process> {
+    match business_process.trim() {
+        "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0"
+        | "urn:peppol:france:billing:regulated"
+        | "urn:peppol:france:billing:non-regulated" => Some(Process::Billing),
+        "urn:peppol:bis:billing_with_response" => Some(Process::BillingWithResponse),
+        _ => None,
+    }
 }
 
 rule!(R010, "PEPPOL-EN16931-R010", terms: [bt::BUYER_ELECTRONIC_ADDRESS],
@@ -668,8 +1216,7 @@ rule!(CL008, "PEPPOL-EN16931-CL008", terms: [bt::SELLER_ELECTRONIC_ADDRESS, bt::
 "Electronic address identifier scheme must be from the codelist \"Electronic Address Identifier \
  Scheme\".",
 |inv, f| {
-    // Strictly narrower than `BR-CL-25`: 94 of CEN's 104. Scheme `0219` passes
-    // the core rule and fails this one, which is exactly what a CIUS is for.
+    // Narrower than `BR-CL-25`.
     for (group, party) in [(Group::Seller, &inv.seller), (Group::Buyer, &inv.buyer)] {
         if party
             .electronic_address
@@ -777,26 +1324,22 @@ by_type!(
 
 // ── The document type codes, per business process ─────────────────────────────
 
-/// `P0100` — BT-3 on an **invoice**, under billing process `01`.
-///
-/// 26 of `BR-CL-01`'s 50, and **`389` is not among them**: self-billing is a
-/// separate Peppol profile with its own customization identifier.
+/// `P0100` — BT-3 on an invoice, under billing process `01` or `02`. Excludes
+/// `389` (self-billing is a separate Peppol profile).
 const P0100_CODES: &[&str] = &[
     "102", "218", "219", "326", "331", "380", "382", "383", "384", "386", "388", "393", "395",
     "553", "575", "623", "71", "780", "80", "817", "82", "84", "870", "875", "876", "877",
 ];
 
-/// `P0101` — BT-3 on a **credit note**, under billing process `01`.
+/// `P0101` — BT-3 on a credit note, under billing process `01` or `02`.
 const P0101_CODES: &[&str] = &["381", "396", "532", "81", "83"];
 
 rule!(P0100, "PEPPOL-EN16931-P0100", terms: [bt::TYPE_CODE],
 "Invoice type code MUST be set according to the profile.",
 |inv, f| {
-    if is_billing_01(inv)
+    if is_billing_process(inv)
         && let Some(code) = inv.type_code.as_ref()
-        // Which list applies is decided the way `BR-CL-01` decides it: by
-        // whether the code is a credit-note code. UBL splits this into two
-        // elements; a syntax-independent model has one term and one document.
+        // Invoice or credit-note list, by the code itself.
         && !is_credit_note(code)
         && !crate::codes::contains(P0100_CODES, code.as_str())
     {
@@ -807,7 +1350,7 @@ rule!(P0100, "PEPPOL-EN16931-P0100", terms: [bt::TYPE_CODE],
 rule!(P0101, "PEPPOL-EN16931-P0101", terms: [bt::TYPE_CODE],
 "Credit note type code MUST be set according to the profile.",
 |inv, f| {
-    if is_billing_01(inv)
+    if is_billing_process(inv)
         && let Some(code) = inv.type_code.as_ref()
         && is_credit_note(code)
         && !crate::codes::contains(P0101_CODES, code.as_str())
@@ -816,33 +1359,25 @@ rule!(P0101, "PEPPOL-EN16931-P0101", terms: [bt::TYPE_CODE],
     }
 });
 
-/// Whether BT-23 names Peppol billing process `01`, which is what `P0100` and
-/// `P0101` are conditional on. A document on another process is not constrained
-/// by either.
-fn is_billing_01(inv: &Invoice) -> bool {
+/// Whether BT-23 names a Peppol billing process — the condition of `P0100`
+/// and `P0101` (`$profile = ('01','02')`).
+fn is_billing_process(inv: &Invoice) -> bool {
     inv.business_process
         .as_deref()
         .and_then(peppol_process)
-        .is_some_and(|nn| nn.trim_start_matches('0') == "1")
+        .is_some()
 }
 
-/// Whether BT-3 is a credit-note code, per `BR-CL-01`'s own split.
-///
-/// `81` is in **both** CEN lists, and in Peppol's credit-note list only — so it
-/// is read as a credit note here, which is what `P0101` expects.
+/// Whether BT-3 is a credit-note code, per `BR-CL-01`'s split (`81`, in both
+/// CEN lists, counts as a credit note, as `P0101` expects).
 fn is_credit_note(code: &crate::invoice::Code) -> bool {
     code.is_in(lists::CREDIT_NOTE_TYPE_CODES)
 }
 
 // ── The three rules that mirror a CEN rule exactly ────────────────────────────
 
-/// Peppol code-list rules whose list the generator **asserts** is identical to a
-/// CEN table.
-///
-/// They are registered as rules of their own rather than folded into the CEN
-/// ones, because a Peppol validator reports Peppol ids: a user fixing a document
-/// against phive's output searches for `PEPPOL-EN16931-CL003`, and finding
-/// nothing is worse than seeing it beside `BR-CL-20`.
+/// Peppol code-list rules whose list the generator asserts is identical to a
+/// CEN table, registered under their own Peppol ids.
 macro_rules! mirror_rule {
     ($konst:ident, $id:literal, $mirrors:literal, $list:ident, $text:literal,
      |$inv:ident, $f:ident| $body:block) => {
@@ -936,46 +1471,13 @@ mirror_rule!(
 
 // ── What XRechnung actually merges ────────────────────────────────────────────
 
-/// The **21** Peppol rules XRechnung's released Schematron merges in.
+/// The 21 Peppol rules XRechnung's released Schematron merges in.
 ///
-/// XRechnung 3.0.2 does not ship the file KoSIT keeps in source control. Its
-/// build runs `peppol-into-xr.xsl` over `PEPPOL-EN16931-UBL.sch`, copying in
-/// every assert whose id appears in `rule-list.xml` — 21 of Peppol's 46 — and
-/// rewriting two of them on the way (see [`XR_R040`] and [`XR_R120`]).
-///
-/// # `rule-list.xml` is a whitelist with holes
-///
-/// Eleven entries are **commented out in the XML**, several with a reason:
-///
-/// ```xml
-/// <!--
-/// <r:rule>PEPPOL-EN16931-R002</r:rule>
-/// <r:rule>PEPPOL-EN16931-R003</r:rule>
-/// <r:rule>PEPPOL-EN16931-R004</r:rule>
-/// -->
-/// …
-/// <!-- R051 will be included when Issue is solved, see …/pull/140 -->
-/// ```
-///
-/// `R004` is the one that proves it: it requires BT-24 to start with Peppol's
-/// customization identifier, and XRechnung's BT-24 is KoSIT's own. Were it
-/// merged, **every XRechnung invoice would fail it**, including all of KoSIT's
-/// own test instances.
-///
-/// A regex over this file matches inside the comments and reports 32. That is
-/// how this list read 31 for a while, and it is the fourth time in this crate's
-/// history that pattern-matching structured text has produced a confident wrong
-/// answer. It is parsed as XML now, in `tests/codelists.rs`.
-///
-/// The **twenty-five it leaves out** include `CL001`…`CL008` (Peppol's own
-/// narrower code lists), `P0100`/`P0101` (type codes — XRechnung has `BR-DE-17`),
-/// `P0104`…`P0112`, and the reference rules `R002`/`R003`/`R004`.
-///
-/// This is the reverse of what a previous version of this crate concluded from
-/// KoSIT's validator configuration. The configuration names two Schematrons,
-/// CEN's and XRechnung's — and XRechnung's *already contains* Peppol's, because
-/// the merge happens at build time. Reading the shipped configuration was right;
-/// reading the source Schematron and stopping there was not.
+/// KoSIT's build runs `peppol-into-xr.xsl` over Peppol's Schematron, copying
+/// every assert listed (not commented out) in `rule-list.xml` and rewriting
+/// two (see [`XR_R040`] and [`XR_R120`]). Left out are, among others,
+/// `CL001`…`CL008`, `P0100`/`P0101`, `P0104`…`P0112` and `R002`/`R003`/`R004`
+/// (`R004` would reject every XRechnung BT-24).
 pub const MERGED_INTO_XRECHNUNG: &[&str] = &[
     "PEPPOL-EN16931-R001",
     "PEPPOL-EN16931-R005",
@@ -1010,19 +1512,8 @@ pub static XR_R040: Rule = Rule {
     eval: |inv, f| check_allowance_basis(inv, f, currency_slack),
 };
 
-/// `R120` as XRechnung merges it: **a warning**, and with the HUF slack.
-///
-/// `peppol-into-xr.xsl` rewrites the flag outright:
-///
-/// ```xslt
-/// <xsl:when test="@id='PEPPOL-EN16931-R120'">
-///   <xsl:attribute name="flag">warning</xsl:attribute>
-/// ```
-///
-/// So a line whose net amount does not follow from its price **rejects** a
-/// Peppol invoice and merely annotates an XRechnung one. Same id, same text,
-/// different consequence — which is exactly why severity belongs to the rule
-/// instance a profile holds and not to a global registry.
+/// `R120` as XRechnung merges it: a warning (`peppol-into-xr.xsl` rewrites
+/// the flag), with the HUF slack.
 pub static XR_R120: Rule = Rule {
     id: RuleId::new("PEPPOL-EN16931-R120"),
     severity: Severity::Warning,
@@ -1032,12 +1523,8 @@ pub static XR_R120: Rule = Rule {
     eval: |inv, f| check_line_amount(inv, f, currency_slack),
 };
 
-/// The 31 merged rules, as XRechnung runs them.
-///
-/// [`XR_R040`] and [`XR_R120`] are XRechnung's rewritten instances; the other 29
-/// are Peppol's own, unchanged. Listed explicitly rather than filtered, so it is
-/// a `const` — and `the_merged_set_matches_the_rule_list` asserts it agrees with
-/// [`MERGED_INTO_XRECHNUNG`], which is transcribed from KoSIT's `rule-list.xml`.
+/// The 21 merged rules, as XRechnung runs them: [`XR_R040`], [`XR_R120`] and
+/// 19 of Peppol's own. Must agree with [`MERGED_INTO_XRECHNUNG`].
 pub static FOR_XRECHNUNG: &[&Rule] = &[
     &R001, &R005, &R008, &R010, &R020, &XR_R040, &R041, &R042, &R043, &R044, //
     &R046, &R053, &R054, &R055, &R061, &R101, &R110, &R111, &XR_R120, &R121, &R130,
@@ -1047,11 +1534,7 @@ pub static FOR_XRECHNUNG: &[&Rule] = &[
 mod merge_tests {
     use super::*;
 
-    /// [`FOR_XRECHNUNG`] and [`MERGED_INTO_XRECHNUNG`] must name the same rules.
-    ///
-    /// One is a list of `&Rule`s, the other a list of ids transcribed from
-    /// KoSIT's `rule-list.xml`. Keeping them in step by hand is exactly the sort
-    /// of thing that silently rots.
+    /// [`FOR_XRECHNUNG`] and [`MERGED_INTO_XRECHNUNG`] name the same rules.
     #[test]
     fn the_merged_set_matches_the_rule_list() {
         let mut got: Vec<&str> = FOR_XRECHNUNG.iter().map(|r| r.id.as_str()).collect();
@@ -1070,7 +1553,6 @@ mod merge_tests {
         assert_eq!(XR_R120.text, R120.text, "only the flag changes");
         assert_eq!(XR_R040.severity, R040.severity, "R040 keeps its flag");
 
-        // HUF is the whole reason the second instance exists.
         let huf = Invoice {
             currency: Some(crate::invoice::Code::new("HUF")),
             ..Default::default()

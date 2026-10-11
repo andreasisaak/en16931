@@ -1,189 +1,289 @@
-//! Fetching the reference specifications and validation artefacts into `spec/`.
+//! Fetching the reference specifications and validation artefacts into the reference corpus.
 //!
-//! # Why `spec/` is not committed
+//! The corpus is not committed: the CEN artefacts are EUPL-1.2 (a reciprocal
+//! licence) and the vendor specifications carry their own terms, so keeping them
+//! out of the repository keeps the workspace `MIT OR Apache-2.0`.
 //!
-//! The CEN validation artefacts are **EUPL-1.2**, a reciprocal licence, and the
-//! vendor specifications carry their own terms. Keeping them out of the
-//! repository is what keeps this crate's `MIT OR Apache-2.0` licensing clean —
-//! and it is why `deny.toml`'s allow-list does not mention EUPL. Everything
-//! fetched here is publicly downloadable, including the normative text of
-//! EN 16931-1 itself.
+//! Only what the generators and test suites of both crates read is fetched: the
+//! code-list and preprocessed Schematron (the only form with every rule context
+//! resolved), every published UBL and CII instance (the element-order tables are
+//! derived from them), and the OASIS UBL 2.1 `xsd/` tree for the schema gate.
 //!
-//! # What is fetched, and what is not
-//!
-//! Only what the generators and the test suites actually read — for **both**
-//! crates, which is the point of fetching once. `en16931` needs the code-list
-//! Schematron; `en16931-formats` needs the *preprocessed* Schematron, the only
-//! form in which a rule's context is fully resolved rather than a `$Variable`,
-//! and every published UBL and CII instance, because its element-order tables
-//! are derived from 319 and 167 documents respectively. A table derived from
-//! three examples is a guess with a large sample size written on it.
-//!
-//! Earlier versions of this also pulled `phive-rules` — 3.6 GB in full,
-//! sparse-checked out to three modules — and three specification PDFs. Nothing
-//! consumed any of them: they were research material, and a fetch that
-//! downloads what nobody reads is a fetch people learn to skip.
-//!
-//! The normative text of EN 16931-1 is free of charge with derivative use
-//! permitted under the 2018 CEN–European Commission agreement, and
-//! `spec/README.md` says where to get it — but obtaining it is a reading task,
-//! not a build step.
-//!
-//! # Why this shells out to git
-//!
-//! `git` is the right tool for cloning a repository, and it is already present
-//! on any machine that can build this crate. The alternative is `git2` plus a
-//! TLS stack — upwards of a hundred crates and an OpenSSL decision — to do what
-//! one command already does correctly, paid for by every contributor running
-//! `cargo xtask`.
-//!
-//! A missing `git` is reported by name and purpose rather than as an OS error.
+//! `git`, `curl` and `unzip` are invoked as external tools; a missing one is
+//! reported by name and purpose. The archive digest is checked in Rust.
 //!
 //! # Pinning
 //!
-//! **Every source is pinned to a release tag.** Regenerating a table is then a
-//! reviewable diff rather than a moving target, and two contributors cloning
-//! six months apart get the same corpus and the same verdicts.
+//! Every source is pinned to its authority's release: the tag where one exists,
+//! otherwise the commit (see [`Ref::Commit`], which states why and until when),
+//! or for a download the archive's SHA-256 (see [`Archive`]). A branch is never a
+//! pin: it is the authority's next release and would silently change the
+//! severities this crate claims to implement. The fetch fails unless the
+//! checkout's `HEAD` or the archive's digest matches the pin.
 //!
-//! Three of the four used to track `master`, and that was wrong for a reason
-//! sharper than reproducibility. An authority's `master` is its *next* release:
-//! at the time this was fixed, KoSIT's `validator-configuration` branch carried
-//! two `customLevel` overrides — `CII-SR-465` and `CII-SR-466` — that appear in
-//! no published release. This crate's central claim is that it reports rules at
-//! **the severities the authorities publish**, and it was reading severities
-//! nobody had published yet. A moving pin does not merely make the build
-//! irreproducible; it silently changes what the crate is claiming to implement.
-//!
-//! KoSIT states the correspondence in its own changelog — schematron `v2.5.0`
-//! says *"compatible with XRechnung 3.0.x"*, which is the CIUS this crate ships
-//! — so the pins name a version, not just a commit. Bump one deliberately, and
-//! read the changelog first: a KoSIT release that moves to XRechnung 4.0 is a
-//! new profile here, not a newer pin on the old one.
-//!
-//! For [`CEN_REF`] there is a second constraint: `en16931::ARTEFACT_VERSION`
-//! and the revision stamped into every generated table must agree with it, and
-//! `crates/en16931/tests/artefact_pin.rs` checks all three.
-//!
-//! **One pin, for both crates.** Split across two repositories this was two
-//! constants and a comment asking that they be kept equal; a workspace makes it
-//! one, so "the two crates derived their tables from different artefact
-//! revisions" is no longer a state that can be reached.
+//! The KoSIT pins name the XRechnung version their changelog states (`v2.6.0`:
+//! XRechnung 3.0); a KoSIT release for XRechnung 4.0 is a new profile, not a
+//! newer pin. [`CEN_REF`] must equal `en16931::ARTEFACT_VERSION` and the
+//! revision stamped into every generated table; `crates/en16931/tests/artefact_pin.rs`
+//! checks all three.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::root;
-
-/// The pinned CEN artefact **tag**.
-///
-/// Must equal `en16931::ARTEFACT_VERSION`, and the `ARTEFACT` constant the code
-/// generator stamps into every table's provenance line.
-/// `crates/en16931/tests/artefact_pin.rs` asserts all three.
+/// The pinned CEN artefact tag. Must equal `en16931::ARTEFACT_VERSION` and the
+/// code generator's `ARTEFACT` stamp (asserted by `artefact_pin.rs`).
 pub const CEN_REF: &str = "validation-1.3.16";
 
-/// OpenPeppol's release, and the source of `PEPPOL-EN16931-*`.
-pub const PEPPOL_REF: &str = "v3.0.20";
+/// OpenPeppol BIS Billing 3.0.21 (`PEPPOL-EN16931-*`, `PEPPOL-COMMON-*`, national
+/// rule sets), pinned by commit because 3.0.21 is untagged. Its
+/// `PEPPOL-EN16931-UBL.sch` is byte-identical to the one docs.peppol.eu publishes.
+pub const PEPPOL_REF: &str = "806866bd2bd91d7e9623b68f08164e8fbe9e67a0";
 
-/// KoSIT's Schematron release. Its own changelog states which XRechnung version
-/// each release is compatible with; `v2.5.0` says **XRechnung 3.0.x**, which is
-/// the CIUS this crate ships.
-pub const KOSIT_SCHEMATRON_REF: &str = "v2.5.0";
+/// The Peppol release [`PEPPOL_REF`] is.
+pub const PEPPOL_RELEASE: &str = "3.0.21";
 
-/// KoSIT's validator configuration release — `scenarios.xml`, and therefore the
-/// published severity overrides, plus the mutation corpus.
-pub const KOSIT_CONFIG_REF: &str = "v2026-01-31";
+/// KoSIT's XRechnung Schematron release (`v2.6.0`: XRechnung 3.0).
+pub const KOSIT_SCHEMATRON_REF: &str = "v2.6.0";
 
-/// Which kind of ref a source is pinned to.
+/// KoSIT's validator configuration release: `scenarios.xml` (severity overrides)
+/// and the mutation corpus.
+pub const KOSIT_CONFIG_REF: &str = "v2026-08-31";
+
+/// The ZUGFeRD community corpus (Apache-2.0), pinned by commit: it has no tags.
+pub const ZUGFERD_CORPUS_REF: &str = "d891458e9822e34271a5438497bf924e89955979";
+
+/// veraPDF's REST image, the PDF/A-3b gate: the tag and digest the gate test and
+/// CI's pull name (asserted by a test).
+pub const VERAPDF_TAG: &str = "v1.30.2";
+/// The digest of [`VERAPDF_TAG`].
+pub const VERAPDF_DIGEST: &str =
+    "sha256:341359ac6af558f35f03c355a798fec57ba049dd04f0a503f300170e1696573b";
+
+/// SHA-256 of the OASIS UBL 2.1 distribution archive (the schemas written UBL is
+/// validated against). Only its `xsd/` tree is kept.
+pub const UBL_SHA256: &str = "60b80d76394a8a2add90723ecb8e0e2e9d826775de9749df37a72d60703f86ed";
+
+/// The sources whose published instances the element-order tables are derived
+/// from. Must equal the corpus suites' `AUTHORITY_SOURCES` (asserted by a test).
+pub const ORDER_SOURCES: &[&str] = &[
+    "eInvoicing-EN16931",
+    "peppol-bis-invoice-3",
+    "xrechnung-schematron",
+    "validator-configuration-xrechnung",
+];
+
+/// Which kind of ref a source is pinned to (never a branch).
 ///
-/// This distinction is not pedantry. `eInvoicing-EN16931` publishes
-/// `validation-1.3.16` as **both a tag and a branch, pointing at different
-/// commits** — `refs/tags/…` is the release, `refs/heads/…` is the working
-/// branch that produced it. `git clone --branch` prefers the branch, so two
-/// clones of the same "pinned" ref land on different trees and the generated
-/// tables differ for no reason anyone can see in a diff.
-///
-/// Naming the ref kind makes the pin unambiguous, and fetching the
-/// fully-qualified ref makes git agree.
-enum Ref {
-    /// A release tag. The right pin for anything that must not move — which,
-    /// here, is everything.
+/// `eInvoicing-EN16931` has a tag and a branch both named `validation-1.3.16` at
+/// different commits, so tags are fetched fully qualified (`refs/tags/...`).
+#[derive(Debug)]
+pub enum Ref {
+    /// A release tag.
     Tag(&'static str),
-    /// A moving branch. Kept for a source that ever stops publishing releases;
-    /// nothing uses it today, and adding a use is a decision worth arguing for
-    /// rather than a default worth drifting into.
-    #[expect(dead_code, reason = "every source is tagged; see the module header")]
-    Branch(&'static str),
+    /// A full commit SHA, for a release published without a tag.
+    Commit {
+        /// The 40-hex commit; the checkout's `HEAD` must equal it.
+        sha: &'static str,
+        /// The release this commit is, if the source numbers its releases.
+        release: Option<&'static str>,
+        /// Why this is not a tag pin.
+        reason: &'static str,
+        /// What ends the commit pin.
+        until: &'static str,
+    },
 }
 
 impl Ref {
-    /// The fully-qualified ref, so git cannot resolve it to the other kind.
-    fn qualified(&self) -> String {
+    /// What to ask the remote for: the fully-qualified tag, or the commit.
+    fn wanted(&self) -> String {
         match self {
             Self::Tag(t) => format!("refs/tags/{t}"),
-            Self::Branch(b) => format!("refs/heads/{b}"),
+            Self::Commit { sha, .. } => (*sha).to_owned(),
         }
     }
 
     fn describe(&self) -> String {
         match self {
             Self::Tag(t) => format!("tag {t}"),
-            Self::Branch(b) => format!("branch {b}"),
+            Self::Commit {
+                sha, reason, until, ..
+            } => {
+                format!("commit {sha}\n    pinned by commit: {reason}; {until}")
+            }
         }
     }
 }
 
-/// A git repository to clone or update.
-struct Repo {
-    /// Directory name under `spec/`.
-    name: &'static str,
-    url: &'static str,
-    /// The pinned ref, tag or branch — see [`Ref`].
-    reference: Ref,
-    /// Why this is here, printed so a contributor can see what they are pulling.
-    purpose: &'static str,
+/// Where a source publishes a release without a tag (read by `cargo xtask watch`).
+#[derive(Debug)]
+pub enum Channel {
+    /// Only tags.
+    None,
+    /// A branch named like a release tag announces that release until it is tagged.
+    Branches,
+    /// The release-notes page publishes a release; `<YYYY>-Q<n>-QA<m>` branches stage one.
+    PeppolQa {
+        /// The release-notes page; each release is a heading anchored `version_<N>_<N>_<N>`.
+        release_notes: &'static str,
+    },
+    /// No tags at all: the head of this branch is the latest release.
+    Head(&'static str),
 }
 
-static REPOS: &[Repo] = &[
+/// A git repository to clone or update.
+pub struct Repo {
+    /// Directory name under the reference corpus.
+    pub name: &'static str,
+    pub url: &'static str,
+    /// The pinned ref, tag or commit — see [`Ref`].
+    pub reference: Ref,
+    /// The prefixes of release tags: a release tag is one of these followed by
+    /// digits separated by `.` or `-`, and nothing else.
+    pub releases: &'static [&'static str],
+    /// Where an untagged release appears.
+    pub channel: Channel,
+    /// Why this is fetched, printed during the fetch.
+    pub purpose: &'static str,
+}
+
+pub static REPOS: &[Repo] = &[
     Repo {
         name: "eInvoicing-EN16931",
         url: "https://github.com/ConnectingEurope/eInvoicing-EN16931.git",
         reference: Ref::Tag(CEN_REF),
+        releases: &["validation-"],
+        channel: Channel::Branches,
         purpose: "CEN/TC 434 — the abstract model, code lists and per-rule test corpus, \
-                  the preprocessed Schematron behind the prohibition tables, and 486 \
+                  the preprocessed Schematron behind the prohibition tables, and 500 \
                   published UBL and CII instances behind the element-order tables.",
     },
     Repo {
         name: "peppol-bis-invoice-3",
         url: "https://github.com/OpenPEPPOL/peppol-bis-invoice-3.git",
-        reference: Ref::Tag(PEPPOL_REF),
-        purpose: "Peppol BIS Billing 3.0 — PEPPOL-EN16931-*, the national rule sets, and \
-                  the widest real-world sample of UBL in the corpus suite.",
+        reference: Ref::Commit {
+            sha: PEPPOL_REF,
+            release: Some(PEPPOL_RELEASE),
+            reason: "BIS Billing 3.0.21 was published on docs.peppol.eu and made \
+                     mandatory on 2026-08-17 without a tag",
+            until: "until OpenPeppol tags v3.0.21 or a later release",
+        },
+        releases: &["", "v"],
+        channel: Channel::PeppolQa {
+            release_notes: "https://docs.peppol.eu/poacc/billing/3.0/release-notes/",
+        },
+        purpose: "Peppol BIS Billing 3.0.21 — PEPPOL-EN16931-*, PEPPOL-COMMON-*, the \
+                  national rule sets, and the widest real-world sample of UBL in the \
+                  corpus suite.",
     },
     Repo {
         name: "xrechnung-schematron",
         url: "https://github.com/itplr-kosit/xrechnung-schematron.git",
         reference: Ref::Tag(KOSIT_SCHEMATRON_REF),
+        releases: &["v"],
+        channel: Channel::None,
         purpose: "KoSIT — the XRechnung Schematron, BR-DE-*.",
     },
     Repo {
         name: "validator-configuration-xrechnung",
         url: "https://github.com/itplr-kosit/validator-configuration-xrechnung.git",
         reference: Ref::Tag(KOSIT_CONFIG_REF),
+        releases: &["v"],
+        channel: Channel::None,
         purpose: "KoSIT — validator scenarios and the mutation test instances.",
+    },
+    Repo {
+        name: "zugferd-corpus",
+        url: "https://github.com/ZUGFeRD/corpus.git",
+        reference: Ref::Commit {
+            sha: ZUGFERD_CORPUS_REF,
+            release: None,
+            reason: "the corpus repository publishes no tags",
+            until: "until it tags a release",
+        },
+        releases: &[],
+        channel: Channel::Head("master"),
+        purpose: "The ZUGFeRD community corpus (Apache-2.0) — real ZUGFeRD / Factur-X \
+                  PDFs from real producers, pinned for the extraction sweep the \
+                  assurance work will assert.",
     },
 ];
 
-/// Is this command available?
+/// Repositories not fetched, but watched by `cargo xtask watch`, at the release
+/// the workspace targets.
+pub static WATCHED: &[Repo] = &[Repo {
+    name: "France_RFE",
+    url: "https://github.com/fnfempe/France_RFE.git",
+    reference: Ref::Tag("v1.4.0.04"),
+    releases: &["v", "FNFE_RFE_INVOICE_"],
+    channel: Channel::None,
+    purpose: "FNFE-MPE — the French rules (XP Z12-012) the French profile targets.",
+}];
+
+/// A Docker Hub image the suites or CI run, watched by `cargo xtask watch`.
+pub struct Image {
+    /// `<namespace>/<repository>`.
+    pub name: &'static str,
+    /// The tag in use; release tags are `v` and a dotted version.
+    pub tag: &'static str,
+    /// The tag's pinned digest, where the image is pinned by digest.
+    pub digest: Option<&'static str>,
+    /// Why this is watched.
+    pub purpose: &'static str,
+}
+
+pub static IMAGES: &[Image] = &[
+    Image {
+        name: "verapdf/rest",
+        tag: VERAPDF_TAG,
+        digest: Some(VERAPDF_DIGEST),
+        purpose: "veraPDF's REST service — the PDF/A-3b gate.",
+    },
+    Image {
+        name: "verapdf/cli",
+        tag: VERAPDF_TAG,
+        digest: None,
+        purpose: "veraPDF's command line, released with the REST service: a newer one \
+                  is the veraPDF release the gate moves to.",
+    },
+];
+
+/// A release archive to download, pinned by its SHA-256.
+pub struct Archive {
+    /// Directory name under the reference corpus.
+    pub name: &'static str,
+    pub url: &'static str,
+    /// The archive's SHA-256, lowercase hex. The fetch fails on any other.
+    pub sha256: &'static str,
+    /// Why the pin is a digest rather than a git ref.
+    reason: &'static str,
+    /// The archive members kept, as an `unzip` pattern.
+    keep: &'static str,
+    /// Why this is here.
+    pub purpose: &'static str,
+}
+
+pub static ARCHIVES: &[Archive] = &[Archive {
+    name: "oasis-ubl-2.1",
+    url: "https://docs.oasis-open.org/ubl/os-UBL-2.1/UBL-2.1.zip",
+    sha256: UBL_SHA256,
+    reason: "OASIS publishes UBL 2.1 as a downloadable OASIS Standard, not from a \
+             tagged repository",
+    keep: "xsd/*",
+    purpose: "OASIS UBL 2.1 — the Invoice and CreditNote schemas every UBL document \
+              the suites write is validated against.",
+}];
+
+/// Is this command available? `unzip` has no `--version`; `-v` is its own.
 fn available(tool: &str) -> bool {
     Command::new(tool)
-        .arg("--version")
+        .arg(if tool == "unzip" { "-v" } else { "--version" })
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
 }
 
-fn run(cmd: &mut Command) -> Result<String, String> {
+pub fn run(cmd: &mut Command) -> Result<String, String> {
     let out = cmd
         .output()
         .map_err(|e| format!("{:?}: {e}", cmd.get_program()))?;
@@ -226,33 +326,98 @@ fn fetch_repo(spec: &Path, repo: &Repo) -> Result<(), String> {
     );
     println!("    {}", repo.purpose);
 
-    // Init-and-fetch rather than clone, uniformly for a fresh and an existing
-    // checkout. `git clone --branch` takes a short name and resolves it to
-    // whichever ref kind it finds first; fetching the fully-qualified ref
-    // cannot pick the wrong one.
+    // Init-and-fetch the fully-qualified ref; `git clone --branch` could resolve
+    // a short name to a same-named branch.
     if !dir.join(".git").is_dir() {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         git(&dir, &["init", "--quiet"])?;
         git(&dir, &["remote", "add", "origin", repo.url])?;
     }
-    let qualified = repo.reference.qualified();
+    let wanted = repo.reference.wanted();
     git(
         &dir,
-        &["fetch", "--depth", "1", "--quiet", "origin", &qualified],
-    )?;
+        &["fetch", "--depth", "1", "--quiet", "origin", &wanted],
+    )
+    .map_err(|e| format!("{} @ {}: {e}", repo.name, repo.reference.describe()))?;
     git(&dir, &["checkout", "--quiet", "--force", "FETCH_HEAD"])?;
+    if let Ref::Commit { sha, .. } = repo.reference {
+        let head = git(&dir, &["rev-parse", "HEAD"])?;
+        if head != sha {
+            return Err(format!(
+                "{}: HEAD is {head}, but the pin is commit {sha}",
+                repo.name
+            ));
+        }
+    }
     println!("    {}", describe(&dir));
     Ok(())
 }
 
-/// Fetch everything into `spec/`.
+/// The SHA-256 of `bytes`, lowercase hex.
+pub fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn fetch_archive(spec: &Path, archive: &Archive) -> Result<(), String> {
+    let dir = spec.join(archive.name);
+    println!(
+        "\n==> {} @ sha256 {}\n    pinned by digest: {}",
+        archive.name, archive.sha256, archive.reason
+    );
+    println!("    {}", archive.purpose);
+
+    // Written last: present and equal means this archive was unpacked in full.
+    let stamp = dir.join(".sha256");
+    if std::fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == archive.sha256) {
+        println!("    already at the pinned digest");
+        return Ok(());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let zip = dir.join("archive.zip");
+    run(Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--output",
+        ])
+        .arg(&zip)
+        .arg(archive.url))
+    .map_err(|e| format!("{}: {e}", archive.url))?;
+    let bytes = std::fs::read(&zip).map_err(|e| format!("{}: {e}", zip.display()))?;
+    let got = sha256(&bytes);
+    if got != archive.sha256 {
+        return Err(format!(
+            "{}: the archive's SHA-256 is {got}, but the pin is {}",
+            archive.name, archive.sha256
+        ));
+    }
+    run(Command::new("unzip")
+        .args(["-q", "-o"])
+        .arg(&zip)
+        .arg(archive.keep)
+        .arg("-d")
+        .arg(&dir))?;
+    std::fs::remove_file(&zip).map_err(|e| format!("{}: {e}", zip.display()))?;
+    std::fs::write(&stamp, archive.sha256).map_err(|e| format!("{}: {e}", stamp.display()))?;
+    println!("    unpacked {}", archive.keep);
+    Ok(())
+}
+
+/// Fetch everything into the reference corpus.
 ///
 /// # Errors
 ///
-/// Fails if `git` is missing, or if any source cannot be retrieved. Partial
-/// success is treated as failure: a half-fetched `spec/` produces a code list
-/// quietly missing values, which is worse than no code list at all.
+/// Fails if `git`, `curl` or `unzip` is missing, or if any source cannot be
+/// retrieved. Partial success is failure: a half-fetched corpus yields code lists
+/// silently missing values.
 pub fn run_fetch() -> Result<(), String> {
     if !available("git") {
         return Err(
@@ -262,23 +427,33 @@ pub fn run_fetch() -> Result<(), String> {
         );
     }
 
-    let spec = root().join("spec");
+    let spec = PathBuf::from(env!("EN16931_REFERENCE"));
     std::fs::create_dir_all(&spec).map_err(|e| format!("{}: {e}", spec.display()))?;
 
     for repo in REPOS {
         fetch_repo(&spec, repo)?;
     }
-    std::fs::write(spec.join("README.md"), orientation())
-        .map_err(|e| format!("spec/README.md: {e}"))?;
+    for tool in ["curl", "unzip"] {
+        if !available(tool) {
+            return Err(format!(
+                "`{tool}` is not on PATH, and is needed to fetch the OASIS UBL 2.1 schemas"
+            ));
+        }
+    }
+    for archive in ARCHIVES {
+        fetch_archive(&spec, archive)?;
+    }
+    let readme = spec.join("README.md");
+    std::fs::write(&readme, orientation()).map_err(|e| format!("{}: {e}", readme.display()))?;
 
-    println!("\ndone — see spec/README.md for what is where");
+    println!("\ndone — see {} for what is where", readme.display());
     Ok(())
 }
 
-/// The orientation file written into `spec/`.
+/// The orientation file written into the reference corpus.
 fn orientation() -> String {
     format!(
-        r"# spec/ — reference material
+        r"# The reference corpus
 
 **Nothing here is committed.** Regenerate with `cargo xtask fetch`.
 
@@ -289,9 +464,11 @@ keeps this crate's `MIT OR Apache-2.0` licensing clean.
 | Path | What | Licence |
 |---|---|---|
 | `eInvoicing-EN16931/` | CEN/TC 434 validation artefacts, pinned at `{CEN_REF}` — abstract model, code lists, per-rule test corpus | EUPL-1.2 |
-| `peppol-bis-invoice-3/` | Peppol BIS Billing 3.0 — `PEPPOL-EN16931-*` + national rule sets | see repo |
-| `xrechnung-schematron/` | KoSIT XRechnung Schematron — `BR-DE-*` | see repo |
-| `validator-configuration-xrechnung/` | KoSIT validator scenarios and mutation instances | see repo |
+| `peppol-bis-invoice-3/` | Peppol BIS Billing {PEPPOL_RELEASE}, commit `{PEPPOL_REF}` — `PEPPOL-EN16931-*`, `PEPPOL-COMMON-*` + national rule sets | see repo |
+| `xrechnung-schematron/` | KoSIT XRechnung Schematron `{KOSIT_SCHEMATRON_REF}` — `BR-DE-*` | see repo |
+| `validator-configuration-xrechnung/` | KoSIT validator scenarios and mutation instances, `{KOSIT_CONFIG_REF}` | see repo |
+| `zugferd-corpus/` | The ZUGFeRD community corpus, commit `{ZUGFERD_CORPUS_REF}` | Apache-2.0 |
+| `oasis-ubl-2.1/` | OASIS UBL 2.1 schemas (`xsd/`), archive SHA-256 `{UBL_SHA256}` | OASIS |
 
 Only what the generator and the suites read is fetched. The specification PDFs
 and `phive-rules` are not: nothing consumes them, and downloading gigabytes
@@ -332,4 +509,72 @@ Parts 3-x (syntax bindings), 4, 5 and 6 must be purchased. They are
 Anything obtained manually goes in `manual/`; the fetch never touches it.
 "
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{REPOS, Ref};
+
+    /// A digest pin is a full lowercase SHA-256 with a reason.
+    #[test]
+    fn every_archive_pin_is_a_full_digest_with_a_reason() {
+        for archive in super::ARCHIVES {
+            assert!(
+                archive.sha256.len() == 64
+                    && archive
+                        .sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{}: `{}` is not a lowercase SHA-256",
+                archive.name,
+                archive.sha256
+            );
+            assert!(!archive.reason.trim().is_empty(), "{}", archive.name);
+            assert!(archive.url.starts_with("https://"), "{}", archive.name);
+        }
+        assert_eq!(
+            super::sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// The veraPDF image the watch reads is the one the PDF/A gate runs and CI pulls.
+    #[test]
+    fn the_watched_verapdf_reference_is_the_one_in_use() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let read = |rel: &str| std::fs::read_to_string(root.join(rel)).expect(rel);
+        let rest = &super::IMAGES[0];
+        let reference = format!("{}@{}", rest.tag, rest.digest.expect("pinned by digest"));
+        assert!(read(".github/workflows/ci.yml").contains(&format!("{}:{reference}", rest.name)));
+        let gate = read("crates/en16931-formats/tests/zugferd_embed.rs");
+        assert!(gate.contains(&format!("\"{}\"", rest.name)));
+        assert!(gate.contains(&format!("\"{reference}\"")));
+    }
+
+    /// A commit pin is a full SHA with a reason and an end condition.
+    #[test]
+    fn every_commit_pin_states_why_and_until_when() {
+        for repo in REPOS {
+            if let Ref::Commit {
+                sha, reason, until, ..
+            } = repo.reference
+            {
+                assert!(
+                    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{}: `{sha}` is not a full commit SHA",
+                    repo.name
+                );
+                assert!(
+                    !reason.trim().is_empty(),
+                    "{}: a commit pin must say why there is no tag",
+                    repo.name
+                );
+                assert!(
+                    until.trim_start().starts_with("until "),
+                    "{}: a commit pin must say what ends it",
+                    repo.name
+                );
+            }
+        }
+    }
 }

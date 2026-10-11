@@ -1,0 +1,60 @@
+# Fuzz targets (cargo-fuzz, nightly). `just fuzz-build`; `just fuzz read 600`.
+#
+# Its own unpublished workspace: the root workspace excludes it, so stable
+# `cargo build` / `cargo test` never see it. The CI job `fuzz` builds every
+# target and runs each for 60 s from `seeds/`.
+#
+# `seeds/` is hand-made: every file in it is this repository's own output (the
+# `en16931::examples` invoices written as UBL and CII, a blank PDF/A-3b and the
+# hybrid PDF `embed` makes of it, short generator streams). Third-party corpora
+# are read as extra seeds at fuzz time by `just fuzz` and never committed.
+[package]
+name    = "en16931-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+en16931         = { path = "../crates/en16931", features = ["serde"] }
+en16931-formats = { path = "../crates/en16931-formats", features = ["ubl", "cii", "zugferd"] }
+libfuzzer-sys   = "0.4"
+# `roundtrip` drives the suites' proptest generators with the fuzz input as
+# their random stream.
+proptest        = "1.11"
+rust_decimal    = { version = "1.43", default-features = false, features = ["std"] }
+serde_json      = "1"
+
+# Keep this package out of any workspace above it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name  = "read"
+path  = "fuzz_targets/read.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "extract"
+path  = "fuzz_targets/extract.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "roundtrip"
+path  = "fuzz_targets/roundtrip.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "embed"
+path  = "fuzz_targets/embed.rs"
+test  = false
+doc   = false
+bench = false

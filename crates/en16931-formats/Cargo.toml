@@ -1,11 +1,11 @@
 [package]
 name        = "en16931-formats"
 description = """\
-European e-invoicing formats on top of the EN 16931 semantic model: UBL 2.1 \
-and UN/CEFACT CII in both directions, the XRechnung CIUS, and ZUGFeRD / \
-Factur-X hybrid PDFs. Every business rule is delegated to `en16931`.\
+UBL 2.1, UN/CEFACT CII and ZUGFeRD / Factur-X for the EN 16931 e-invoice: \
+read, receive, write and convert documents in both syntaxes, and extract or \
+embed the invoice in a PDF/A-3 hybrid. The business rules come from en16931.\
 """
-keywords   = ["einvoice", "xrechnung", "zugferd", "en16931", "ubl"]
+keywords   = ["einvoice", "en16931", "ubl", "zugferd", "xrechnung"]
 categories = ["finance", "encoding", "parser-implementations"]
 readme     = "README.md"
 
@@ -21,35 +21,30 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-# UBL 2.1, both directions. On by default: it is the syntax XRechnung is
-# overwhelmingly sent in.
+# UBL 2.1, both directions.
 default = ["ubl"]
 ubl = ["dep:roxmltree"]
-# UN/CEFACT CII D16B, both directions. One binding serves two consumers —
-# XRechnung is carried in CII as well as UBL, and every ZUGFeRD payload is CII.
+# UN/CEFACT CII D16B, both directions.
 cii = ["dep:roxmltree"]
-# ZUGFeRD / Factur-X, **reading only** — there is no writer; see `zugferd`'s
-# module docs. Off by default: `lopdf` takes the graph from 13 crates to 57 and
-# does not build for `wasm32-unknown-unknown`.
-zugferd = ["dep:lopdf", "cii"]
+# ZUGFeRD / Factur-X: `extract` and `embed`. Off by default: it takes the graph
+# from 13 crates to 57 and does not build for `wasm32-unknown-unknown`.
+zugferd = ["dep:lopdf", "dep:flate2", "cii"]
 # `serde` on this crate's own public types.
 serde = ["dep:serde", "en16931/serde"]
 
 [dependencies]
 en16931.workspace   = true
 thiserror.workspace = true
-# Pinned to `en16931`'s version in `[workspace.dependencies]`: two `Decimal`
-# types in one graph is a compile error nobody enjoys diagnosing.
+# The same `rust_decimal` as `en16931`, so there is one `Decimal` type.
 rust_decimal.workspace = true
 
-# Reading XML only — the writers build strings and need nothing at all.
-# `roxmltree` rather than `quick-xml`: arena-allocated, no panics on hostile
-# input, and the reader CEN's conformance suites already validate.
+# Reading XML only; the writers need no dependency.
 roxmltree = { workspace = true, optional = true }
 
-# PDF object parsing, for `zugferd`. `default-features = false` drops chrono,
-# jiff, rayon and time — not needed to inflate one stream.
+# PDF parsing and writing for `zugferd`, without its date and threading features.
 lopdf = { version = "0.44", default-features = false, optional = true }
+# Strict, bounded `/FlateDecode` inflation. Already in the graph through `lopdf`.
+flate2 = { version = "1.1", optional = true }
 
 serde = { workspace = true, optional = true }
 
@@ -66,23 +61,23 @@ name              = "read_and_validate"
 required-features = ["ubl"]
 
 [dev-dependencies]
-# The same workspace entry, with the feature the suites need. A path-only
-# dependency would be a wildcard, which `deny.toml` bans.
-en16931      = { workspace = true, features = ["serde"] }
+# The workspace entry with the features the suites need (a path-only
+# dependency would be a wildcard, which `deny.toml` bans).
+en16931      = { workspace = true, features = ["serde", "billing", "svrl"] }
+# `tests/billing_seam.rs`: a derived `billing` document through both writers.
+billing      = "0.16"
 lopdf        = { version = "0.44", default-features = false }
 proptest     = "1.11"
-# The suites parse what the writers emit, whether or not the library itself
-# pulls in a parser for the feature set under test.
+# The suites parse what the writers emit under every feature set.
 roxmltree    = { workspace = true }
 rust_decimal = { workspace = true, features = ["macros"] }
 serde_json   = "1"
 criterion    = { version = "0.7", features = ["html_reports"] }
+# `tests/zugferd_embed.rs`: veraPDF in its Docker image, started once per run.
+testcontainers = { version = "0.28", default-features = false, features = ["blocking"] }
 
 [[bench]]
 name    = "syntax"
 harness = false
-# Both syntaxes, because the benchmark exists to compare them and to time the
-# conversion between them. With one enabled it would be a different, weaker
-# measurement; with neither it is an empty file that still has to lint, which is
-# what `just features` found. `just bench` runs it with `--all-features`.
+# Compares both syntaxes and times the conversion; `just bench` runs it.
 required-features = ["ubl", "cii"]

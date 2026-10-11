@@ -1,32 +1,16 @@
-//! How long reading and writing take, measured rather than asserted.
+//! Read, write and convert timings for both syntaxes.
 //!
-//! # Why this exists
-//!
-//! The model crate's benchmark exists because `README.md` claims microseconds
-//! rather than milliseconds, and a performance claim in a project that spends a
-//! section on the cost of unverified claims needs a number. **This crate made no
-//! such claim, and that is worse**: reading is where a batch job actually spends
-//! its time — a receiver is handed a document, not a model — and there was no
-//! figure for it at all. An absent number cannot be wrong, and it cannot be
-//! relied on either.
-//!
-//! The comparisons worth having:
-//!
-//! * `read/ubl` against `read/cii` — the two mandatory syntaxes on the same
-//!   invoice, so a caller choosing one knows what it costs.
-//! * `read/*` against `write/*` — reading is the hard direction and should show
-//!   it; a writer slower than a reader is doing something it should not.
-//! * `read/ubl/1000` — whether reading stays **linear** in line count. The rules
-//!   are (the model crate's benchmark asserts it); a reader that goes quadratic
-//!   is fine on examples and dies on a telecoms bill with 5 000 call records.
-//! * `convert/ubl-to-cii` — read, model, write: what `en16931 convert` does, and
-//!   the only figure a user of that command has.
+//! * `read/ubl` vs `read/cii`: the two syntaxes on the same invoice.
+//! * `read/*` vs `write/*`: reading should be the slower direction.
+//! * `read/ubl/1000`: reading should stay linear in line count.
+//! * `convert/ubl-to-cii`: what `en16931 convert` does.
 //!
 //! Run with `cargo bench -p en16931-formats --all-features`.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use en16931::invoice::*;
 use en16931::{Date, InvoiceAmount, Percentage, Quantity};
+use en16931_formats::{Loss, Syntax};
 use rust_decimal::Decimal;
 use std::hint::black_box;
 
@@ -45,10 +29,9 @@ fn party(name: &str) -> Party {
     }
 }
 
-/// An invoice with `n` lines at two VAT rates — the shape a real one has.
+/// An invoice with `n` lines at two VAT rates.
 fn invoice(n: usize) -> Invoice {
-    // `Invoice` is `#[non_exhaustive]`, so it is filled in rather than
-    // constructed — which is the point of that attribute.
+    // `Invoice` is `#[non_exhaustive]`, so it is filled in, not constructed.
     let mut inv = Invoice::default();
     inv.specification_id = Some("urn:cen.eu:en16931:2017".into());
     inv.number = Some("R-2026-0001".into());
@@ -74,65 +57,60 @@ fn invoice(n: usize) -> Invoice {
             }))),
         ));
     }
-    // The totals a real document carries, so the reader has them to parse.
+    // The totals a real document carries.
     let _ = en16931::reconcile(&mut inv);
     inv
 }
 
+/// `inv` written in `syntax` — every invoice here has what the schemas require.
+fn xml(inv: &Invoice, syntax: Syntax) -> String {
+    en16931_formats::write_unchecked(inv, syntax)
+        .expect("writable")
+        .xml
+}
+
 fn benches(c: &mut Criterion) {
-    // Reading: the direction a receiver takes, and the one all 1 339 syntax
-    // rules apply to.
+    // Reading: the direction a receiver takes.
     let mut group = c.benchmark_group("read");
     for n in [5usize, 100, 1000] {
         let inv = invoice(n);
-        {
-            let xml = en16931_formats::ubl::to_string(&inv);
-            group.bench_with_input(BenchmarkId::new("ubl", n), &xml, |b, xml| {
-                b.iter(|| en16931_formats::ubl::from_str(black_box(xml)).expect("readable"));
-            });
-        }
-        {
-            let xml = en16931_formats::cii::to_string(&inv);
-            group.bench_with_input(BenchmarkId::new("cii", n), &xml, |b, xml| {
-                b.iter(|| en16931_formats::cii::from_str(black_box(xml)).expect("readable"));
+        for (name, syntax) in [("ubl", Syntax::Ubl), ("cii", Syntax::Cii)] {
+            let xml = xml(&inv, syntax);
+            group.bench_with_input(BenchmarkId::new(name, n), &xml, |b, xml| {
+                b.iter(|| en16931_formats::read(black_box(xml.as_bytes())).expect("readable"));
             });
         }
     }
     group.finish();
 
-    // Writing cannot fail and does no I/O, so this is the element-order sort
-    // and the string building, and nothing else.
+    // Writing does no I/O: element-order sorting and string building.
     let mut group = c.benchmark_group("write");
     for n in [5usize, 1000] {
         let inv = invoice(n);
-        group.bench_with_input(BenchmarkId::new("ubl", n), &inv, |b, inv| {
-            b.iter(|| en16931_formats::ubl::to_string(black_box(inv)));
-        });
-        group.bench_with_input(BenchmarkId::new("cii", n), &inv, |b, inv| {
-            b.iter(|| en16931_formats::cii::to_string(black_box(inv)));
-        });
+        for (name, syntax) in [("ubl", Syntax::Ubl), ("cii", Syntax::Cii)] {
+            group.bench_with_input(BenchmarkId::new(name, n), &inv, |b, inv| {
+                b.iter(|| en16931_formats::write_unchecked(black_box(inv), syntax));
+            });
+        }
     }
     group.finish();
 
-    // `en16931 convert`, end to end: read, hold the model, write the other
-    // syntax — the only number a user of that command has.
+    // `en16931 convert`, end to end: read, write the other syntax, assess the source.
     {
         let mut group = c.benchmark_group("convert");
         let inv = invoice(5);
-        let ubl = en16931_formats::ubl::to_string(&inv);
-        group.bench_function("ubl-to-cii", |b| {
-            b.iter(|| {
-                let read = en16931_formats::ubl::from_str(black_box(&ubl)).expect("readable");
-                en16931_formats::cii::to_string(&read.invoice)
+        for (name, from, to) in [
+            ("ubl-to-cii", Syntax::Ubl, Syntax::Cii),
+            ("cii-to-ubl", Syntax::Cii, Syntax::Ubl),
+        ] {
+            let source = xml(&inv, from);
+            group.bench_function(name, |b| {
+                b.iter(|| {
+                    en16931_formats::convert(black_box(source.as_bytes()), to, Loss::Allow)
+                        .expect("convertible")
+                });
             });
-        });
-        let cii = en16931_formats::cii::to_string(&inv);
-        group.bench_function("cii-to-ubl", |b| {
-            b.iter(|| {
-                let read = en16931_formats::cii::from_str(black_box(&cii)).expect("readable");
-                en16931_formats::ubl::to_string(&read.invoice)
-            });
-        });
+        }
         group.finish();
     }
 }

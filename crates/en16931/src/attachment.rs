@@ -4,7 +4,7 @@ use core::fmt;
 
 /// A file transmitted with the invoice — EN 16931-1 §6.5.11.
 ///
-/// Table 25 gives three components, and **all three are mandatory**:
+/// Table 25 gives three components, all mandatory:
 ///
 /// | Component | Primitive | Example |
 /// |---|---|---|
@@ -12,39 +12,11 @@ use core::fmt;
 /// | Mime Code | String | `image/jpeg` |
 /// | Filename | String | `drawing5.jpg` |
 ///
-/// So a bare byte slice is not an attachment. The mime code tells the receiver
-/// how to open it and the filename is what they see; omitting either produces a
-/// document a human cannot use, which is why the standard makes them mandatory
-/// rather than conditional.
+/// [`Attachment::new`] (and `serde` deserialisation) rejects a blank mime code
+/// or filename; no core rule checks the filename.
 ///
-/// # The receiver obligation nobody implements
-///
-/// §6.5.11 also states a requirement that appears in **no Schematron** —
-/// `BR-CL-24` only checks that the value is *a* MIME type:
-///
-/// > A Receiver of an Invoice, compliant to the core invoice model shall accept
-/// > and process attachments that are of the following mime types […]
-///
-/// [`Attachment::RECEIVER_MUST_ACCEPT`] is that list. It constrains the
-/// *receiver*, not the document, so it is not a validation rule — but a sending
-/// system that only ever emits, say, `image/tiff` is relying on something the
-/// standard does not promise, and [`Attachment::is_universally_accepted`] says
-/// so.
-///
-/// # The invariant is enforced, not merely documented
-///
-/// `new` **fails** on an empty mime code or filename. Non-`Option` `String`
-/// fields encode "present" but not "non-empty", and an empty string is exactly
-/// the value a careless mapping produces — so the check lives in the
-/// constructor, and [`serde`] deserialisation re-runs it rather than
-/// reconstructing the fields directly.
-///
-/// This matters because nothing else catches it at the model level. `BR-CL-24`
-/// rejects an empty mime code as a side effect of checking the list, and the
-/// only rule that requires a filename at all is `UBL-DT-07` — a **syntax** rule
-/// this crate deliberately does not implement. Without the constructor check, an
-/// attachment with no filename would pass every rule here and fail in the format
-/// crate, or worse, at the receiver.
+/// [`Attachment::RECEIVER_MUST_ACCEPT`] lists the types §6.5.11 obliges every
+/// receiver to accept — a receiver obligation, not a validation rule.
 ///
 /// ```
 /// use en16931::Attachment;
@@ -70,11 +42,6 @@ pub struct Attachment {
 }
 
 /// The wire shape, so `serde` re-runs [`Attachment::new`]'s checks.
-///
-/// Deriving `Deserialize` straight onto [`Attachment`] would rebuild the private
-/// fields directly and let a serialised document carry an attachment the
-/// constructor would have refused — the invariant would hold everywhere except
-/// across the one boundary that matters.
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct Parts {
@@ -105,9 +72,6 @@ pub enum AttachmentError {
 
 impl Attachment {
     /// The mime types §6.5.11 obliges every compliant receiver to accept.
-    ///
-    /// Normative, and absent from the validation artefacts — see the type
-    /// documentation.
     pub const RECEIVER_MUST_ACCEPT: &'static [&'static str] = &[
         "application/pdf",
         "image/png",
@@ -160,10 +124,7 @@ impl Attachment {
     }
 
     /// Whether every compliant receiver is obliged to accept this mime type.
-    ///
-    /// A `false` is not a validation failure — the standard does not restrict
-    /// which types may be *sent* — but it does mean delivery depends on the
-    /// counterparty's goodwill rather than on the standard.
+    /// `false` is not a validation failure.
     #[must_use]
     pub fn is_universally_accepted(&self) -> bool {
         Self::RECEIVER_MUST_ACCEPT.contains(&self.mime_code.as_str())
@@ -200,7 +161,7 @@ mod tests {
 
     #[test]
     fn the_receiver_obligation_list_matches_the_standard() {
-        // §6.5.11, verbatim and in order.
+        // §6.5.11, in order.
         assert_eq!(
             Attachment::RECEIVER_MUST_ACCEPT,
             [

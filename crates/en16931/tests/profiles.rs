@@ -1,4 +1,4 @@
-//! Profiles end to end — the CIUS restriction model, and the typed proof.
+//! Profiles end to end: the CIUS restriction model and the typed proof.
 
 use en16931::DocumentReference;
 use en16931::invoice::*;
@@ -23,8 +23,14 @@ fn core_valid() -> Invoice {
             country: Some(Code::new(country)),
             ..Default::default()
         },
-        electronic_address: Some(Identifier::schemed(name, "0088")),
-        vat_identifier: Some(format!("{country}123456789")), // BR-CO-26 / BR-CO-09
+        // A GLN with a valid check digit: Peppol's `PEPPOL-COMMON-R040` checks it.
+        electronic_address: Some(Identifier::schemed("4006381333931", "0088")),
+        // BR-CO-26 / BR-CO-09; a Dutch one in Dutch shape (`PEPPOL-COMMON-R056-2`).
+        vat_identifier: Some(if country == "NL" {
+            "NL123456789B01".to_owned()
+        } else {
+            format!("{country}123456789")
+        }),
         ..Default::default()
     };
     let line = InvoiceLine {
@@ -111,8 +117,7 @@ fn xrechnung_valid() -> Invoice {
     inv.buyer.address.post_code = Some("1011".to_owned()); // BR-DE-9
     inv.payment = Some(PaymentInstructions {
         means_code: Some(Code::new("58")), // SEPA credit transfer
-        // BG-17, which BR-DE-23-a requires when BT-81 is 30 or 58. The IBAN is
-        // a real one, so BR-DE-19's mod-97 check passes.
+        // BG-17 (BR-DE-23-a); a mod-97-valid IBAN for BR-DE-19.
         means: Some(PaymentMeans::CreditTransfer(vec![CreditTransfer {
             account_identifier: Some("DE89370400440532013000".to_owned()),
             ..Default::default()
@@ -122,19 +127,14 @@ fn xrechnung_valid() -> Invoice {
     inv
 }
 
-/// A document valid under Peppol BIS Billing 3.0 — the one shipped CIUS that is
-/// conformant, and therefore the one `widen()` is demonstrated on.
-///
-/// XRechnung's document satisfies everything Peppol asks for except BT-24, which
-/// `PEPPOL-EN16931-R004` pins by prefix.
+/// A Peppol BIS Billing 3.0-valid document: the XRechnung one with Peppol's BT-24.
 fn peppol_valid() -> Invoice {
     let mut inv = xrechnung_valid();
     inv.specification_id = Some(profiles::PEPPOL_BIS_3.specification_id.to_owned());
     inv
 }
 
-/// A CIUS *restricts*. So an invoice that satisfies it satisfies the core model,
-/// but not the reverse — which is the entire content of §4.4.4.
+/// A CIUS restricts: CIUS-valid implies core-valid, not the reverse (§4.4.4).
 #[test]
 fn a_cius_restricts_and_the_direction_matters() {
     let core = core_valid();
@@ -164,9 +164,7 @@ fn a_cius_restricts_and_the_direction_matters() {
     assert!(profiles::EN16931.validate(&xr).is_valid());
 }
 
-/// Restrictions carry the profile's **real** rule ids, so a finding is
-/// lookup-able in KoSIT's index. That is the whole reason they are not collapsed
-/// into one generic "profile restriction" rule.
+/// Restrictions carry the profile's real rule ids, so findings match KoSIT's index.
 #[test]
 fn findings_carry_the_real_br_de_ids_and_business_term_paths() {
     let report = profiles::XRECHNUNG.validate(&core_valid());
@@ -178,9 +176,7 @@ fn findings_carry_the_real_br_de_ids_and_business_term_paths() {
     assert!(f.message.contains("Seller city"), "{}", f.message);
 }
 
-/// The BT-119 case: CEN's `BR-48` exempts category `O`, XRechnung's `BR-DE-14`
-/// does not. Suppressing BT-119 for `O` is the natural mistake and it fails
-/// KoSIT.
+/// CEN's `BR-48` exempts category `O` from BT-119; XRechnung's `BR-DE-14` does not.
 #[test]
 fn br_de_14_requires_bt_119_where_br_48_exempts_it() {
     let mut inv = xrechnung_valid();
@@ -212,14 +208,12 @@ fn br_de_14_requires_bt_119_where_br_48_exempts_it() {
     );
 }
 
-/// XRechnung and Peppol are **siblings**, not points on a scale: each permits a
-/// BT-3 the other forbids.
+/// XRechnung and Peppol are siblings: each permits a BT-3 the other forbids.
 #[test]
 fn xrechnung_and_peppol_genuinely_disagree() {
     let mut inv = xrechnung_valid();
     inv.type_code = Some(Code::new("389")); // self-billed invoice
-    // `P0100` is conditional on the business process being Peppol billing `01`
-    // — `$profile != '01' or …` in the artefact — so BT-23 has to say so.
+    // `P0100` only applies when BT-23 names Peppol billing `01`.
     inv.business_process = Some("urn:fdc:peppol.eu:2017:poacc:billing:01:1.0".to_owned());
 
     // XRechnung's BR-DE-17 allows 389.
@@ -241,59 +235,45 @@ fn xrechnung_and_peppol_genuinely_disagree() {
     );
 }
 
-/// §7.6 — a document declares its own profile, so the rule set can be selected
-/// from the document rather than guessed by the caller.
+/// A document declares its own profile, so the rule set is selected from it.
 #[test]
 fn a_document_selects_its_own_rule_set() {
     let inv = xrechnung_valid();
-    let declared = inv.specification_id.as_deref().unwrap();
-    let profile = profiles::for_specification_id(declared).expect("known profile");
+    let declared = profiles::classify(inv.specification_id.as_deref());
+    let profile = declared.profile().expect("known profile");
     assert_eq!(profile.id, "XRechnung 3.0");
     assert!(profile.validate(&inv).is_valid());
 }
 
-/// §7.4 — the typed proof, and §4.4.4's free widening.
+/// The typed proof, and widening out of a conformant CIUS (§4.4.4).
 #[test]
 fn a_proof_survives_the_call_boundary_and_widens_for_free() {
-    // A serialiser can demand this and be unable to receive anything else.
     fn serialise_xrechnung(v: &Validated<XRechnung>) -> String {
         v.invoice().number.clone().unwrap_or_default()
     }
     fn accepts_core(_: Validated<En16931>) {}
 
-    let proof: Validated<XRechnung> = Validated::new(xrechnung_valid())
-        .map_err(|b| b.1.to_string())
-        .unwrap();
+    let proof: Validated<XRechnung> = Validated::new(xrechnung_valid()).unwrap();
     assert_eq!(serialise_xrechnung(&proof), "INV-1");
 
-    // §4.4.4: for a **conformant** CIUS, CIUS-valid implies core-valid, so this
-    // is infallible and free. Peppol is one; XRechnung is not, because its
-    // reference validator relaxes two core code-list rules — so widening out of
-    // XRechnung has to re-validate, and does.
-    let peppol: Validated<PeppolBis3> = Validated::new(peppol_valid())
-        .map_err(|b| b.1.to_string())
-        .unwrap();
+    // Peppol is a conformant CIUS, so `widen` is infallible. XRechnung relaxes
+    // core code-list rules, so leaving it means re-validating.
+    let peppol: Validated<PeppolBis3> = Validated::new(peppol_valid()).unwrap();
     accepts_core(peppol.widen());
 
-    let core: Validated<En16931> = Validated::new(proof.into_inner())
-        .map_err(|b| b.1.to_string())
-        .expect("this particular document is core-valid too");
+    let core: Validated<En16931> =
+        Validated::new(proof.into_inner()).expect("this particular document is core-valid too");
     accepts_core(core);
 
     // The failure branch hands the invoice back, so a caller can fix and retry.
     let rejected = Validated::<XRechnung>::new(core_valid()).unwrap_err();
-    let (returned, report) = *rejected;
+    let (returned, report) = rejected.into_parts();
     assert_eq!(returned.number.as_deref(), Some("INV-1"));
     assert!(report.has("BR-DE-15"));
 }
 
-/// The soundness hole that removing `Underlies<XRechnung> for En16931` closes.
-///
-/// KoSIT reports `BR-CL-23` at warning, so a unit code outside CEN's Rec 20
-/// table leaves an invoice **valid as an XRechnung and invalid as a core
-/// invoice**. While the widening impl existed, `Validated<XRechnung>::widen()`
-/// turned that into a `Validated<En16931>` — a proof of something untrue, handed
-/// to a serialiser that was written to trust it.
+/// KoSIT reports `BR-CL-23` at warning, so an XRechnung-valid invoice can be
+/// core-invalid; hence no `Underlies<XRechnung> for En16931`.
 #[test]
 fn an_xrechnung_invoice_can_be_core_invalid() {
     let mut inv = xrechnung_valid();
@@ -309,27 +289,12 @@ fn an_xrechnung_invoice_can_be_core_invalid() {
     let core = en16931::validate(&inv);
     assert!(!core.is_valid(), "core EN 16931 does not");
 
-    // So the proof cannot be widened by re-badging, only by re-validating —
-    // which is what `Validated::<En16931>::new` does, and it refuses.
     assert!(Validated::<En16931>::new(inv).is_err());
 }
 
-/// §4.4.2's structural criterion, told apart from the profiles that break it.
-///
-/// A conformant CIUS only *restricts*, so anything it accepts is also
-/// core-valid. Reporting a core rule at a **lower** severity breaks that, and
-/// three of the five shipped profiles do — each on its own authority's
-/// published validator configuration:
-///
-/// * `XRECHNUNG` relaxes `BR-CL-21` and `BR-CL-23` to warning, because CEN's
-///   code-list tables lag the registries they track;
-/// * `XRECHNUNG_CVD` adds `BR-CL-13` at information — it widens UNTDID 7143 by
-///   one value;
-/// * `XRECHNUNG_EXTENSION` relaxes six more: §4.3's other mechanism.
-///
-/// Two earlier versions of this test were wrong in the same way, one after the
-/// other: the first asserted a method that returned a constant `true`, the
-/// second a hand-maintained list that omitted XRechnung itself. Both passed.
+/// §4.4.2: a profile that reports a core rule at a lower severity is not a
+/// conformant CIUS. Only `EN 16931` and Peppol qualify; the XRechnung family
+/// relaxes core code-list rules per KoSIT's configuration.
 #[test]
 fn conformance_is_reported_honestly() {
     let conformant: Vec<&str> = profiles::ALL
@@ -342,7 +307,7 @@ fn conformance_is_reported_honestly() {
         ["EN 16931", "Peppol BIS Billing 3.0"],
         "a profile that relaxes a core rule is not a conformant CIUS"
     );
-    // …and the property is computed from the data rather than restated here.
+    // The property is derived from the level overrides.
     for p in profiles::ALL {
         let relaxes = p.levels.iter().any(|(id, level)| {
             en16931::validation::rules::explain(id).is_some_and(|r| *level > r.severity)
@@ -356,15 +321,8 @@ fn conformance_is_reported_honestly() {
     }
 }
 
-/// The *behavioural* half of §4.4.4, which the structural claim only implies.
-///
-/// For a conformant CIUS, **everything it accepts the core model accepts**. That
-/// is what makes [`Validated::widen`] infallible, and it is a property of the
-/// rule sets that can be checked rather than argued.
-///
-/// Checked over the corpus of real documents each profile is built around, not
-/// over a single hand-picked one — a claim of the form "for all documents"
-/// deserves more than one witness.
+/// §4.4.4 behaviourally: whatever a conformant CIUS accepts, core accepts, which
+/// is what makes [`Validated::widen`] infallible.
 #[test]
 fn a_conformant_cius_never_accepts_what_core_rejects() {
     let docs = [core_valid(), xrechnung_valid()];
@@ -407,8 +365,7 @@ fn markers_match_their_profiles() {
     assert_eq!(PeppolBis3::PROFILE.id, profiles::PEPPOL_BIS_3.id);
 }
 
-/// **The third tolerance regime.** Peppol's ±0.02 is not CEN's ±1.00 and not the
-/// exact totals chain, and the three must not be confused.
+/// Peppol's ±0.02 line tolerance, distinct from CEN's ±1.00 and the exact totals chain.
 #[test]
 fn peppols_line_arithmetic_is_a_third_tolerance_regime() {
     let build = |net: &str| {
@@ -440,14 +397,12 @@ fn peppols_line_arithmetic_is_a_third_tolerance_regime() {
             .has("PEPPOL-EN16931-R120")
     );
 
-    // And EN 16931 core has no such rule at all: a line whose amount does not
-    // follow from its price is perfectly valid under the standard.
+    // Core EN 16931 has no such rule.
     let inv = build("999.00");
     assert!(!profiles::EN16931.validate(&inv).has("PEPPOL-EN16931-R120"));
 }
 
-/// `R046` looks like `R040`'s sibling and is **exact** — it carries no
-/// `u:slack`. A producer should derive BT-146 rather than compute and state it.
+/// `R046` is exact (no `u:slack`), unlike `R040`.
 #[test]
 fn r046_is_exact_where_r040_is_tolerant() {
     let mut inv = core_valid();
@@ -471,8 +426,7 @@ fn r046_is_exact_where_r040_is_tolerant() {
     );
 }
 
-/// `R130` is a cross-field rule between BT-130 (on the quantity) and BT-150 (on
-/// the price), so only the line can check it.
+/// `R130` compares BT-130 (quantity) with BT-150 (price), so the line checks it.
 #[test]
 fn r130_compares_two_terms_neither_type_owns() {
     let mut inv = core_valid();
@@ -492,8 +446,7 @@ fn r130_compares_two_terms_neither_type_owns() {
     );
 }
 
-/// `R121`: the base quantity is R120's divisor, so zero is undefined rather than
-/// merely odd — and the engine must not divide by it.
+/// `R121`: a zero base quantity (R120's divisor) is reported, never divided by.
 #[test]
 fn a_zero_base_quantity_is_reported_and_never_divided_by() {
     let mut inv = core_valid();
@@ -509,8 +462,7 @@ fn a_zero_base_quantity_is_reported_and_never_divided_by() {
     );
 }
 
-/// `extra_rules` is §7.3.2's one axis that genuinely needs code — and it is now
-/// exercised rather than empty.
+/// `extra_rules` carries conditional rules that restrictions cannot express.
 #[test]
 fn profiles_carry_conditional_rules_that_restrictions_cannot_express() {
     assert!(
@@ -522,11 +474,8 @@ fn profiles_carry_conditional_rules_that_restrictions_cannot_express() {
     assert!(!profiles::XRECHNUNG.extra_rules.is_empty());
 }
 
-/// **`PaymentMeans` is an enum, so three rules have nothing left to check.**
-///
-/// `BR-DE-23-b`, `-24-b` and `-25-b` each forbid the two payment groups that
-/// BT-81 did not name. The combination they forbid cannot be written down — the
-/// model's own §6.1 note, finally honoured.
+/// `PaymentMeans` is an enum, so the combinations `BR-DE-23-b`, `-24-b` and
+/// `-25-b` forbid cannot be built; the `-a` rules still tie the variant to BT-81.
 #[test]
 fn the_payment_groups_are_mutually_exclusive_by_construction() {
     let mut inv = xrechnung_valid();
@@ -534,13 +483,11 @@ fn the_payment_groups_are_mutually_exclusive_by_construction() {
     // BT-81 = 58 with BG-17 present: correct.
     assert!(!profiles::XRECHNUNG.validate(&inv).has("BR-DE-23-a"));
 
-    // Switch BT-81 to a card code without switching the group: `-a` fires,
-    // because it ties the *variant* to BT-81's value — which no type can see.
+    // Card code with a credit-transfer group: `-a` fires.
     inv.payment.as_mut().unwrap().means_code = Some(Code::new("48"));
     let report = profiles::XRECHNUNG.validate(&inv);
     assert!(report.has("BR-DE-24-a"), "{report}");
 
-    // Switching the group too satisfies it. There is no way to have both.
     inv.payment.as_mut().unwrap().means = Some(PaymentMeans::Card(PaymentCard {
         primary_account_number: Some("############1234".to_owned()),
         holder_name: Some("A. Muster".to_owned()),
@@ -548,7 +495,7 @@ fn the_payment_groups_are_mutually_exclusive_by_construction() {
     assert!(!profiles::XRECHNUNG.validate(&inv).has("BR-DE-24-a"));
 }
 
-/// Direct debit pulls in three rules at once — and the IBAN is checked offline.
+/// Direct debit requires its own terms, and the IBAN checksum is verified.
 #[test]
 fn direct_debit_requires_its_own_terms_and_a_real_iban() {
     let mut inv = xrechnung_valid();
@@ -565,11 +512,8 @@ fn direct_debit_requires_its_own_terms_and_a_real_iban() {
     );
     assert!(report.has("BR-DE-31"), "BT-91 debited account: {report}");
 
-    // …and BT-89, through `PEPPOL-EN16931-R061`. XRechnung 3.0 withdrew
-    // `BR-DE-29` precisely because R061 covers it — and R061 *is* an XRechnung
-    // rule, because KoSIT's build merges 31 Peppol asserts into the Schematron
-    // it ships. The file in KoSIT's repository is an input to that build, not
-    // the artefact its validator loads.
+    // BT-89 via `PEPPOL-EN16931-R061`, which KoSIT merges into XRechnung in
+    // place of the withdrawn `BR-DE-29`.
     assert!(
         report.has("PEPPOL-EN16931-R061"),
         "R061 replaced BR-DE-29 and is merged into XRechnung:\n{report}"
@@ -585,8 +529,7 @@ fn direct_debit_requires_its_own_terms_and_a_real_iban() {
     assert!(!report.has("BR-DE-30"));
     assert!(!report.has("BR-DE-31"));
     assert!(report.has("BR-DE-20"), "mod-97 catches the typo: {report}");
-    // …but advisory, not fatal: this crate cannot check a registry, only a
-    // checksum, so it reports a suspicion rather than a rejection.
+    // Advisory only: a checksum is not a registry lookup.
     assert!(report.is_valid(), "{report}");
 
     // Correct the checksum and the warning goes.
@@ -613,8 +556,7 @@ fn a_corrected_invoice_must_reference_the_original() {
     assert!(!profiles::XRECHNUNG.validate(&inv).has("BR-DE-26"));
 }
 
-/// `BR-DE-27` / `BR-DE-28` — contact shape checks, weaker than an RFC parser on
-/// purpose.
+/// `BR-DE-27` / `BR-DE-28`: contact shape checks, not RFC parsers.
 #[test]
 fn contact_formats_are_shape_checked() {
     let mut inv = xrechnung_valid();
@@ -630,7 +572,7 @@ fn contact_formats_are_shape_checked() {
     assert!(!profiles::XRECHNUNG.validate(&inv).has("BR-DE-28"));
 }
 
-/// `BR-DE-16` — a seller charging VAT must be identifiable to the tax authority.
+/// `BR-DE-16`: a seller charging VAT needs BT-31 or BT-32.
 #[test]
 fn a_vat_charging_seller_needs_a_tax_identifier() {
     let mut inv = xrechnung_valid();
@@ -640,19 +582,14 @@ fn a_vat_charging_seller_needs_a_tax_identifier() {
     let report = profiles::XRECHNUNG.validate(&inv);
     assert!(report.has("BR-DE-16"), "{report}");
 
-    // BT-32 satisfies it just as BT-31 does — the rule accepts either.
     inv.seller.tax_registration = Some("DE 199/123/45678".to_owned());
     assert!(!profiles::XRECHNUNG.validate(&inv).has("BR-DE-16"));
 }
 
-/// XRechnung merges Peppol's rules **and rewrites two of them**.
-///
-/// The same document can be an invalid Peppol invoice and a valid XRechnung,
-/// for two independent reasons, and both are load-bearing.
+/// XRechnung merges Peppol's R120 with a lower severity and a wider HUF slack.
 #[test]
 fn xrechnung_rewrites_r120_on_the_way_in() {
-    // 1. Severity. A line whose net amount does not follow from its price is
-    //    fatal under Peppol and a warning under XRechnung.
+    // 1. Severity: fatal under Peppol, warning under XRechnung.
     let mut inv = xrechnung_valid();
     inv.lines[0].price.net_price = UnitPriceAmount::new(dec!(1));
 
@@ -672,11 +609,9 @@ fn xrechnung_rewrites_r120_on_the_way_in() {
     let pe = profiles::PEPPOL_BIS_3.validate(&peppol_doc);
     assert!(!pe.is_valid(), "Peppol keeps it fatal:\n{pe}");
 
-    // 2. Slack. HUF has no minor unit in practice, so XRechnung widens the
-    //    tolerance to 0.5 where Peppol always uses 0.02.
+    // 2. Slack: XRechnung allows 0.5 for HUF; Peppol always 0.02.
     let mut huf = xrechnung_valid();
     huf.currency = Some(Code::new("HUF"));
-    // 0.30 out: inside XRechnung's 0.5, outside Peppol's 0.02.
     huf.lines[0].net_amount = InvoiceAmount::parse("100.30").unwrap();
     assert!(
         !profiles::XRECHNUNG
@@ -695,11 +630,8 @@ fn xrechnung_rewrites_r120_on_the_way_in() {
     );
 }
 
-/// Fifteen Peppol rules are **not** merged, and must not fire under XRechnung.
-///
-/// `CL001`…`CL008` are Peppol's narrower code lists and `P0104`…`P0112` the
-/// VATEX-to-category pinning. Reporting one of them as a German defect would be
-/// a false positive.
+/// Peppol's code-list rules (`CL001`…`CL008`) and VATEX pinning (`P0104`…) are
+/// not merged into XRechnung.
 #[test]
 fn the_unmerged_peppol_rules_stay_out_of_xrechnung() {
     let ids: Vec<&str> = profiles::XRECHNUNG
@@ -720,17 +652,8 @@ fn the_unmerged_peppol_rules_stay_out_of_xrechnung() {
     assert!(ids.contains(&"PEPPOL-EN16931-R120"));
 }
 
-/// The evidence behind the missing `Underlies` impls for CVD.
-///
-/// A conforming Clean Vehicles invoice marks a vehicle line with `BT-158` under
-/// the scheme `CVD`, and `CVD` is **not in UNTDID 7143** — so core `BR-CL-13`
-/// rejects it, while `XRECHNUNG_CVD` accepts it because it suppresses that rule.
-///
-/// This test exists because the crate briefly offered
-/// `Validated<XRechnungCvd>::widen::<En16931>()`, which handed back a proof of
-/// core-validity for exactly this document. If someone ever removes the
-/// suppression, this test fails and the widening can be reinstated deliberately
-/// rather than by assumption.
+/// A CVD invoice's BT-158 scheme `CVD` is not in UNTDID 7143: core `BR-CL-13`
+/// rejects it, so CVD has no `Underlies` impl for core.
 #[test]
 fn a_cvd_invoice_can_be_core_invalid() {
     let mut inv = xrechnung_valid();
@@ -757,7 +680,7 @@ fn a_cvd_invoice_can_be_core_invalid() {
     );
 }
 
-// ── Deviations, recorded rather than hidden ───────────────────────────────────
+// ── Suppressions ──────────────────────────────────────────────────────────────
 
 /// A suppressed rule is skipped, and the report says so.
 #[test]
@@ -780,7 +703,6 @@ fn suppression_is_loud() {
         deviated.to_string().contains("suppressed and NOT checked"),
         "a stored report must not misrepresent what ran:\n{deviated}"
     );
-    // The count drops, so `rules_checked` cannot overstate coverage either.
     assert!(deviated.rules_checked() < plain.rules_checked());
 }
 
@@ -793,22 +715,15 @@ fn suppression_matches_ids_canonically() {
     assert_eq!(report.suppressed(), ["br-co-3"]);
 }
 
-/// **A deviated run cannot produce a proof.**
-///
-/// This is `XRECHNUNG_CVD`'s lesson at runtime: a rule set with a hole may
-/// accept documents the full set rejects, so a `Validated<P>` derived from it
-/// would claim something untrue. `Validated<P>` means *the whole rule set
-/// passed*; if it could also mean *most of it*, no consumer could rely on it.
+/// A run with suppressions cannot produce a `Validated<P>` proof.
 #[test]
 fn a_deviated_run_refuses_to_prove() {
     use en16931::validation::{Check, ProveError};
 
     let inv = xrechnung_valid();
-    // Without suppressions, the proof is available.
     let proof = Check::new(&profiles::XRECHNUNG).prove::<XRechnung>(inv.clone());
     assert!(proof.is_ok(), "a clean run proves");
 
-    // With one, it is refused — even though the document is perfectly valid.
     let refused = Check::new(&profiles::XRECHNUNG)
         .without("BR-DE-15")
         .prove::<XRechnung>(inv);
@@ -828,23 +743,14 @@ fn a_report_says_what_it_checked_against() {
     let shown = report.to_string();
     assert!(shown.starts_with("XRechnung 3.0 validation"), "{shown}");
 
-    // The bare core path says so rather than naming a profile it did not use.
     let core = en16931::validate(&Invoice::default());
     assert_eq!(core.profile(), None);
     assert!(core.to_string().starts_with("EN 16931 validation"));
 }
 
-/// **A report states each finding's severity, and summarises them.**
-///
-/// The crate compares 121 published severities against KoSIT's Schematrons on
-/// every run, and for a long time printed none of them: three findings, one
-/// fatal and two advisory, rendered as three identical-looking lines. A reader
-/// could not tell which one made the document invalid, so the measurement was
-/// invisible exactly where it was meant to be used.
+/// A report prints each finding's severity and a per-severity summary.
 #[test]
 fn a_report_says_how_badly_each_finding_matters() {
-    // XRechnung relevels `BR-CL-23` to warning, so a document can be *valid*
-    // and still carry findings — the case that is unreadable without this.
     let report = profiles::XRECHNUNG.validate(&Invoice::default());
     let shown = report.to_string();
 
@@ -855,8 +761,6 @@ fn a_report_says_how_badly_each_finding_matters() {
         "the fixture must exercise both: {shown}"
     );
 
-    // Every finding line names its severity, in the spelling every Schematron
-    // tool in this field writes.
     for finding in report.findings() {
         let line = finding.to_string();
         assert!(
@@ -865,8 +769,6 @@ fn a_report_says_how_badly_each_finding_matters() {
         );
     }
 
-    // …and the header answers "how much of this must I fix" before the reader
-    // has read a single finding.
     let header = shown.lines().next().expect("a header");
     assert!(
         header.contains(&format!("{fatal} fatal")),
@@ -874,12 +776,7 @@ fn a_report_says_how_badly_each_finding_matters() {
     );
 }
 
-/// The core path and the `EN 16931` profile must agree about what they checked.
-///
-/// They are separate code paths — one filters, one does not — and for a while
-/// they reported 226 and 225 rules for the same invoice with the same findings.
-/// A caller comparing "core" against "the EN 16931 profile" saw a difference
-/// that meant nothing, which is worse than no number at all.
+/// The core path and the `EN 16931` profile report the same count and findings.
 #[test]
 fn the_core_path_and_the_en16931_profile_agree() {
     for invoice in [en16931::Invoice::default(), corpus_invoice()] {
@@ -913,14 +810,10 @@ fn corpus_invoice() -> en16931::Invoice {
     inv
 }
 
-// ── Regressions ───────────────────────────────────────────────────────────────
+// ── Edge cases ────────────────────────────────────────────────────────────────
 
-/// The XRechnung **Extension** must accept an `application/xml` attachment.
-///
-/// `BR-DEX-01` exists to permit exactly that, and KoSIT's Extension scenario
-/// drops CEN's `BR-CL-24` to `information` to let it through. This crate instead
-/// re-levelled a Peppol rule that never runs under XRechnung, so `BR-CL-24` went
-/// on rejecting the one attachment the Extension is for.
+/// The XRechnung Extension accepts an `application/xml` attachment (`BR-DEX-01`);
+/// KoSIT relaxes `BR-CL-24` to information there.
 #[test]
 fn the_extension_accepts_the_xml_attachment_br_dex_01_permits() {
     let mut inv = xrechnung_valid();
@@ -943,14 +836,13 @@ fn the_extension_accepts_the_xml_attachment_br_dex_01_permits() {
         !report.has("BR-DEX-01"),
         "…and the Extension's own rule agrees:\n{report}"
     );
-    // Relaxed, not dropped: the reader is still told the core model would object.
     assert!(
         report
             .info()
             .any(|f| f.rule == "BR-CL-24" && f.severity == Severity::Info),
         "reported at KoSIT's level:\n{report}"
     );
-    // …and the plain CIUS, which does not carry BR-DEX-01, still rejects it.
+    // The plain CIUS still rejects it.
     let mut cius = inv.clone();
     cius.specification_id = Some(profiles::XRECHNUNG.specification_id.to_owned());
     assert!(
@@ -961,16 +853,12 @@ fn the_extension_accepts_the_xml_attachment_br_dex_01_permits() {
     );
 }
 
-/// `BR-CL-10` and `BR-CL-11` are bound to **any** party identification, and the
-/// `SEPA` carve-out is scoped to the seller and the payee.
-///
-/// This crate checked the seller and the buyer, admitted `SEPA` on both, and
-/// never looked at the payee — three divergences from one Schematron context.
+/// `BR-CL-10` / `BR-CL-11` cover every party identification; the `SEPA` scheme
+/// is admitted only for the seller and the payee.
 #[test]
 fn the_party_identifier_scheme_rules_cover_every_party() {
     let bad = || Identifier::schemed("X", "NOT-AN-ICD");
 
-    // The payee was invisible to both rules.
     let mut inv = core_valid();
     inv.payee = Some(Payee {
         name: Some("Factoring GmbH".to_owned()),
@@ -981,7 +869,6 @@ fn the_party_identifier_scheme_rules_cover_every_party() {
     assert!(report.has("BR-CL-10"), "BT-60:\n{report}");
     assert!(report.has("BR-CL-11"), "BT-61:\n{report}");
 
-    // `SEPA` is admissible under the seller and the payee…
     let mut ok = core_valid();
     ok.seller.identifiers = vec![Identifier::schemed("DE98ZZZ09999999999", "SEPA")];
     ok.payee = Some(Payee {
@@ -991,8 +878,6 @@ fn the_party_identifier_scheme_rules_cover_every_party() {
     });
     assert!(!en16931::validate(&ok).has("BR-CL-10"));
 
-    // …and nowhere else. The artefact's own predicate is
-    // `(ancestor::cac:AccountingSupplierParty) or (ancestor::cac:PayeeParty)`.
     let mut buyer = core_valid();
     buyer.buyer.identifiers = vec![Identifier::schemed("DE98ZZZ09999999999", "SEPA")];
     assert!(
@@ -1001,8 +886,7 @@ fn the_party_identifier_scheme_rules_cover_every_party() {
     );
 }
 
-/// Suppressing a rule that was never going to run must not make the report claim
-/// it checked fewer rules than it did.
+/// Suppressing a rule the profile does not run leaves the count unchanged.
 #[test]
 fn an_unknown_suppression_does_not_shrink_the_count() {
     use en16931::validation::Check;
@@ -1018,7 +902,7 @@ fn an_unknown_suppression_does_not_shrink_the_count() {
         plain.rules_checked(),
         "nothing was skipped, so nothing may be deducted"
     );
-    // The request is still recorded — a report must not hide what was asked for.
+    // The request is still recorded.
     assert_eq!(bogus.suppressed().len(), 2);
 
     // A suppression that *does* bite deducts exactly one.
@@ -1028,13 +912,8 @@ fn an_unknown_suppression_does_not_shrink_the_count() {
     assert_eq!(real.rules_checked(), plain.rules_checked() - 1);
 }
 
-/// Sub-lines keyed to a line that does not exist are reported, not ignored.
-///
-/// `Extensions::sub_invoice_lines` is keyed by the *index* of the BG-25 line the
-/// group hangs beneath, so removing or reordering a line strands the key. Every
-/// consumer iterates the lines and asks for each one's sub-lines, so a stranded
-/// group is skipped by `BR-DEX-02`, skipped by `BR-DEX-03`, and never written —
-/// data that validates clean and does not survive being written down.
+/// Sub-lines keyed (by BG-25 index) to a line that does not exist are reported,
+/// since no writer or rule would ever reach them.
 #[test]
 fn stranded_sub_invoice_lines_are_a_finding() {
     let mut inv = xrechnung_valid();
@@ -1044,7 +923,6 @@ fn stranded_sub_invoice_lines_are_a_finding() {
         vat: Some(inv.lines[0].vat.clone()),
         children: vec![],
     };
-    // The invoice has one line, so index 0 is the only valid key.
     inv.extensions
         .sub_invoice_lines
         .push((0, vec![sub.clone()]));
@@ -1064,15 +942,7 @@ fn stranded_sub_invoice_lines_are_a_finding() {
     );
 }
 
-/// Every profile's check count, as five documents quote it.
-///
-/// `README.md`, `lib.rs`, the CLI's README and the site's profile page all
-/// print these five numbers, and one rule added to `CORE` moves every row at
-/// once. A number repeated in five files is a number nobody rechecks, so it is
-/// checked here instead.
-///
-/// The sibling of `just deps`, which does the same for the dependency graph
-/// sizes, and for the same reason.
+/// Every profile's check count, as the READMEs, `lib.rs` and the site quote it.
 #[test]
 fn the_documented_profile_check_counts_are_measured() {
     let documented = [
@@ -1080,7 +950,7 @@ fn the_documented_profile_check_counts_are_measured() {
         (&profiles::XRECHNUNG, 282),
         (&profiles::XRECHNUNG_CVD, 290),
         (&profiles::XRECHNUNG_EXTENSION, 296),
-        (&profiles::PEPPOL_BIS_3, 273),
+        (&profiles::PEPPOL_BIS_3, 290),
     ];
     let mut wrong = Vec::new();
     for (profile, want) in documented {
@@ -1099,14 +969,7 @@ fn the_documented_profile_check_counts_are_measured() {
     );
 }
 
-/// …and the number a **report** prints is that same number, on any document.
-///
-/// Filtering `EN-EXT-01` out of the rule *sequence* whenever the target can
-/// represent the invoice's extension data — which, for an invoice carrying
-/// none, is every profile and every document — would make the tool print
-/// `281 rule(s) checked` beside five files quoting 282. The rule runs and its
-/// *finding* is withdrawn instead. Pinned here because the difference is
-/// invisible until someone reads a report next to a README.
+/// A report's `rules_checked` equals the profile's registered count on any document.
 #[test]
 fn a_report_says_it_checked_what_the_profile_registers() {
     use en16931::extensions::SubInvoiceLine;
@@ -1138,5 +1001,63 @@ fn a_report_says_it_checked_what_the_profile_registers() {
             profiles::EN16931.check_ids().count(),
             "the bare core path on an {label} invoice"
         );
+    }
+}
+
+// ── Valid starting points and profile names ───────────────────────────────────
+
+/// Every shipped profile has a valid example declaring it; ZUGFeRD profiles have none.
+#[test]
+fn every_shipped_profile_has_a_valid_example() {
+    for p in en16931::profiles::ALL {
+        let invoice = en16931::examples::for_profile(p).expect("a shipped profile");
+        assert_eq!(
+            invoice.specification_id.as_deref(),
+            Some(p.specification_id)
+        );
+        let report = p.validate(&invoice);
+        assert_eq!(report.fatal().count(), 0, "{}: {report}", p.id);
+        assert_eq!(report.warnings().count(), 0, "{}: {report}", p.id);
+    }
+    for p in en16931::profiles::ZUGFERD {
+        assert!(en16931::examples::for_profile(p).is_none(), "{}", p.id);
+    }
+}
+
+/// Change one field of a valid example and the report names exactly that.
+#[test]
+fn an_example_without_bt_1_has_exactly_one_fatal_finding() {
+    for p in en16931::profiles::ALL {
+        let mut invoice = en16931::examples::for_profile(p).expect("a shipped profile");
+        invoice.number = None;
+        let report = p.validate(&invoice);
+        let fatal: Vec<&str> = report.fatal().map(|f| f.rule.as_str()).collect();
+        assert_eq!(fatal, ["BR-02"], "{}: {report}", p.id);
+    }
+}
+
+/// Profiles parse from slug, name, alias or BT-24; an unknown name lists the slugs.
+#[test]
+fn a_profile_parses_from_slug_name_alias_or_bt24() {
+    use en16931::Profile;
+    use en16931::profiles::{EN16931, PEPPOL_BIS_3, XRECHNUNG};
+
+    for (spelling, want) in [
+        ("core", &EN16931),
+        ("CORE", &EN16931),
+        ("bis3", &PEPPOL_BIS_3),
+        ("peppol-bis-3", &PEPPOL_BIS_3),
+        ("XRechnung 3.0", &XRECHNUNG),
+        ("xrechnung", &XRECHNUNG),
+        (XRECHNUNG.specification_id, &XRECHNUNG),
+    ] {
+        let got: &Profile = spelling.parse().expect(spelling);
+        assert!(std::ptr::eq(got, want), "{spelling}");
+    }
+    let err = "xrechung".parse::<&Profile>().unwrap_err();
+    assert_eq!(err.name, "xrechung");
+    let text = err.to_string();
+    for p in en16931::profiles::ALL {
+        assert!(text.contains(p.slug), "{text}");
     }
 }

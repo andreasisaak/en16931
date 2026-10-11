@@ -1,43 +1,22 @@
 //! Build tasks for the workspace.
 //!
 //! ```text
-//! cargo xtask fetch        download the artefacts into spec/
-//! cargo xtask codegen      regenerate every derived table from spec/
+//! cargo xtask fetch        download the artefacts into the reference corpus
+//! cargo xtask codegen      regenerate every derived table from the reference corpus
 //! cargo xtask check        regenerate into memory and fail if anything differs
+//! cargo xtask watch        report every pin that is behind its source (JSON)
 //! ```
 //!
-//! # One runner, two crates, one `spec/`
-//!
-//! Both crates derive tables from the *same* four upstream artefact
-//! repositories at the *same* pinned revision. Split across two repositories
-//! that meant two near-identical `fetch.rs`, two `spec/` trees of the same
-//! 136 MB, and two `CEN_REF` constants kept equal by hand. Here it is one fetch,
-//! one pin, and one `cargo xtask check` that gates every generated file in the
-//! workspace.
-//!
-//! # What is generated, and why none of it is hand-written
-//!
-//! | Table | Crate | Why it cannot be written by hand |
+//! | Table | Crate | Source |
 //! |---|---|---|
-//! | [`codes`] | `en16931` | ~4 400 code values across eighteen lists, 2 162 unit codes alone. A wrong unit code is a rejected invoice. |
-//! | [`order`] | `en16931-formats` | Both content models are XSD `sequence`s, so right elements in the wrong order is invalid — and no *rule* reports it, because ordering is the schema's job. The order is evidence, topologically sorted from 486 published instances. |
-//! | [`prohibitions`] | `en16931-formats` | 1 220 of the 1 339 syntax rules say some element "shall not be used", each *context-relative*. Dropping the context turns a narrow prohibition into a blanket one, and did. |
+//! | [`codes`] | `en16931` | the code lists of CEN's and Peppol's Schematron |
+//! | [`order`] | `en16931-formats` | element order: the D16B schema for CII, the published instances for UBL |
+//! | [`prohibitions`] | `en16931-formats` | CEN's context-relative "shall not be used" syntax rules |
+//! | [`once`] | `en16931-formats` | the single-occurrence elements: the schemas and CEN's `count(…) <= 1` rules |
 //!
-//! # Why the extraction is careful
-//!
-//! A Schematron `test` is a **program**, not a data structure. `BR-CL-01`'s test
-//! is a disjunction over `self::` with *two* different lists — 50 codes for
-//! `cbc:InvoiceTypeCode` and 13 for `cbc:CreditNoteTypeCode`. An extractor that
-//! takes the first `contains(…)` literal and stops reports a confident, precise,
-//! wrong answer. So every table declares how its list is selected, and the
-//! generator **fails** when the artefact does not match that declaration.
-//!
-//! # Why an xtask and not a script
-//!
-//! The generators are compiled, type-checked and linted like the rest of the
-//! workspace, and need no toolchain it does not already require. `cargo xtask
-//! check` runs in CI, so a committed table cannot drift away from the artefacts
-//! it claims to come from.
+//! Each table declares how its list is selected from the artefact, and the
+//! generator fails when the artefact does not match. `cargo xtask check` runs
+//! in CI.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -45,8 +24,10 @@ use std::process::ExitCode;
 
 mod codes;
 mod fetch;
+mod once;
 mod order;
 mod prohibitions;
+mod watch;
 
 /// The header every generated file carries.
 fn header(title: &str, body: &str) -> String {
@@ -57,10 +38,6 @@ fn header(title: &str, body: &str) -> String {
 }
 
 /// A Rust string literal's contents, escaped.
-///
-/// Element names cannot contain a quote or a backslash, so this is defensive
-/// rather than load-bearing — but a generator that emits invalid Rust when the
-/// input surprises it is worse than one that escapes for nothing.
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -76,9 +53,6 @@ type Table = BTreeMap<String, Vec<String>>;
 type Set = BTreeSet<String>;
 
 /// The workspace root — the directory holding the `[workspace]` manifest.
-///
-/// `xtask/` sits directly under it, so this is one `parent()` regardless of
-/// where cargo was invoked from.
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -87,24 +61,19 @@ fn root() -> PathBuf {
 }
 
 /// The directory of a workspace member.
-///
-/// Every generated file lands under one of these, and routing through a named
-/// function is what keeps `crates/` from being spelled out in four generators.
 fn member(name: &str) -> PathBuf {
     root().join("crates").join(name)
 }
 
 /// Where the artefacts are, if anywhere.
 ///
-/// Not committed: the CEN artefacts are EUPL-1.2, a reciprocal licence, and
-/// keeping them out of the repository is what keeps both crates
-/// `MIT OR Apache-2.0`.
+/// Not committed: the CEN artefacts are EUPL-1.2.
 fn spec() -> Result<PathBuf, String> {
-    let p = root().join("spec");
+    let p = PathBuf::from(env!("EN16931_REFERENCE"));
     if p.is_dir() {
         Ok(p)
     } else {
-        Err("no spec/ directory — run `cargo xtask fetch`".to_owned())
+        Err("no reference corpus — run `cargo xtask fetch`".to_owned())
     }
 }
 
@@ -142,10 +111,7 @@ impl Generated {
         std::fs::write(&self.path, &self.contents)
     }
 
-    /// Whether the file on disk already matches.
-    ///
-    /// Compared after normalising line endings, so a Windows checkout does not
-    /// report every generated file as stale.
+    /// Whether the file on disk already matches, line endings normalised.
     fn is_current(&self) -> bool {
         std::fs::read_to_string(&self.path)
             .map(|on_disk| on_disk.replace("\r\n", "\n") == self.contents.replace("\r\n", "\n"))
@@ -155,15 +121,8 @@ impl Generated {
 
 /// Run the source through `rustfmt`.
 ///
-/// Without this, `cargo xtask check` fails immediately after `cargo fmt`: the
-/// generators' line breaks and rustfmt's disagree, so a freshly generated file
-/// and a committed one never match. Formatting here makes the generator's output
-/// the same artefact the repository stores, which is the only way `check` can be
-/// a useful CI gate.
-///
-/// If `rustfmt` is not on `PATH` the source is returned unchanged and `check`
-/// will report a difference — noisy, but honest, and better than silently
-/// comparing two things that were never going to be equal.
+/// So generated output matches what `cargo fmt` leaves in the repository.
+/// Without `rustfmt` on `PATH` the source is returned unchanged.
 fn rustfmt(source: &str) -> String {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
@@ -190,7 +149,7 @@ fn rustfmt(source: &str) -> String {
     }
 }
 
-/// Every generated file in the workspace, in one pass over `spec/`.
+/// Every generated file in the workspace, in one pass over the reference corpus.
 fn generate() -> Result<Vec<Generated>, String> {
     let spec = spec()?;
     let mut out = Vec::new();
@@ -208,13 +167,17 @@ fn generate() -> Result<Vec<Generated>, String> {
         contents: source,
     });
 
-    // `en16931-formats` — element order and prohibitions, per syntax.
+    // `en16931-formats`, per syntax: from the authorities' own instances
+    // only, not the ZUGFeRD community corpus or `manual/`.
     let mut files = Vec::new();
-    xml_files(&spec, &mut files);
+    for source in fetch::ORDER_SOURCES {
+        xml_files(&spec.join(source), &mut files);
+    }
     let formats = member("en16931-formats");
     for syntax in [order::Syntax::Ubl, order::Syntax::Cii] {
-        out.push(order::derive(syntax, &files, &formats)?);
+        out.push(order::derive(syntax, &files, &spec, &formats)?);
         out.push(prohibitions::extract(syntax, &spec, &formats)?);
+        out.push(once::derive(syntax, &files, &spec, &formats)?);
     }
 
     for g in &mut out {
@@ -226,9 +189,11 @@ fn generate() -> Result<Vec<Generated>, String> {
 const USAGE: &str = "\
 usage: cargo xtask <task>
 
-  fetch     download the artefacts into spec/
-  codegen   regenerate every derived table from spec/
+  fetch     download the artefacts into the reference corpus
+  codegen   regenerate every derived table from the reference corpus
   check     regenerate and fail if any committed table differs
+  watch     report every pin that is behind its source, as JSON
+            [--out FILE]; fails if a source cannot be read
 ";
 
 fn run(check_only: bool) -> Result<(), String> {
@@ -266,6 +231,7 @@ fn main() -> ExitCode {
         Some("fetch") => fetch::run_fetch(),
         Some("codegen") => run(false),
         Some("check") => run(true),
+        Some("watch") => watch::run_watch(std::env::args().skip(2)),
         Some(other) => Err(format!("unknown task {other:?}\n\n{USAGE}")),
         None => Err(format!("no task given\n\n{USAGE}")),
     };

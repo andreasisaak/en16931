@@ -1,76 +1,37 @@
 #![cfg(all(feature = "ubl", feature = "cii"))]
 
-//! **UBL and CII are two spellings of one model** — over the authorities' own
-//! documents, in both directions.
+//! UBL and CII are two spellings of one model: each corpus document is read
+//! in its syntax, written in the other, and read back. The models must agree,
+//! or the writer must name what it could not carry.
 //!
-//! `tests/roundtrip.rs` checks `Invoice → syntax → Invoice` within each syntax,
-//! and `tests/fidelity.rs` does the same over the corpus. Both can pass while the
-//! two bindings disagree with *each other*: a term the UBL side reads and the CII
-//! side does not is invisible to a test that never crosses.
-//!
-//! So this reads each published document in its own syntax, writes it in the
-//! **other** one, reads it back, and requires the two models to agree — or the
-//! writer to have said what it could not carry.
-//!
-//! It found four, none of which any same-syntax test could have:
-//!
-//! | | |
-//! |---|---|
-//! | BT-20 was **trimmed** by the CII reader | `BR-DE-18` needs the Skonto block to end with a newline, and XRechnung is carried in CII too. 36 documents. |
-//! | credit notes were detected from `381` alone | `396`, `532`, `83` read back as *invoices*, and `BR-CL-01` then reported a violation that is not one |
-//! | BT-111 vanished when BT-6 = BT-5 | one element is then both totals, which the UBL reader already knew and the CII reader did not |
-//! | `kind` and the Extension groups | genuinely unrepresentable in CII — now **reported** rather than lost |
-//!
-//! # Why the comparison is on the model and not on its JSON
-//!
-//! `Decimal` compares by value and serialises by representation, so a quantity
-//! written `1.0000` and read back `1` is the same quantity and two different
-//! strings. Diffing the JSON reports that as data loss, which is how a test like
-//! this gets weakened until it passes. The JSON is used only to *describe* a
-//! difference once the model has said there is one.
+//! Comparison is on the model, not its JSON: `Decimal` compares by value but
+//! serialises by representation.
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use en16931::Invoice;
-use en16931_formats::{Syntax, cii, ubl};
+use en16931_formats::{Syntax, Written};
 
-fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            collect(&p, out);
-        } else if p.extension().is_some_and(|x| x == "xml") {
-            out.push(p);
-        }
-    }
+/// Read a document, whatever its syntax, and require it to be `syntax`.
+fn read(xml: &str, syntax: Syntax) -> Result<Invoice, String> {
+    let r = en16931_formats::read(xml.as_bytes()).map_err(|e| e.to_string())?;
+    assert_eq!(r.syntax, syntax, "read as the wrong syntax");
+    Ok(r.invoice)
+}
+
+/// Write the fixture, which carries everything either schema requires.
+fn write(inv: &Invoice, syntax: Syntax) -> Written {
+    en16931_formats::write_unchecked(inv, syntax).expect("the fixture is writable")
 }
 
 fn documents(syntax: Syntax) -> Vec<(PathBuf, String)> {
-    let Some(root) = common::require("cross-syntax equivalence") else {
-        return Vec::new();
-    };
-    let mut paths = Vec::new();
-    collect(&root, &mut paths);
-    paths.sort();
-    paths
-        .into_iter()
-        .filter_map(|p| {
-            let text = std::fs::read_to_string(&p).ok()?;
-            (en16931_formats::sniff(&text) == Some(syntax)).then_some((p, text))
-        })
-        .collect()
+    common::authority_documents(syntax, "cross-syntax equivalence")
 }
 
-/// CII splits a party's BT-29 by whether it carries a scheme — `ram:GlobalID`
-/// when it does, `ram:ID` when it does not — and the sequence fixes their order.
-/// A party carrying both kinds therefore comes back reordered. EN 16931 gives
-/// the order of repeated BT-29 occurrences no meaning, so the comparison sorts
-/// rather than the binding pretending it can control it.
+/// The model with each party's BT-29 sorted: CII's `ram:GlobalID` / `ram:ID`
+/// split fixes an order EN 16931 gives no meaning.
 fn canonical(inv: &Invoice) -> Invoice {
     let mut inv = inv.clone();
     for party in [&mut inv.seller, &mut inv.buyer] {
@@ -109,41 +70,42 @@ fn differences(a: &serde_json::Value, b: &serde_json::Value, at: &str, out: &mut
 
 /// `read in one syntax → write in the other → read back` preserves the model,
 /// or the writer named what it could not carry.
-fn cross(from: Syntax, min: usize) {
+fn cross(from: Syntax, min: usize, expect_refused: usize) {
     let docs = documents(from);
     if docs.is_empty() {
         println!("SKIPPED: no artefacts — run `cargo xtask fetch`");
         return;
     }
-    let (mut checked, mut reported) = (0usize, 0usize);
+    let to = match from {
+        Syntax::Ubl => Syntax::Cii,
+        Syntax::Cii => Syntax::Ubl,
+        other => unreachable!("{other} has no other syntax to cross to"),
+    };
+    let (mut checked, mut reported, mut refused) = (0usize, 0usize, 0usize);
     let mut silent: Vec<String> = Vec::new();
 
     for (path, text) in &docs {
-        let source = match from {
-            Syntax::Ubl => ubl::from_str(text).ok().map(|r| r.invoice),
-            Syntax::Cii => cii::from_str(text).ok().map(|r| r.invoice),
-            _ => None,
-        };
         // A document this reader refuses is `tests/corpus.rs`' business.
-        let Some(source) = source else { continue };
-        checked += 1;
+        let Ok(source) = read(text, from) else {
+            continue;
+        };
 
-        // Write in the *other* syntax, and read it back with that syntax's own
-        // reader — so a shared misunderstanding between one binding's writer and
-        // its own reader cannot hide the disagreement.
-        let (xml, dropped, back) = match from {
-            Syntax::Ubl => {
-                let w = cii::write(&source);
-                let back = cii::from_str(&w.xml).map(|r| r.invoice);
-                (w.xml, w.dropped, back.map_err(|e| e.to_string()))
-            }
-            _ => {
-                let w = ubl::write(&source);
-                let back = ubl::from_str(&w.xml).map(|r| r.invoice);
-                (w.xml, w.dropped, back.map_err(|e| e.to_string()))
+        // Write in the other syntax and read back with that syntax's reader. A
+        // model the target schema has no form for is refused; counted.
+        let w = match en16931_formats::write_unchecked(&source, to) {
+            Ok(w) => w,
+            Err(e) => {
+                println!("{}: refused — {e}", path.display());
+                refused += 1;
+                continue;
             }
         };
-        let back = back.unwrap_or_else(|e| {
+        checked += 1;
+        if to == Syntax::Cii {
+            common::assert_cii_bt8_spelled_for_cii(&path.display().to_string(), &w.xml);
+        }
+        let (xml, entries) = (w.xml, w.entries);
+        let back = read(&xml, to).unwrap_or_else(|e| {
             panic!("{}: unreadable after crossing: {e}\n{xml}", path.display())
         });
 
@@ -158,7 +120,7 @@ fn cross(from: Syntax, min: usize) {
             "",
             &mut diffs,
         );
-        if dropped.is_empty() {
+        if entries.is_empty() {
             silent.push(format!("{}\n    {}", path.display(), diffs.join("\n    ")));
         } else {
             reported += 1;
@@ -169,39 +131,39 @@ fn cross(from: Syntax, min: usize) {
         checked > min,
         "only {checked} documents — is the corpus complete?"
     );
+    // Deliberately invalid corpus documents with no form in the target schema
+    // (`processing-valid/ubl005.xml` lacks BT-2). Pinned.
+    assert_eq!(refused, expect_refused, "documents refused as unwritable");
     assert!(
         silent.is_empty(),
-        "{} document(s) changed meaning crossing syntaxes with nothing in `dropped` \
+        "{} document(s) changed meaning crossing syntaxes with nothing in `entries` \
          to say so:\n\n{}",
         silent.len(),
         silent.join("\n\n")
     );
     println!(
         "{from:?} → other syntax → back: {checked} documents, {reported} differ and every \
-         difference is named in `dropped`"
+         difference is named in `entries`; {refused} refused as unwritable"
     );
 }
 
 #[test]
 fn ubl_documents_survive_a_trip_through_cii() {
-    cross(Syntax::Ubl, 250);
+    cross(Syntax::Ubl, 250, 1);
 }
 
 #[test]
 fn cii_documents_survive_a_trip_through_ubl() {
-    cross(Syntax::Cii, 120);
+    cross(Syntax::Cii, 120, 0);
 }
 
-// ── The four bugs this file was written to find ──────────────────────────────
+// ── Targeted crossings ───────────────────────────────────────────────────────
 
 /// BT-90 survives being written as UBL.
 ///
-/// UBL has no element for it inside BG-19: it rides on the **seller** as a
-/// `cac:PartyIdentification` with `schemeID="SEPA"`, the one place `BR-CL-10`
-/// admits a scheme outside ISO 6523. The reader had always hopped it into BG-19,
-/// where `BR-DE-30` can see it. The writer never hopped it back, so every
-/// direct-debit invoice written as UBL lost BT-90 **in silence** — and CII keeps
-/// it in BG-19, so nothing but a crossing could show it.
+/// UBL carries it on the seller as a `cac:PartyIdentification` with
+/// `schemeID="SEPA"` (the one non-ISO 6523 scheme `BR-CL-10` admits); the
+/// reader moves it into BG-19 and the writer back.
 #[test]
 fn bt_90_survives_the_crossing_in_both_directions() {
     use en16931::invoice::{DirectDebit, PaymentInstructions, PaymentMeans};
@@ -222,12 +184,9 @@ fn bt_90_survives_the_crossing_in_both_directions() {
         _ => None,
     };
 
-    for (name, xml) in [("ubl", ubl::write(&inv).xml), ("cii", cii::write(&inv).xml)] {
-        let back = if name == "ubl" {
-            ubl::from_str(&xml).expect("readable").invoice
-        } else {
-            cii::from_str(&xml).expect("readable").invoice
-        };
+    for (name, syntax) in [("ubl", Syntax::Ubl), ("cii", Syntax::Cii)] {
+        let xml = write(&inv, syntax).xml;
+        let back = read(&xml, syntax).expect("readable");
         assert_eq!(
             creditor(&back).as_deref(),
             Some("DE98ZZZ09999999999"),
@@ -238,9 +197,7 @@ fn bt_90_survives_the_crossing_in_both_directions() {
             !en16931::profiles::XRECHNUNG.validate(&back).has("BR-DE-30"),
             "{name}"
         );
-        // And it is *moved*, not copied: a SEPA party identification is the UBL
-        // binding's home for BT-90, not a BT-29 with an unusual scheme. Copying
-        // it made a document grow a seller identifier on every crossing.
+        // Moved, not copied: no extra BT-29 appears on the seller.
         assert!(
             !back
                 .seller
@@ -252,14 +209,8 @@ fn bt_90_survives_the_crossing_in_both_directions() {
     }
 }
 
-/// A CII credit note is detected from the **whole** UNTDID 1001 credit-note
-/// list, not from `381` alone.
-///
-/// CII has one document element, so BT-3 is the only signal — and checking
-/// `381` alone is wrong in a way the corpus cannot show, because every
-/// published CII credit note uses `381`. `396`, `532` and `83` would read back
-/// as *invoices*, whereupon `BR-CL-01` compares them against the 50 invoice
-/// codes and reports a violation that is not one.
+/// A CII credit note is detected from the whole UNTDID 1001 credit-note list
+/// (`396`, `532`, `83`, …), not from `381` alone: BT-3 is the only signal.
 #[test]
 fn cii_reads_every_credit_note_code_as_a_credit_note() {
     use en16931::DocumentKind;
@@ -267,8 +218,8 @@ fn cii_reads_every_credit_note_code_as_a_credit_note() {
     for code in ["381", "396", "532", "83"] {
         let mut inv = common::maximal_credit_note();
         inv.type_code = Some(en16931::invoice::Code::new(code));
-        let xml = cii::write(&inv).xml;
-        let back = cii::from_str(&xml).expect("readable").invoice;
+        let xml = write(&inv, Syntax::Cii).xml;
+        let back = read(&xml, Syntax::Cii).expect("readable");
 
         assert_eq!(back.kind, DocumentKind::CreditNote, "BT-3 = {code}");
         assert!(
@@ -278,22 +229,16 @@ fn cii_reads_every_credit_note_code_as_a_credit_note() {
         );
     }
 
-    // An invoice code stays an invoice — the widening must not swallow BT-3's
-    // actual meaning.
+    // An invoice code stays an invoice.
     let mut inv = common::maximal();
     inv.type_code = Some(en16931::invoice::Code::new("380"));
-    let back = cii::from_str(&cii::write(&inv).xml)
-        .expect("readable")
-        .invoice;
+    let back = read(&write(&inv, Syntax::Cii).xml, Syntax::Cii).expect("readable");
     assert_eq!(back.kind, DocumentKind::Invoice);
 }
 
 /// BT-111 survives when BT-6 equals BT-5.
 ///
-/// `BR-53`'s binding is satisfied by the document-currency total whenever the
-/// two currencies coincide, so one element is then **both** BT-110 and BT-111.
-/// The UBL reader knew that; the CII reader keyed BT-111 off "a currency other
-/// than the document's" and therefore never found it.
+/// When the currencies coincide, one element is both BT-110 and BT-111 (`BR-53`).
 #[test]
 fn bt_111_survives_when_the_two_currencies_are_the_same() {
     use en16931::invoice::Code;
@@ -302,12 +247,9 @@ fn bt_111_survives_when_the_two_currencies_are_the_same() {
     inv.vat_accounting_currency = Some(Code::new("EUR")); // == BT-5
     inv.totals.vat_total_accounting = inv.totals.vat_total;
 
-    for (name, xml) in [("ubl", ubl::write(&inv).xml), ("cii", cii::write(&inv).xml)] {
-        let back = if name == "ubl" {
-            ubl::from_str(&xml).expect("readable").invoice
-        } else {
-            cii::from_str(&xml).expect("readable").invoice
-        };
+    for (name, syntax) in [("ubl", Syntax::Ubl), ("cii", Syntax::Cii)] {
+        let xml = write(&inv, syntax).xml;
+        let back = read(&xml, syntax).expect("readable");
         assert_eq!(
             back.totals.vat_total_accounting, inv.totals.vat_total_accounting,
             "{name} lost BT-111:\n{xml}"
@@ -318,20 +260,15 @@ fn bt_111_survives_when_the_two_currencies_are_the_same() {
 
 /// An empty element is an **absent** term, in both readers.
 ///
-/// `<ram:Description/>` is not a description whose value is the empty string.
-/// The UBL reader always said so — `roxmltree` gives an empty element no text
-/// node — and the CII reader mapped the same element to `Some("")`. Two readers
-/// of one model disagreeing about that is a real difference: nine published CII
-/// instances differed from their UBL crossing on it alone.
+/// `<ram:Description/>` is not `Some("")`.
 #[test]
 fn an_empty_element_is_an_absent_term_in_both_readers() {
     let ubl_doc = r#"<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
         <cbc:BuyerReference/></Invoice>"#;
     assert_eq!(
-        ubl::from_str(ubl_doc)
+        read(ubl_doc, Syntax::Ubl)
             .expect("readable")
-            .invoice
             .buyer_reference,
         None
     );
@@ -343,9 +280,8 @@ fn an_empty_element_is_an_absent_term_in_both_readers() {
         <ram:BuyerReference/></ram:ApplicableHeaderTradeAgreement>
         </rsm:SupplyChainTradeTransaction></rsm:CrossIndustryInvoice>"#;
     assert_eq!(
-        cii::from_str(cii_doc)
+        read(cii_doc, Syntax::Cii)
             .expect("readable")
-            .invoice
             .buyer_reference,
         None,
         "an empty element is not a value"

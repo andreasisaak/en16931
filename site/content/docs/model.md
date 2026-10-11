@@ -14,7 +14,7 @@ reconciliation, both syntaxes, the PDF container — is built on top of it.
 
 ## The design invariants
 
-These five decisions explain most of the API, so they are worth stating up front.
+These four decisions explain most of the API.
 
 **No `f64`.** Amounts are fixed-point; rates and quantities are `Decimal`. A
 binary float cannot represent `0.10`, and an invoice is a legal statement about
@@ -24,13 +24,14 @@ money.
 error, not a rounding opportunity. Whoever produced the third decimal knows what
 should happen to it; the type does not.
 
-**Mandatory means non-`Option`.** The type system carries every cardinality it
-can. Rules exist for the ones it cannot express, not as a substitute for it.
-
 **Types enforce representability; rules enforce validity.** An *invalid* invoice
 must still be representable — otherwise a parser cannot load one in order to
-explain what is wrong with it. This is the line that decides, for any given
-constraint, whether it belongs in a type or in a rule.
+explain what is wrong with it. So the terms the standard makes mandatory —
+BT-1, BT-2, BT-3, BT-5, BT-24 — are `Option` in `Invoice`, and `BR-01` …
+`BR-05` report their absence; `Invoice::builder` takes them as arguments, so
+code that builds an invoice cannot forget them. Types carry what no valid or
+invalid document can violate: a third decimal on an amount, a time of day on a
+date, two payment groups at once.
 
 **No I/O, no async, no `unsafe`.** `#![forbid(unsafe_code)]`, and `wasm32` is
 tested in CI.
@@ -94,9 +95,8 @@ assert_eq!(price.to_string(), "0.28901");
 assert!(InvoiceAmount::from_decimal_exact(dec!(0.28901)).is_err());
 ```
 
-Metering, freight and commodity pricing all live in the fourth and fifth decimal.
-An implementation that caps BT-146 at two silently overcharges or undercharges
-every kilowatt-hour, and it is one of the most common bugs in this space.
+Metering, freight and commodity prices need the fourth and fifth decimal, so
+BT-146 is not capped.
 
 ### `Date` — a calendar day, not an instant
 
@@ -157,19 +157,18 @@ credits 10 returned ones **on the same ordinary invoice**:
 The sign lives on the **quantity**, never on the price — BR-27 forbids a negative
 item net price.
 
-## Code lists — 4 887 values, generated
+## Code lists — 4 876 values, generated
 
-Eighteen code lists are generated from the CEN artefacts and re-verified in CI:
+4 876 values across 18 tables, generated from the CEN artefacts and re-verified
+in CI:
 ISO 3166-1 countries, ISO 4217 currencies, UNTDID 1001 document types, UNTDID
 5305 VAT categories, UNTDID 4451 note subjects, UN/ECE Rec 20 and Rec 21 unit
 codes, the EAS scheme list, ISO 6523 ICD, VATEX exemption reasons, and the rest.
 None is written by hand; `cargo xtask check` re-derives all of them and fails if
 a committed table differs.
 
-The guarded constructors check membership **at the map**, where you still know
-what you were mapping:
-
-`contains` answers yes or no. `guard` answers **what to do**:
+`contains` answers yes or no. `guard` answers **what to do**, at the point of
+mapping:
 
 ```rust
 use en16931::codes::guard;
@@ -188,42 +187,23 @@ withdrawn codes really are gone from the current list, and that every named
 successor really is in it, is asserted against the pinned artefacts — so a code
 CEN reinstates fails the build rather than producing a wrong hint.
 
-A code list that only speaks up in the final report tells you at the end of a
-pipeline what it could have told you at the start, and by then the context that
-would let you fix it is three layers away. This is a convenience and never a
-second source of truth: `guard` checks the same generated list the corresponding
-rule checks, and skipping the layer loses nothing but the earlier message.
+`guard` checks the same generated list the corresponding rule checks; skipping
+it loses nothing but the earlier message.
 
 ## Formatting never shortens a value
 
-Every `Display` in the crate used `Formatter::pad`, the standard helper — which,
-because that is what precision means for a *string*, truncates to N
-**characters**:
-
-```text
-format!("{:.2}",    amount)   →  "11"           ← 1190.00, as eleven euros
-format!("{:>12.4}", amount)   →  "        1190"
-format!("{:.4}",    date)     →  "2026"
-```
-
-A caller asking for two decimal places got a hundredth of the amount, right
-where a person reads it. The crate refuses to round an amount at a boundary
-because a plausible wrong number is worse than an error, and this was the same
-failure arriving through the formatter.
-
-Nothing truncates now, and **precision on the numeric types is a minimum number
-of fraction digits** — `{:.4}` on `1190.00` is `1190.0000`, `{:.0}` is still
-`1190.00`. Padding is lossless; rounding is not. Width, fill and alignment are
-unchanged, and `en16931::fmt` exposes the two helpers so a downstream `Display`
-can make the same promise.
+No `Display` truncates. On the numeric types, **precision is a minimum number of
+fraction digits**: `{:.4}` on `1190.00` is `1190.0000`, and `{:.0}` is still
+`1190.00`. Width, fill and alignment work as usual. `en16931::fmt` exposes the
+two helpers, so a downstream `Display` can make the same promise.
 
 ## Editions are values, not crate versions
 
-`XRechnung 3.0` and a future `XRechnung 4.0` are *values* of the same type, not
-two versions of this crate. That is what makes *"valid today, and still valid
-under the next edition?"* one call instead of two pipelines and a diff.
+Each profile names its `Edition` of EN 16931-1 (`Profile::edition`, printed in
+every report header). A profile is a value of one type, not a version of this
+crate, so checking one invoice against two profiles is two calls in one build.
 
-## What is next
+## See also
 
 - **[Validation](@/docs/validation.md)** — what the rules do with all of this.
 - **[Profiles](@/docs/profiles.md)** — restricting the model for XRechnung or Peppol.

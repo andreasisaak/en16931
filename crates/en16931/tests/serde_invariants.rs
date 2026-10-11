@@ -1,20 +1,5 @@
-//! Invariants must survive the `serde` boundary.
-//!
-//! The crate's central claim is that **types enforce representability**: an
-//! `InvoiceAmount` cannot hold three decimals, a `Date` cannot hold a timestamp,
-//! an `Attachment` cannot lack a filename. Every one of those is enforced in a
-//! constructor — and a derived `Deserialize` rebuilds private fields *without
-//! calling the constructor*, which would make the guarantee hold everywhere
-//! except across the one boundary where untrusted data actually arrives.
-//!
-//! `Cargo.toml` advertises that this is handled:
-//!
-//! > Types carrying invariants re-run their validation on deserialisation via
-//! > `#[serde(try_from = ...)]` rather than trusting reconstructed fields.
-//!
-//! That claim had no test. This file is the test, and it is written to fail if
-//! anyone removes a `try_from` — the failure mode is silent otherwise, because
-//! the happy path round-trips identically either way.
+//! Constructor invariants hold across `serde`: types re-validate on
+//! deserialisation (`#[serde(try_from = ...)]`), and invoices and reports round-trip.
 
 #![cfg(feature = "serde")]
 
@@ -67,12 +52,7 @@ fn deserialisation_re_runs_the_constructor_checks() {
     );
 }
 
-/// A whole invoice round-trips, and validates identically on the far side.
-///
-/// The stronger property: serialisation is not merely lossless in the fields it
-/// happens to test, but lossless *as far as the rule set can tell*. Two
-/// documents that produce the same report are equivalent for this crate's
-/// purpose, and that is what a format crate on the far side depends on.
+/// A whole invoice round-trips, and validates identically under every profile.
 #[test]
 fn an_invoice_round_trips_and_validates_the_same() {
     let inv = sample();
@@ -96,7 +76,7 @@ fn an_invoice_round_trips_and_validates_the_same() {
     }
 }
 
-/// A report is an artefact you store and diff, so it round-trips too.
+/// A report round-trips.
 #[test]
 fn a_report_round_trips() {
     let report = validate(&Invoice::default());
@@ -108,11 +88,7 @@ fn a_report_round_trips() {
     assert_eq!(report.is_valid(), back.is_valid());
 }
 
-/// `Percentage` keeps its scale-independence across the boundary.
-///
-/// `19` and `19.00` are the same rate, and VAT grouping depends on `Eq` and
-/// `Hash` agreeing with that — including after a round-trip through a
-/// representation that writes one and reads the other.
+/// `19` and `19.00` deserialise to equal, equally hashed `Percentage`s.
 #[test]
 fn percentages_stay_scale_independent() {
     let a: Percentage = serde_json::from_str("19").expect("parse");
@@ -163,4 +139,47 @@ fn sample() -> Invoice {
         ),
     }];
     inv
+}
+
+/// A stored invoice carries the version of the shape it was stored in, and a
+/// reader of another version refuses it — naming both — rather than reading a
+/// partial model.
+#[test]
+fn an_invoice_is_stored_in_a_versioned_envelope() {
+    let inv = sample();
+    let json: serde_json::Value = serde_json::to_value(&inv).expect("serialise");
+    assert_eq!(json["en16931"], en16931::invoice::JSON_VERSION);
+    assert_eq!(en16931::invoice::JSON_VERSION, "0.8");
+    assert!(json["invoice"].is_object(), "{json}");
+    assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
+
+    let mut other = json.clone();
+    other["en16931"] = "0.7".into();
+    let err = serde_json::from_value::<Invoice>(other).expect_err("another version");
+    let msg = err.to_string();
+    assert!(msg.contains("\"0.7\"") && msg.contains("\"0.8\""), "{msg}");
+
+    // An unenveloped body is refused too.
+    let bare = json["invoice"].clone();
+    let err = serde_json::from_value::<Invoice>(bare).expect_err("no envelope");
+    assert!(err.to_string().contains("en16931"), "{err}");
+}
+
+/// Every list field may be left out of stored JSON and reads as empty.
+#[test]
+fn list_fields_may_be_omitted() {
+    let json = serde_json::json!({
+        "en16931": en16931::invoice::JSON_VERSION,
+        "invoice": {
+            "kind": "Invoice",
+            "seller": { "address": {}, "contact": {} },
+            "buyer": { "address": {}, "contact": {} },
+            "totals": {
+                "line_total": "0.00", "taxable_total": "0.00",
+                "gross_total": "0.00", "due": "0.00"
+            }
+        }
+    });
+    let inv: Invoice = serde_json::from_value(json).expect("lists default to empty");
+    assert!(inv.lines.is_empty() && inv.notes.is_empty() && inv.seller.identifiers.is_empty());
 }

@@ -1,351 +1,590 @@
-//! **European e-invoicing formats**, on top of the EN 16931 semantic model.
+//! UBL 2.1, UN/CEFACT CII D16B and ZUGFeRD / Factur-X for the EN 16931 e-invoice.
 //!
-//! ```text
-//!         ┌──────────────┐                       ┌──────────────────────┐
-//!         │   billing    │                       │  inbound documents   │
-//!         │ calculations │                       │  UBL / CII / ZUGFeRD │
-//!         └──────┬───────┘                       └──────────┬───────────┘
-//!                │  adapter (optional feature)              │
-//!                └──────────────┬───────────────────────────┘
-//!                               ▼
-//!                     ┌─────────────────────┐
-//!                     │      en16931        │  semantic model, 317 rules,
-//!                     │  proof of validity  │  no XML, no PDF, no I/O
-//!                     └──────────┬──────────┘
-//!                                ▼
-//!                     ┌─────────────────────┐
-//!                     │  en16931-formats    │  ← you are here
-//!                     │   UBL · CII · PDF   │
-//!                     └─────────────────────┘
-//! ```
-//!
-//! [`en16931`] decides whether an invoice is **correct**. This crate decides
-//! what it looks like **on the wire**, and re-implements not one of the 317
-//! rules.
-//!
-//! # Why one crate, not one per format
-//!
-//! XRechnung is carried in UBL *and* CII; every ZUGFeRD payload is CII. A crate
-//! per format would need the CII binding twice, and two bindings drift. Cargo
-//! features already express which syntax a consumer wants, so a crate boundary
-//! here would be solving with a package what `--no-default-features` solves for
-//! free.
-//!
-//! What *is* a separate crate is [`en16931`], and that boundary is
-//! load-bearing: this crate depends on it, so rustc forbids the reverse. "The
-//! semantic rules do not depend on a syntax" is enforced rather than asked for,
-//! and `en16931`'s dependency graph stays at ten crates and builds for
-//! `wasm32`.
-//!
-//! # Features, and what each one costs
+//! [`en16931`] decides whether an invoice is correct; this crate reads and
+//! writes it on the wire and re-implements none of the 334 business rules.
 //!
 //! | Feature | Default | Graph | What |
 //! |---|---|---|---|
 //! | [`ubl`] | ✅ | 13 crates | UBL 2.1, both directions |
 //! | [`cii`] | — | 13 crates | UN/CEFACT CII D16B, both directions |
-//! | [`zugferd`] | — | **57 crates** | ZUGFeRD / Factur-X hybrid PDFs — **reading only**, see [`zugferd`] |
+//! | [`zugferd`] | — | 57 crates | ZUGFeRD / Factur-X: extract from and embed into PDF/A-3; does not build for `wasm32` |
 //!
-//! `zugferd` is off by default and that matters: `lopdf` brings AES, ChaCha20,
-//! SHA-2, `getrandom` and `libc`, and the result does not build for
-//! `wasm32-unknown-unknown`. Nobody reading a UBL invoice should pay for that.
-//!
-//! # The 91 % that costs a writer nothing
-//!
-//! CEN's artefacts carry **1 339** syntax rules, and **1 218 of them (91 %)**
-//! say some element "shall not be used" — they fence off the parts of UBL 2.1
-//! and CII D16B that EN 16931 does not use. That inverts the usual expectation:
-//!
-//! * A **writer** driven from the semantic model cannot violate them. It has no
-//!   way to express `cbc:UUID`, because the model has no term for it. They are
-//!   *unreachable*, not cheaply satisfied — the same shape as `InvoiceAmount`
-//!   making `BR-DEC-*` unrepresentable. So the writer answers to roughly **119**
-//!   real rules.
-//! * A **reader** must cope with all 1 339, because the document came from
-//!   somewhere else.
-//!
-//! Unreachability is a claim, so the serialiser enforces it against the
-//! prohibitions extracted from CEN's own Schematron, and `tests/subset.rs`
-//! asserts the writer never needs that safety net. See [`ubl::prohibitions`].
-//!
-//! # Quick start
+//! | Task | Call |
+//! |---|---|
+//! | read UBL, CII or a ZUGFeRD PDF from bytes | [`read`] |
+//! | receive bytes and decide — accept, reject, undefined | [`receive`] |
+//! | write a validated invoice | [`write()`] |
+//! | write a model nobody validated | [`write_unchecked`] |
+//! | convert between syntaxes | [`convert`] |
+//! | embed a validated invoice into a PDF/A-3 file | [`zugferd::embed`] (feature `zugferd`) |
 //!
 //! ```
 //! # #[cfg(feature = "ubl")] {
 //! use en16931::Invoice;
+//! use en16931_formats::{Policy, Recommendation, Syntax};
 //!
-//! let xml = en16931_formats::ubl::to_string(&Invoice::default());
-//! let read = en16931_formats::ubl::from_str(&xml).expect("readable");
-//! assert!(read.unmapped.is_empty(), "nothing was silently dropped");
+//! // A model UBL's schema has no form for is refused, naming what it lacks.
+//! let refused = en16931_formats::write_unchecked(&Invoice::default(), Syntax::Ubl);
+//! assert!(refused.unwrap_err().to_string().contains("BT-1"));
+//!
+//! let received = en16931_formats::receive(b"<Invoice/>", &Policy::default());
+//! assert_eq!(received.recommendation, Recommendation::Reject);
 //! # }
 //! ```
 //!
-//! # Reading a document somebody else wrote
+//! Reading never drops anything silently: what the reader could not map or
+//! hold, and every further occurrence of an element the schema allows once, is
+//! a typed [`report::Entry`]; the first occurrence is the one read. Input is
+//! UTF-8 or UTF-16 with a byte-order mark; any other encoding is refused
+//! ([`Error::Encoding`]). A DTD is refused, which rules out entity expansion
+//! and external entities, and nesting deeper than [`MAX_DEPTH`] is refused
+//! before parsing ([`Error::TooDeep`]). Input size and time are the caller's
+//! to bound.
 //!
-//! Which is the only kind worth reading. Three ways an inbound document can
-//! attack the reader rather than inform it, and what happens to each:
+//! Writers driven from the model cannot produce the elements CEN's syntax
+//! rules prohibit; the prohibitions extracted from CEN's Schematron are
+//! enforced anyway (see [`ubl::prohibitions`]).
 //!
-//! | | |
-//! |---|---|
-//! | **entity expansion** (billion laughs) | needs a DTD; the parser rejects every document carrying one |
-//! | **external entities** (XXE, file disclosure) | the same DTD refusal, for the same reason |
-//! | **nesting** | refused past [`ubl::MAX_DEPTH`] before parsing — see below |
-//!
-//! The third is the one that had teeth. `roxmltree` recurses once per level of
-//! nesting and overflows the stack a few hundred levels in, and a stack overflow
-//! is **not a panic**: Rust cannot unwind it and cannot catch it, so the process
-//! aborts. Two lines of XML took down the caller, with no report and nothing for
-//! `?` to catch.
-//!
-//! It cannot be handled afterwards, so it is refused before: one linear scan of
-//! the bytes, then [`ubl::Error::TooDeep`] or its CII twin. The limit is 64 and
-//! the deepest of the 487 published instances in the artefact tree is **nine**,
-//! which `tests/corpus.rs` measures rather than assumes.
-//!
-//! What this crate does **not** do is bound input size or time — a caller who
-//! reads from a socket owns that decision, and a library that quietly capped it
-//! would be wrong for the batch job and useless for the endpoint.
-//!
-//! [`ubl::MAX_DEPTH`]: crate::ubl::MAX_DEPTH
-//! [`ubl::Error::TooDeep`]: crate::ubl::Error::TooDeep
-//!
-//! # Attribution
-//!
-//! The bindings are derived from CEN's EUPL-1.2 validation artefacts and the
-//! element order from the authorities' published instances. The notice is a
-//! licence condition, not decoration, and it has a test.
+//! The bindings are derived from CEN's EUPL-1.2 validation artefacts; the
+//! attribution notice is [`ATTRIBUTION`].
 
+#![forbid(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs, clippy::pedantic)]
 #![allow(
     clippy::must_use_candidate,
     clippy::missing_errors_doc,
-    // The writer is one function per aggregate and `write` is a straight walk
-    // of the document element's sequence. Splitting it to satisfy a line count
-    // would scatter the order it exists to express.
+    // A writer function walks one element's schema sequence in order.
     clippy::too_many_lines,
-    // `en16931::invoice::*` is the model. Naming forty types individually in
-    // three files is noise, not clarity.
+    // `en16931::invoice::*` is the model.
     clippy::wildcard_imports
 )]
 
 #[cfg(feature = "cii")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cii")))]
 pub mod cii;
+#[cfg(any(feature = "ubl", feature = "cii"))]
+mod receive;
+pub mod report;
 #[cfg(feature = "ubl")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ubl")))]
 pub mod ubl;
-pub mod xrechnung;
-
 #[cfg(any(feature = "ubl", feature = "cii"))]
 mod xml;
 #[cfg(feature = "zugferd")]
 #[cfg_attr(docsrs, doc(cfg(feature = "zugferd")))]
 pub mod zugferd;
 
-pub use xrechnung::{Flavour, detect};
-
-/// A document was **not** written, because it did not pass the profile it was
-/// asked to be written for.
-///
-/// Returned by [`ubl::to_string_for`] / [`ubl::write_for`] and their CII twins.
-///
-/// # Why an error type rather than the report itself
-///
-/// [`en16931::ValidationReport`] is a *product* — you store it, diff it, show
-/// it to an operator — and it deliberately does not implement
-/// [`std::error::Error`]. `report.is_valid()` being false is an ordinary
-/// outcome of validating, not a failure of validation.
-///
-/// It *is* an error when the thing you asked for was a shippable document. This
-/// type is that framing, so `?` works and the message says what happened rather
-/// than spilling forty findings into a log line. The report is right there in
-/// [`report`](Self::report) when you want it.
-///
-/// [`ubl::to_string_for`]: crate::ubl::to_string_for
-/// [`ubl::write_for`]: crate::ubl::write_for
-#[derive(Debug)]
-pub struct NotValid {
-    profile: &'static str,
-    // Boxed: a report carries a `Vec<Finding>` and several `String`s, and the
-    // success arm of these `Result`s is one `String`. Unboxed, the error would
-    // widen every one of them.
-    report: Box<en16931::ValidationReport>,
-}
-
-impl NotValid {
-    /// The full report — every finding, in the order the validator produced it.
-    #[must_use]
-    pub fn report(&self) -> &en16931::ValidationReport {
-        &self.report
-    }
-
-    /// Take the report.
-    #[must_use]
-    pub fn into_report(self) -> en16931::ValidationReport {
-        *self.report
-    }
-
-    /// The profile the invoice was checked against — `"XRechnung 3.0"`.
-    #[must_use]
-    pub fn profile(&self) -> &'static str {
-        self.profile
-    }
-}
-
-impl std::fmt::Display for NotValid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "not written: the invoice does not satisfy {} ({} fatal finding(s)); \
-             see `NotValid::report` for all of them",
-            self.profile,
-            self.report.fatal().count()
-        )
-    }
-}
-
-impl std::error::Error for NotValid {}
-
-/// Validate against `profile`, stamping BT-24 from it, or say why not.
-///
-/// Shared by both syntaxes: the check is about the *model*, so doing it twice
-/// would be two places for it to differ.
-///
-/// The stamp happens **before** validation, not after. `BR-01` requires BT-24
-/// and XRechnung's `BR-DE-21` constrains its value, so a document validated
-/// carrying the caller's BT-24 and shipped carrying the profile's would have
-/// been checked as something other than what it claims to be.
+use en16931::Invoice;
 #[cfg(any(feature = "ubl", feature = "cii"))]
-fn prepare_for(
-    invoice: &en16931::Invoice,
-    profile: &'static en16931::validation::profile::Profile,
-) -> Result<en16931::Invoice, NotValid> {
-    let mut inv = invoice.clone();
-    inv.specification_id = Some(profile.specification_id.to_owned());
-    let report = profile.validate(&inv);
-    if report.is_valid() {
-        Ok(inv)
-    } else {
-        Err(NotValid {
-            profile: profile.id,
-            report: Box::new(report),
-        })
-    }
-}
+use en16931::validation::profile::{ProfileMarker, Validated};
+
+#[cfg(any(feature = "ubl", feature = "cii"))]
+pub use receive::{Policy, Received, Recommendation, receive};
+use report::{Entry, Kind};
+#[cfg(any(feature = "ubl", feature = "cii"))]
+pub use xml::MAX_DEPTH;
 
 /// The CEN attribution notice, as [`en16931`] carries it.
-///
-/// Re-exported rather than restated, so the two cannot drift.
 pub const ATTRIBUTION: &str = en16931::ATTRIBUTION;
 
 /// Which syntax a document is written in.
+///
+/// A variant exists only when its feature is on, so a build that cannot write
+/// CII cannot be asked to; a `match` outside this crate needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum Syntax {
     /// OASIS UBL 2.1 — `Invoice` or `CreditNote`.
+    #[cfg(feature = "ubl")]
     Ubl,
     /// UN/CEFACT Cross Industry Invoice D16B.
+    #[cfg(feature = "cii")]
     Cii,
 }
 
-/// Guess the syntax from the document element, without parsing.
+impl core::fmt::Display for Syntax {
+    #[cfg_attr(not(any(feature = "ubl", feature = "cii")), allow(unused_variables))]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            #[cfg(feature = "ubl")]
+            Self::Ubl => f.write_str("UBL 2.1"),
+            #[cfg(feature = "cii")]
+            Self::Cii => f.write_str("UN/CEFACT CII D16B"),
+        }
+    }
+}
+
+/// A document, read.
+#[derive(Debug, Clone)]
+pub struct Read {
+    /// The model.
+    pub invoice: Invoice,
+    /// The syntax the invoice was written in — CII for a hybrid PDF.
+    pub syntax: Syntax,
+    /// Everything reading had to say: duplicates (in document order), then the
+    /// reader's malformed values and schema notes, then each unmapped path once.
+    pub entries: Vec<Entry>,
+    /// For a hybrid PDF, the container: the payload's bytes, its filename, the
+    /// ZUGFeRD profile, the XMP and every disagreement between them.
+    #[cfg(feature = "zugferd")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "zugferd")))]
+    pub pdf: Option<zugferd::Extracted>,
+}
+
+impl Read {
+    /// The entries of one kind.
+    pub fn entries_of(&self, kind: Kind) -> impl Iterator<Item = &Entry> {
+        self.entries.iter().filter(move |e| e.kind == kind)
+    }
+
+    /// What reading found, as a layered [`report::Report`] with **no rules
+    /// run**: the container, syntax and schema layers, the document's
+    /// identity, and a semantic layer skipped. [`receive`] is the call that
+    /// validates.
+    #[cfg(any(feature = "ubl", feature = "cii"))]
+    #[must_use]
+    pub fn report(&self) -> report::Report {
+        let (container, syntax, schema) = receive::document_layers(self);
+        report::Report {
+            identity: report::Identity::of(&self.invoice),
+            rule_set: None,
+            container,
+            syntax,
+            schema,
+            semantic: report::Semantic {
+                validity: report::Validity::Skipped("not validated".to_owned()),
+                report: None,
+            },
+        }
+    }
+}
+
+/// A document, written.
 ///
-/// Returns `None` rather than guessing when the root is neither — "not an
-/// e-invoice at all" and "an e-invoice in the other syntax" need different
-/// messages, and a caller that cannot tell them apart writes a bad one.
+/// One type for both syntaxes, and never a document without its report: what
+/// the target could not carry is in [`entries`](Self::entries).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Written {
+    /// The document.
+    pub xml: String,
+    /// What the target syntax could not carry ([`Kind::Dropped`]), what CEN's
+    /// syntax rules forbid it to ([`Kind::Prohibited`]), and what the writer
+    /// had to derive ([`Kind::Derived`]). Empty for an ordinary invoice.
+    pub entries: Vec<Entry>,
+}
+
+/// A model the target syntax's schema has no form for, so nothing was written.
 ///
-/// # The prologue is skipped properly, not by shape
+/// UBL 2.1 requires `cbc:ID`, `cbc:IssueDate`, both parties and a line; D16B
+/// requires `ram:ID` and `ram:IssueDateTime`. A model without them would be a
+/// document every receiver's schema check rejects, and the writer will not
+/// emit one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "not written: the target schema has no form for this model ({})",
+    self.entries
+        .iter()
+        .filter(|e| e.kind == Kind::Schema)
+        .map(|e| e.term.clone().unwrap_or_else(|| e.path.clone()))
+        .collect::<Vec<_>>()
+        .join(", ")
+)]
+pub struct Unwritable {
+    /// Every entry the writer produced, the [`Kind::Schema`] ones among them.
+    pub entries: Vec<Entry>,
+}
+
+/// Whether [`convert`] may lose content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loss {
+    /// Refuse a conversion that would lose anything, naming what.
+    Refuse,
+    /// Convert, and list what was lost.
+    Allow,
+}
+
+/// A conversion.
+#[derive(Debug, Clone)]
+pub struct Converted {
+    /// The document in the target syntax.
+    pub document: String,
+    /// The source document as received under its declared profile — so a
+    /// conversion of an invalid invoice says so.
+    pub report: report::Report,
+    /// Everything the writer said, [`Kind::Derived`] included.
+    pub written: Vec<Entry>,
+    /// What did not reach the target: source content the reader could not map
+    /// or hold, and terms the target could not or may not carry.
+    pub lost: Vec<Entry>,
+}
+
+/// Why a conversion produced nothing.
+#[derive(Debug, thiserror::Error)]
+pub enum ConvertError {
+    /// The source could not be read.
+    #[error(transparent)]
+    Read(#[from] Error),
+    /// The conversion would lose content, and [`Loss::Refuse`] was asked for.
+    #[error(
+        "not converted: {} item(s) would be lost — {}",
+        lost.len(),
+        lost.iter().map(|e| e.path.as_str()).collect::<Vec<_>>().join(", ")
+    )]
+    Lossy {
+        /// What would be lost.
+        lost: Vec<Entry>,
+    },
+    /// The target syntax's schema has no form for the model.
+    #[error(transparent)]
+    Unwritable(#[from] Unwritable),
+}
+
+/// Anything that stopped a document being read at all.
 ///
-/// Splitting on `<` and taking the first piece that begins with neither `?` nor
-/// `!` reads a comment's *contents* as markup, so a document opening with
+/// Which variants exist depends on the enabled features.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    /// An encoding an XML reader need not accept, declared or detected — named.
+    #[error(
+        "the document is encoded as {found}; EN 16931 XML must be UTF-8, or UTF-16 with a \
+         byte-order mark"
+    )]
+    Encoding {
+        /// The declared encoding, or what the bytes failed to be.
+        found: String,
+    },
+    /// The text is not well-formed XML.
+    #[error("not well-formed XML at line {line}, column {column}: {message}")]
+    Xml {
+        /// The parser's message.
+        message: String,
+        /// 1-based line.
+        line: u32,
+        /// 1-based column.
+        column: u32,
+    },
+    /// Nested deeper than [`MAX_DEPTH`], refused before parsing: the XML
+    /// parser recurses per level, and a stack overflow aborts the process.
+    #[error(
+        "nested {depth} elements deep, and the limit is {limit}. A document this deep is \
+         not an invoice; it is a denial of service, and the XML parser would abort the \
+         process rather than fail."
+    )]
+    TooDeep {
+        /// How deep the document actually goes.
+        depth: usize,
+        /// The limit.
+        limit: usize,
+    },
+    /// Well-formed, and not an invoice: the document element is neither UBL's
+    /// nor CII's.
+    #[error(
+        "expected a UBL <Invoice> or <CreditNote>, a CII <CrossIndustryInvoice>, or a PDF; \
+         found <{found}>"
+    )]
+    NotAnInvoice {
+        /// The document element found.
+        found: String,
+    },
+    /// A document this build cannot read: the feature that would is off.
+    #[error("{found}, and this build has no `{feature}` feature")]
+    Unsupported {
+        /// What the bytes are — `"a PDF"`, `"a CII document"`.
+        found: &'static str,
+        /// The feature that reads it.
+        feature: &'static str,
+    },
+    /// A hybrid PDF that could not be read.
+    #[cfg(feature = "zugferd")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "zugferd")))]
+    #[error(transparent)]
+    Pdf(#[from] zugferd::Error),
+}
+
+/// Read a UBL or CII document, or a ZUGFeRD / Factur-X PDF, from its bytes.
 ///
-/// ```xml
-/// <!-- exported from <ERP> 4.2 -->
-/// <Invoice …>
+/// The syntax is the document's own: a PDF signature, else the document
+/// element. Duplicated single-occurrence elements are cut before the model is
+/// read and reported as [`Kind::Duplicate`] entries; everything else the
+/// reader could not map or hold is an entry too.
+///
+/// A PDF is read under [`zugferd::Limits::default`]; [`read_with`] reads it
+/// under the caller's limits, [`receive`] under its [`Policy`]'s.
+///
+/// ```
+/// # #[cfg(feature = "ubl")] {
+/// let xml = br#"<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
+///   xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+///   <cbc:ID>INV-1</cbc:ID><cbc:ID>FORGED</cbc:ID></Invoice>"#;
+/// let read = en16931_formats::read(xml).expect("readable");
+/// assert_eq!(read.invoice.number.as_deref(), Some("INV-1"));
+/// let dup = read.entries_of(en16931_formats::report::Kind::Duplicate).next().expect("reported");
+/// assert_eq!(dup.value.as_deref(), Some("FORGED"));
+/// # }
 /// ```
 ///
-/// would sniff as `ERP` and come back `None`, for a perfectly ordinary UBL
-/// invoice. A comment, a processing instruction and a doctype each have their own
-/// terminator, so each is skipped by its own.
-#[must_use]
-pub fn sniff(xml: &str) -> Option<Syntax> {
-    let mut rest = xml;
-    let name = loop {
-        rest = &rest[rest.find('<')? + 1..];
-        if let Some(body) = rest.strip_prefix("!--") {
-            // A comment may contain anything at all, `<` included.
-            rest = &body[body.find("-->")? + 3..];
-        } else if rest.starts_with('?') {
-            rest = &rest[rest.find("?>")? + 2..];
-        } else if rest.starts_with('!') {
-            // `<!DOCTYPE …>`. An internal subset re-enters this loop on its own
-            // `<!ENTITY …>` declarations and falls out at the real root.
-            rest = &rest[rest.find('>')? + 1..];
-        } else {
-            break rest
-                .split([' ', '>', '\t', '\n', '\r', '/'])
-                .next()?
-                .rsplit(':')
-                .next()?;
+/// # Errors
+///
+/// [`Error`]: the bytes are not an invoice this build reads — the encoding,
+/// the XML, the depth, the document element, or the PDF says why.
+#[cfg(any(feature = "ubl", feature = "cii"))]
+pub fn read(bytes: &[u8]) -> Result<Read, Error> {
+    #[cfg(feature = "zugferd")]
+    {
+        read_with(bytes, &zugferd::Limits::default())
+    }
+    #[cfg(not(feature = "zugferd"))]
+    {
+        if bytes.starts_with(b"%PDF") {
+            return Err(Error::Unsupported {
+                found: "a PDF",
+                feature: "zugferd",
+            });
+        }
+        read_xml(bytes)
+    }
+}
+
+/// [`read`], with the limits a PDF is extracted under. An XML document is read
+/// as [`read`] reads it.
+///
+/// ```no_run
+/// use en16931_formats::zugferd::Limits;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let pdf = std::fs::read("invoice.pdf")?;
+/// let read = en16931_formats::read_with(&pdf, &Limits::new().with_max_stream_bytes(20 << 20))?;
+/// # Ok(()) }
+/// ```
+///
+/// # Errors
+///
+/// As [`read`]; a PDF beyond `limits` is [`Error::Pdf`] with
+/// [`zugferd::Error::LimitExceeded`] or [`zugferd::Error::EmbeddedFilesTree`].
+#[cfg(feature = "zugferd")]
+#[cfg_attr(docsrs, doc(cfg(feature = "zugferd")))]
+pub fn read_with(bytes: &[u8], limits: &zugferd::Limits) -> Result<Read, Error> {
+    if bytes.starts_with(b"%PDF") {
+        let got = zugferd::extract(bytes, limits)?;
+        let mut read = read_xml(&got.xml)?;
+        read.pdf = Some(got);
+        return Ok(read);
+    }
+    read_xml(bytes)
+}
+
+/// Read an XML document: decode, parse, find and cut duplicates, read.
+#[cfg(any(feature = "ubl", feature = "cii"))]
+fn read_xml(bytes: &[u8]) -> Result<Read, Error> {
+    let text = xml::decode(bytes)?;
+    let doc = xml::parse(&text)?;
+    let root = doc.root_element();
+    // By local name **and** namespace: an `<Invoice>` in some other vocabulary
+    // is not a UBL invoice, and reading it as one yields a silently empty model.
+    let expected_ns = match xml::name(root) {
+        "Invoice" => Some("urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"),
+        "CreditNote" => Some("urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2"),
+        "CrossIndustryInvoice" => {
+            Some("urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100")
+        }
+        _ => None,
+    };
+    if let Some(ns) = expected_ns
+        && root.tag_name().namespace() != Some(ns)
+    {
+        return Err(Error::NotAnInvoice {
+            found: format!(
+                "{} in namespace {:?}",
+                xml::name(root),
+                root.tag_name().namespace().unwrap_or("")
+            ),
+        });
+    }
+    let syntax = match xml::name(root) {
+        #[cfg(feature = "ubl")]
+        "Invoice" | "CreditNote" => Syntax::Ubl,
+        #[cfg(not(feature = "ubl"))]
+        "Invoice" | "CreditNote" => {
+            return Err(Error::Unsupported {
+                found: "a UBL document",
+                feature: "ubl",
+            });
+        }
+        #[cfg(feature = "cii")]
+        "CrossIndustryInvoice" => Syntax::Cii,
+        #[cfg(not(feature = "cii"))]
+        "CrossIndustryInvoice" => {
+            return Err(Error::Unsupported {
+                found: "a CII document",
+                feature: "cii",
+            });
+        }
+        other => {
+            return Err(Error::NotAnInvoice {
+                found: other.to_owned(),
+            });
         }
     };
-    match name {
-        "Invoice" | "CreditNote" => Some(Syntax::Ubl),
-        "CrossIndustryInvoice" => Some(Syntax::Cii),
-        _ => None,
+    let (once, schema) = match syntax {
+        #[cfg(feature = "ubl")]
+        Syntax::Ubl => (ubl::once_table(), "the UBL 2.1 schema"),
+        #[cfg(feature = "cii")]
+        Syntax::Cii => (cii::once_table(), "the D16B schema"),
+    };
+    let duplicates = xml::duplicates(&doc, once);
+    let mut entries: Vec<Entry> = duplicates
+        .iter()
+        .map(|d| xml::duplicate_entry(d, schema))
+        .collect();
+    let cleaned;
+    let reparsed;
+    let root = if duplicates.is_empty() {
+        doc.root_element()
+    } else {
+        cleaned = xml::without(&text, &duplicates);
+        reparsed = xml::parse(&cleaned)?;
+        reparsed.root_element()
+    };
+    let invoice = match syntax {
+        #[cfg(feature = "ubl")]
+        Syntax::Ubl => {
+            let mut r = ubl::read::Reader::default();
+            let invoice = r.read(root);
+            entries.extend(r.finish());
+            invoice
+        }
+        #[cfg(feature = "cii")]
+        Syntax::Cii => {
+            let mut r = cii::read::Reader::default();
+            let invoice = r.read(root);
+            entries.extend(r.finish());
+            invoice
+        }
+    };
+    Ok(Read {
+        invoice,
+        syntax,
+        entries,
+        #[cfg(feature = "zugferd")]
+        pdf: None,
+    })
+}
+
+/// Write a **validated** invoice, stamping BT-24 from the profile it proved.
+///
+/// The proof makes an unvalidated invoice unwritable here, and BT-24 always
+/// names the profile whose rules ran.
+///
+/// A profile that declares extension groups (the XRechnung Extension) has them
+/// written; for any other, they are reported as [`Kind::Prohibited`].
+///
+/// ```
+/// use en16931::profiles::XRechnung;
+/// use en16931::validation::profile::Validated;
+///
+/// # fn demo(inv: en16931::Invoice) {
+/// let Ok(proof) = Validated::<XRechnung>::new(inv) else { return };
+/// let out = en16931_formats::write(&proof, en16931_formats::Syntax::Ubl);
+/// assert!(out.xml.contains("xrechnung_3.0"));
+/// # }
+/// ```
+#[cfg(any(feature = "ubl", feature = "cii"))]
+#[must_use]
+pub fn write<P: ProfileMarker>(validated: &Validated<P>, syntax: Syntax) -> Written {
+    let mut invoice = validated.invoice().clone();
+    invoice.specification_id = Some(P::PROFILE.specification_id.to_owned());
+    let written = write_model(&invoice, syntax, P::PROFILE);
+    debug_assert!(
+        !written.entries.iter().any(|e| e.kind == Kind::Schema),
+        "a proof carries every element the schemas require: {:?}",
+        written.entries
+    );
+    written
+}
+
+/// Write a model nobody validated — a document you did not author, on its way
+/// to another syntax.
+///
+/// BT-24 is written as the model carries it, and extension groups are written
+/// when the profile it declares defines them. Everything the target could not
+/// carry is in [`Written::entries`].
+///
+/// # Errors
+///
+/// [`Unwritable`] when the target syntax's schema has no form for the model —
+/// no BT-1, no BT-2, and for UBL no seller, buyer or line. No public function
+/// emits a document its schema rejects.
+#[cfg(any(feature = "ubl", feature = "cii"))]
+pub fn write_unchecked(invoice: &Invoice, syntax: Syntax) -> Result<Written, Unwritable> {
+    let profile = en16931::profiles::classify(invoice.specification_id.as_deref())
+        .profile()
+        .unwrap_or(&en16931::profiles::EN16931);
+    let written = write_model(invoice, syntax, profile);
+    if written.entries.iter().any(|e| e.kind == Kind::Schema) {
+        return Err(Unwritable {
+            entries: written.entries,
+        });
     }
+    Ok(written)
+}
+
+#[cfg(any(feature = "ubl", feature = "cii"))]
+#[cfg_attr(not(feature = "ubl"), allow(unused_variables))]
+fn write_model(invoice: &Invoice, syntax: Syntax, profile: &'static en16931::Profile) -> Written {
+    match syntax {
+        #[cfg(feature = "ubl")]
+        Syntax::Ubl => ubl::write::write(invoice, ubl::waivers(profile)),
+        #[cfg(feature = "cii")]
+        Syntax::Cii => cii::write::write(invoice),
+    }
+}
+
+/// Convert a document to another syntax, in one call.
+///
+/// Read, write in `to`, and report: the result carries the document, the
+/// source's report as declared, and **what was lost** — source content the
+/// reader could not map or hold, and terms the target cannot or may not carry.
+/// With [`Loss::Refuse`], any loss refuses the conversion and names it.
+///
+/// Validity is not a refusal: an invoice that breaks its profile's rules is
+/// converted, and [`Converted::report`] says what it breaks.
+///
+/// # Errors
+///
+/// [`ConvertError::Read`] when the source cannot be read;
+/// [`ConvertError::Lossy`] when something would be lost and `loss` is
+/// [`Loss::Refuse`]; [`ConvertError::Unwritable`] when the target schema has
+/// no form for the model.
+#[cfg(any(feature = "ubl", feature = "cii"))]
+pub fn convert(bytes: &[u8], to: Syntax, loss: Loss) -> Result<Converted, ConvertError> {
+    let read = read(bytes)?;
+    let written = write_unchecked(&read.invoice, to)?;
+    let lost_entries: Vec<Entry> = read
+        .entries
+        .iter()
+        .chain(&written.entries)
+        .filter(|e| e.is_loss())
+        .cloned()
+        .collect();
+    if loss == Loss::Refuse && !lost_entries.is_empty() {
+        return Err(ConvertError::Lossy { lost: lost_entries });
+    }
+    let report = receive::assess(Ok(read), &Policy::default()).report_declared;
+    Ok(Converted {
+        document: written.xml,
+        report,
+        written: written.entries,
+        lost: lost_entries,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn sniff_distinguishes_the_syntaxes() {
-        assert_eq!(
-            sniff("<?xml version=\"1.0\"?><Invoice xmlns=\"x\">"),
-            Some(Syntax::Ubl)
-        );
-        assert_eq!(sniff("<CreditNote>"), Some(Syntax::Ubl));
-        assert_eq!(sniff("<rsm:CrossIndustryInvoice>"), Some(Syntax::Cii));
-        assert_eq!(sniff("<html>"), None);
-        assert_eq!(sniff(""), None);
-    }
-
-    /// A prologue or comment before the root must not be mistaken for it.
-    #[test]
-    fn sniff_skips_the_prologue() {
-        assert_eq!(
-            sniff("<?xml?>\n<!-- a note -->\n<Invoice>"),
-            Some(Syntax::Ubl)
-        );
-    }
-
-    /// A comment's *contents* are not markup, however much they look like it.
-    ///
-    /// Real exporters write their own name in a banner comment, and one of them
-    /// writing it in angle brackets made a perfectly ordinary UBL invoice sniff
-    /// as "not an e-invoice".
-    #[test]
-    fn sniff_is_not_fooled_by_markup_inside_a_comment() {
-        assert_eq!(
-            sniff("<!-- exported from <ERP> 4.2 -->\n<Invoice/>"),
-            Some(Syntax::Ubl)
-        );
-        assert_eq!(
-            sniff("<!--<CrossIndustryInvoice>--><Invoice/>"),
-            Some(Syntax::Ubl),
-            "the comment names the other syntax; the document is still UBL"
-        );
-        assert_eq!(
-            sniff("<?xml version=\"1.0\"?><!DOCTYPE Invoice><rsm:CrossIndustryInvoice>"),
-            Some(Syntax::Cii)
-        );
-        // An unterminated comment has no document element to find.
-        assert_eq!(sniff("<!-- never closed <Invoice>"), None);
-    }
-
-    /// The notice travels with the crate, and is not a second copy that can rot.
     #[test]
     fn the_attribution_is_en16931s() {
         assert_eq!(ATTRIBUTION, en16931::ATTRIBUTION);

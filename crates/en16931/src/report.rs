@@ -1,56 +1,10 @@
-//! A **stable interchange shape** for a [`ValidationReport`].
+//! A stable interchange shape for a [`ValidationReport`].
 //!
-//! # Why a second representation
-//!
-//! `ValidationReport` derives `Serialize`, so it already has *a* JSON form. That
-//! form is the crate's internal layout, and it changes whenever the internals
-//! do — `profile` and `edition` were added to it in the same breath as this
-//! module. Anything that persists reports, diffs them across releases, or feeds
-//! them to a non-Rust consumer needs a shape that is allowed to be boring.
-//!
-//! So [`Report`] is a separate type with a [`SCHEMA`] version string, and the
-//! rule is simple: **the internal layout may change freely; this one may not,
-//! except by bumping `SCHEMA`.**
-//!
-//! # Designed against SVRL, not invented
-//!
-//! Every Schematron tool in this field — phive, Mustangproject, the KoSIT
-//! validator — emits SVRL, whose `failed-assert` carries exactly four things:
-//!
-//! ```xml
-//! <svrl:failed-assert id="BR-52" flag="fatal" location="/ubl:Invoice/cac:…">
-//!   <svrl:text>[BR-52]-Each Additional supporting document …</svrl:text>
-//! </svrl:failed-assert>
-//! ```
-//!
-//! `id`, `flag`, `location`, `text`. [`Finding`] maps one-to-one onto those, so
-//! an `en16931-svrl` crate is a rename rather than a translation — which is the
-//! point of [`crate::validation`] doing the deciding and something else owning
-//! the XML.
-//!
-//! **One field deliberately differs.** SVRL's `location` is an XPath into a
-//! serialised document. This crate has no document, and its `location` is a
-//! business-term path — `BG-25[2]/BT-151`. That is the whole reason the crate
-//! exists ([§1](https://docs.rs/en16931)), and a format crate that *does* hold
-//! the XML can map a BT path to an XPath. The reverse is lossy, so the semantic
-//! form is the one worth storing.
-//!
-//! # Why the string fields are `Cow`
-//!
-//! They were `&'static str`, which made the type **impossible to deserialise**:
-//! `serde` would have needed JSON that outlives the program. A shape whose
-//! stated purpose is "persist reports and read them back" that cannot be read
-//! back is not a shape, and `derive(Deserialize)` compiled anyway because the
-//! impl is only unusable at the call site.
-//!
-//! `Cow<'static, str>` costs nothing on the way out — every value comes from a
-//! constant, so it borrows — and deserialises into owned data on the way in.
-//!
-//! # The notice travels with it
-//!
-//! [`Report::attribution`] carries the CEN notice, because the licence condition
-//! is that it is visible to users — and a report handed to another system is
-//! exactly a place where the crate's own `Display` is not what anyone reads.
+//! [`Report`] is versioned by [`SCHEMA`], independently of the internal
+//! `Serialize` layout of `ValidationReport`. Its [`Entry`] mirrors SVRL's
+//! `failed-assert` (`id`, `flag`, `location`, `text`), except that `location` is
+//! a business-term path such as `BG-25[2]/BT-151` rather than an XPath.
+//! [`Report::attribution`] carries the CEN notice, which must stay visible to users.
 
 use std::borrow::Cow;
 
@@ -58,24 +12,13 @@ use crate::validation::{Finding, Severity, Source, ValidationReport};
 
 /// The interchange schema this module emits.
 ///
-/// Bump it — do not reshape [`Report`] silently — when a field changes meaning
-/// or disappears. Consumers are expected to reject a version they do not know.
-///
-/// **Every version here was earned.** `/1` shipped in `en16931` 0.1.0 without
-/// [`Entry::hint`]; `/2` added it; `/3` adds [`Report::artefacts`]. Each is an
-/// *additive* change that a previous reader would survive by ignoring an
-/// unknown key — and the version moved every time anyway, because a consumer is
-/// entitled to reject a version it did not agree to, which is only meaningful
-/// if additions are visible.
-///
-/// Not frozen until 1.0: the promise before then is that it changes
-/// deliberately and visibly, not that it has stopped changing.
-pub const SCHEMA: &str = "en16931-report/3";
+/// Any change to [`Report`]'s fields, including an addition, bumps it.
+/// Consumers should reject a version they do not know.
+pub const SCHEMA: &str = "en16931-report/4";
 
 /// A validation report in a shape safe to store, diff and send elsewhere.
 ///
-/// See the [module documentation](self) for why this is not simply
-/// `serde_json::to_string(&report)`.
+/// See the [module documentation](self).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,31 +33,118 @@ pub struct Report {
     pub edition: Cow<'static, str>,
     /// How many rules ran — SVRL's `fired-rule` count, in effect.
     pub rules_checked: usize,
-    /// The CEN attribution notice. A licence condition, not metadata.
+    /// The CEN attribution notice, required by the licence.
     pub attribution: Cow<'static, str>,
     /// The authority releases the rules that ran were verified against.
     ///
-    /// One entry per authority, because a profile's rules come from more than
-    /// one: an XRechnung report's `BR-*` are CEN's, its `BR-DE-*` are KoSIT's
-    /// Schematron release, its severities are KoSIT's *validator configuration*
-    /// release — a separate cadence — and 31 of its rules are OpenPeppol's. A
-    /// stored report naming only the CEN revision beside a `BR-DE-15` finding
-    /// is citing the wrong authority.
+    /// One entry per authority release (for XRechnung: CEN, KoSIT's Schematron,
+    /// KoSIT's validator configuration and OpenPeppol).
     pub artefacts: Vec<Artefact>,
-    /// Rules the caller asked to skip, and which were therefore **not checked**.
-    ///
-    /// Empty on an ordinary run. Non-empty means `valid` is a weaker claim than
-    /// it looks, and a consumer that ignores this field is reading the report
-    /// wrong — which is why it is not optional and not omitted when empty.
+    /// Rules the caller asked to skip, which were not checked. Always present;
+    /// non-empty means `valid` is a weaker claim.
     pub suppressed: Vec<String>,
+    /// Rules reported at another severity than the authority publishes.
+    pub relevelled: Vec<Relevelled>,
+    /// Core rules the profile does not run — non-empty only for a totals-only
+    /// profile (ZUGFeRD MINIMUM, BASIC WL).
+    pub left_out: Vec<String>,
+    /// Where the document came from — a file name — when the caller knows.
+    pub source: Option<String>,
+    /// Which document: seller, number, issue date. `None` for a report on a
+    /// model that no document carried.
+    pub identity: Option<Identity>,
+    /// What the document's BT-24 declares, as classified — `XRechnung 3.0`, or
+    /// `unknown specification identifier "…"`. `None` when no document was read.
+    pub declaration: Option<String>,
+    /// For a received document: `accept`, `reject` or `undefined`.
+    pub recommendation: Option<Cow<'static, str>>,
+    /// Why, one line per cause. Empty for `accept`.
+    pub reasons: Vec<String>,
+    /// The layers a document passed through — container, syntax, schema,
+    /// semantic — in that order. Empty for a report on a bare model, where
+    /// there was no document.
+    pub layers: Vec<Layer>,
+    /// The same document under the profile the receiver requires, when that is
+    /// not the declared one.
+    pub required: Option<Box<Report>>,
     /// One entry per finding, most severe first.
     pub findings: Vec<Entry>,
 }
 
+/// A rule reported at another severity than its authority publishes.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relevelled {
+    /// The rule id.
+    pub rule: String,
+    /// The severity it was reported at: `fatal`, `warning` or `information`.
+    pub severity: Cow<'static, str>,
+}
+
+/// Which document a report is about.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Identity {
+    /// BT-27, the seller's name.
+    pub seller: Option<String>,
+    /// BT-1, the invoice number.
+    pub number: Option<String>,
+    /// BT-2, the issue date, `YYYY-MM-DD`.
+    pub issue_date: Option<String>,
+}
+
+/// One layer a document passed through.
+///
+/// Syntax-neutral: entries carry the binding's own syntax path and `kind`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer {
+    /// `container`, `syntax`, `schema` or `semantic`.
+    pub name: Cow<'static, str>,
+    /// `valid`, `invalid` or `skipped`.
+    pub validity: Cow<'static, str>,
+    /// Why the layer was skipped. `None` unless `validity` is `skipped`.
+    pub reason: Option<String>,
+    /// What the layer has to say about the document, in document order. The
+    /// semantic layer's verdicts are [`Report::findings`], not entries.
+    pub entries: Vec<DocumentEntry>,
+}
+
+/// One thing a reader, the container or a writer had to say about a document.
+///
+/// Not a finding: it carries a syntax path, may cite an artefact rule, and is
+/// never counted as a failed rule.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentEntry {
+    /// What happened — `unmapped`, `malformed`, `duplicate`, `repeated`,
+    /// `schema`, `unreadable`, `container`, `ambiguous`, `dropped`,
+    /// `prohibited`, `derived`.
+    pub kind: String,
+    /// `fatal`, `warning` or `information`. A fatal entry makes its layer
+    /// invalid.
+    pub level: Cow<'static, str>,
+    /// Where, as a syntax path.
+    pub path: String,
+    /// The business term, when the binding knows it.
+    pub term: Option<String>,
+    /// The value as the document carries it.
+    pub value: Option<String>,
+    /// The artefact rule the entry cites — never a registry rule id.
+    pub rule: Option<String>,
+    /// The binding's statement of what happened.
+    pub message: String,
+    /// What to do about it, where known.
+    pub hint: Option<String>,
+}
+
 /// One authority release a report's rules were verified against.
 ///
-/// Owned `String`s, unlike the `&'static str` the profile carries: a report is
-/// read back from storage, and a borrowed field cannot come out of a buffer.
+/// Owned, so a stored report can be deserialised.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,8 +166,7 @@ pub struct Entry {
     pub rule: String,
     /// SVRL's `@flag`: `fatal`, `warning` or `information`.
     pub severity: Cow<'static, str>,
-    /// Where the rule came from — this crate's addition, and the thing that
-    /// tells a reader whether an id is CEN's, a profile's, or ours.
+    /// Where the rule came from: CEN, a profile, or this crate. Not in SVRL.
     pub source: Cow<'static, str>,
     /// A **business-term** path, `BG-25[2]/BT-151`, where SVRL puts an XPath.
     pub location: String,
@@ -147,15 +176,14 @@ pub struct Entry {
     pub expected: Option<String>,
     /// For arithmetic rules: what the document states.
     pub actual: Option<String>,
-    /// What to do about it — this crate's addition, kept **out of** `text`.
-    ///
-    /// SVRL has no field for this, and that is the point: `text` must stay the
-    /// authority's wording so a finding looks up in CEN's or KoSIT's index. A
-    /// consumer that does not know this field ignores it and loses nothing.
+    /// What to do about it. Not in SVRL; kept out of `text`, which stays the
+    /// authority's wording.
     pub hint: Option<String>,
 }
 
-const fn severity_name(s: Severity) -> &'static str {
+/// The interchange word for a severity: `fatal`, `warning`, `information`.
+#[must_use]
+pub const fn severity_name(s: Severity) -> &'static str {
     match s {
         Severity::Fatal => "fatal",
         Severity::Warning => "warning",
@@ -193,7 +221,53 @@ impl Report {
                 })
                 .collect(),
             suppressed: report.suppressed().to_vec(),
+            relevelled: report
+                .relevelled()
+                .iter()
+                .map(|(rule, level)| Relevelled {
+                    rule: rule.clone(),
+                    severity: Cow::Borrowed(severity_name(*level)),
+                })
+                .collect(),
+            left_out: Vec::new(),
+            source: None,
+            identity: None,
+            declaration: None,
+            recommendation: None,
+            reasons: Vec::new(),
+            layers: Vec::new(),
+            required: None,
             findings: report.findings().iter().map(Entry::of).collect(),
+        }
+    }
+}
+
+impl Report {
+    /// A report on which no rule set ran — a document that could not be read.
+    ///
+    /// Not valid, no profile, nothing checked; a caller fills
+    /// [`layers`](Self::layers) with what refused the document.
+    #[must_use]
+    pub fn unchecked() -> Self {
+        Self {
+            schema: Cow::Borrowed(SCHEMA),
+            valid: false,
+            profile: None,
+            edition: Cow::Borrowed(crate::Edition::En2017A1.designation()),
+            rules_checked: 0,
+            attribution: Cow::Borrowed(crate::ATTRIBUTION),
+            artefacts: Vec::new(),
+            suppressed: Vec::new(),
+            relevelled: Vec::new(),
+            left_out: Vec::new(),
+            source: None,
+            identity: None,
+            declaration: None,
+            recommendation: None,
+            reasons: Vec::new(),
+            layers: Vec::new(),
+            required: None,
+            findings: Vec::new(),
         }
     }
 }
@@ -202,11 +276,7 @@ impl Entry {
     /// Convert one finding.
     #[must_use]
     pub fn of(f: &Finding) -> Self {
-        // The rule's provenance is not on the `Finding` — it is on the rule — so
-        // it is looked up. An id that resolves to nothing is a restriction,
-        // which is always a profile's own.
-        // A rule id that resolves to nothing is a profile restriction, which is
-        // always the profile's own.
+        // An id that resolves to no rule is a profile restriction.
         let source =
             crate::validation::rules::explain(&f.rule).map_or("profile", |r| source_name(r.source));
         Self {
@@ -260,10 +330,7 @@ mod tests {
         assert_eq!(out.edition, "EN 16931-1:2017+A1:2019");
     }
 
-    /// A deviated run says so in the interchange shape too.
-    ///
-    /// The whole point of recording suppressions is that they survive being
-    /// written down and read back somewhere else.
+    /// Suppressions appear in the interchange shape.
     #[test]
     fn suppressions_travel_with_the_report() {
         let report = crate::validation::Check::new(&profiles::EN16931)
@@ -276,12 +343,7 @@ mod tests {
         assert!(clean.suppressed.is_empty());
     }
 
-    /// The shape can be **read back**, which is the whole reason it exists.
-    ///
-    /// The fields were `&'static str`, so `derive(Deserialize)` compiled and
-    /// produced an impl no caller could use: deserialising needed JSON that
-    /// outlived the program. Nothing caught it because no test ever read one
-    /// back — the type was only ever serialised.
+    /// The shape round-trips through JSON.
     #[cfg(feature = "serde")]
     #[test]
     fn a_report_survives_a_round_trip_through_json() {

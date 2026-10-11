@@ -1,0 +1,11 @@
+# Mutants that survive the test suite, and why each one is allowed to.
+#
+# No full sweep has been run against this baseline yet. It is empty: pull
+# requests are mutated on their changed lines in CI (`just mutants-diff-gate`)
+# and fail on any survivor not recorded here; the full sweep of the rules
+# (`just mutants`, or the `mutants-full` workflow) is manual, optional and slow.
+#
+# One entry per line: `survivor  # reason` (two spaces, `#`, the reason). Every
+# entry must carry a reason; the check fails on one that does not. Survivors are
+# killed by a test where one can be written, and recorded only when equivalent.
+# `:LINE:COL` is stripped before comparison, so ordinary edits do not churn this file.

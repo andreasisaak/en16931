@@ -1,30 +1,9 @@
-//! The artefact revision is pinned in three places. They have to agree.
+//! Artefact pins, versions and source lists that are repeated across the
+//! workspace must agree: `xtask`'s fetch pins, [`en16931::ARTEFACT_VERSION`],
+//! generated-table headers, profile provenance and the published pin table.
 //!
-//! # This test is the reason the two crates share a repository
-//!
-//! `xtask` fetches the CEN artefacts at a pinned tag. `en16931` publishes that
-//! tag as [`en16931::ARTEFACT_VERSION`], so a bug report can say which rule text
-//! was in force. The generated code lists stamp it into their own header. Three
-//! copies of one string, and nothing compared them.
-//!
-//! Both crates' `fetch.rs` *claimed* they were compared — `"Must equal
-//! `en16931::ARTEFACT_VERSION`, which `tests/attribution.rs` in that crate pins
-//! to the same string"` — and no such assertion existed in either repository.
-//! It could not have: while `en16931-formats` was a separate repository, its
-//! `CEN_REF` and this crate's `ARTEFACT_VERSION` were in different Cargo graphs,
-//! different CI runs and different clones. A comment asking a human to keep two
-//! constants equal is not a check, and this one shipped in both crates' 0.1.0
-//! releases asserting a test that did not exist.
-//!
-//! In one workspace it is four lines of `read_to_string`.
-//!
-//! # Why it reads source rather than importing
-//!
-//! `xtask` is `publish = false` and is deliberately *not* a dependency of either
-//! library — its `roxmltree` must never reach a consumer's graph. So the pin is
-//! read out of the file as text. That is uglier than an import and it is the
-//! only form that does not put an XML parser in the dependency tree of a crate
-//! whose whole claim is that it has none.
+//! `xtask` is not a dependency (its XML parser must stay out of the library's
+//! graph), so its sources are read as text.
 
 use std::path::{Path, PathBuf};
 
@@ -45,36 +24,70 @@ fn const_str(source: &str, name: &str) -> Option<String> {
     Some(source[open..close].to_owned())
 }
 
+/// The string literals of a `const NAME: &[&str] = &[ … ];` in a Rust source.
+fn const_list(source: &str, name: &str) -> Option<Vec<String>> {
+    let decl = source.find(&format!("{name}: &[&str]"))?;
+    let open = source[decl..].find("= &[")? + decl;
+    let close = source[open..].find("];")? + open;
+    Some(
+        source[open..close]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// Every git source `fetch.rs` fetches (its `REPOS`, not the repositories it
+/// only watches), as `(owner/repo, ref)`: the repository from its `url`, the ref
+/// from the constant its `reference` names.
+fn fetched_pairs(fetch: &str) -> Vec<(String, String)> {
+    let repos = fetch
+        .split_once("static REPOS: &[Repo] = &[")
+        .and_then(|(_, rest)| rest.split_once("\n];"))
+        .map(|(repos, _)| repos)
+        .expect("fetch.rs declares REPOS");
+    let consts = [
+        "CEN_REF",
+        "PEPPOL_REF",
+        "KOSIT_SCHEMATRON_REF",
+        "KOSIT_CONFIG_REF",
+        "ZUGFERD_CORPUS_REF",
+    ];
+    let mut out = Vec::new();
+    for block in repos.split("Repo {").skip(1) {
+        let block = block.split("purpose:").next().unwrap_or(block);
+        let Some(slug) = block
+            .split_once("url: \"https://github.com/")
+            .and_then(|(_, rest)| rest.split_once(".git\""))
+            .map(|(slug, _)| slug.to_owned())
+        else {
+            continue;
+        };
+        let reference = block.split_once("reference:").map_or("", |(_, r)| r);
+        let name = consts
+            .iter()
+            .find(|c| {
+                reference
+                    .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                    .any(|w| w == **c)
+            })
+            .unwrap_or_else(|| panic!("{slug}: its reference names no known pin constant"));
+        let value = const_str(fetch, name).unwrap_or_else(|| panic!("fetch.rs defines {name}"));
+        out.push((slug, value));
+    }
+    out
+}
+
 fn read(rel: &str) -> String {
     let p = workspace_root().join(rel);
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
 }
 
-/// Every published member *inherits* its version rather than declaring one, and
-/// reaches its siblings through `[workspace.dependencies]`.
-///
-/// # What cargo already guarantees, and what it does not
-///
-/// The number appears in `[workspace.package] version` and once per internal
-/// edge in `[workspace.dependencies]`, because cargo has no `version.workspace`
-/// for a dependency requirement. Bumping only the first is **cargo's** error,
-/// not this test's:
-///
-/// ```text
-/// error: failed to select a version for the requirement `en16931 = "^0.2.0"`
-/// candidate versions found which didn't match: 0.3.0
-/// ```
-///
-/// What cargo does *not* notice is a member quietly going back to declaring its
-/// own `version = "…"`, or pinning a sibling at its own use site. Both resolve
-/// fine, build fine, and silently opt the crate out of the workspace bump —
-/// which is the whole mechanism. So this test asserts those two, and leaves the
-/// equality to the resolver.
-///
-/// Enumerated from `cargo metadata` rather than from a list: `en16931-cli` was
-/// added to the workspace with a hand-written `version = "0.2.0"` on its
-/// `en16931-formats` edge, and a hard-coded list of two members would not have
-/// noticed.
+/// Every workspace member (from `cargo metadata`) inherits its version and
+/// reaches siblings through `[workspace.dependencies]`, so a workspace bump
+/// cannot skip one. Version equality itself is left to the resolver.
 #[test]
 fn every_member_inherits_its_version() {
     let meta = std::process::Command::new(env!("CARGO"))
@@ -106,9 +119,7 @@ fn every_member_inherits_its_version() {
             "{path} declares its own version instead of inheriting \
              [workspace.package]"
         );
-        // An internal edge with a literal `path = "../…"` is one that bypassed
-        // `[workspace.dependencies]`, so the resolver never sees the version
-        // requirement that makes a bad bump fail.
+        // A `path = "../…"` edge bypasses `[workspace.dependencies]`.
         assert!(
             !manifest.contains("path = \"../"),
             "{path} reaches a sibling by path instead of through \
@@ -135,9 +146,7 @@ fn every_artefact_pin_in_the_workspace_agrees() {
         en16931::ARTEFACT_VERSION
     );
 
-    // The generator writes the revision into the file it produces, so a table
-    // regenerated against a different checkout than the one CI fetched is
-    // visible in the diff rather than only in someone's shell history.
+    // The generated tables name the revision they came from.
     let generated = read("crates/en16931/src/codes/generated.rs");
     assert!(
         generated.contains(&cen_ref),
@@ -145,8 +154,7 @@ fn every_artefact_pin_in_the_workspace_agrees() {
          it was generated from a different artefact revision"
     );
 
-    // The codegen module stamps the same constant into every table's `Source:`
-    // line. It is a third copy, so it is compared too.
+    // The codegen's `ARTEFACT` stamps every table's `Source:` line.
     let codes = read("xtask/src/codes.rs");
     let artefact =
         const_str(&codes, "ARTEFACT").expect("xtask/src/codes.rs declares `const ARTEFACT: &str`");
@@ -157,12 +165,7 @@ fn every_artefact_pin_in_the_workspace_agrees() {
     );
 }
 
-/// `en16931-formats`' generated tables come from the same fetch, so they cannot
-/// name a different revision either.
-///
-/// This is the assertion that was simply impossible to write before the merge:
-/// the two crates' tables were derived in separate repositories from separate
-/// `spec/` trees, and nothing anywhere compared them.
+/// `en16931-formats`' generated tables name the same revision.
 #[test]
 fn the_syntax_bindings_were_derived_from_the_same_artefacts() {
     let cen_ref = const_str(&read("xtask/src/fetch.rs"), "CEN_REF").expect("CEN_REF");
@@ -183,41 +186,27 @@ fn the_syntax_bindings_were_derived_from_the_same_artefacts() {
     }
 }
 
-/// Every release a profile claims to be verified against is one `xtask` fetches.
-///
-/// [`Profile::artefacts`] is the provenance line in every stored report, and it
-/// is a `&'static str` typed by hand — so nothing stops it naming a KoSIT tag
-/// that was never cloned, or drifting a release behind the pin the conformance
-/// suites actually ran on. Either way the report would cite a revision nobody
-/// checked, which is worse than citing none: it is a claim rather than a gap.
-///
-/// So the pins are read out of `xtask/src/fetch.rs` — the one place that
-/// decides what lands in `spec/` — and every profile's list has to be a subset.
-///
-/// The CEN entry gets a second assertion, because it has a second copy:
-/// [`en16931::ARTEFACT_VERSION`] is public API and is stamped into every
-/// generated table's provenance header.
+/// Every `(repo, ref)` in a profile's [`Profile::artefacts`] is one
+/// `xtask/src/fetch.rs` fetches, and `profiles::CEN` equals
+/// [`en16931::ARTEFACT_VERSION`].
 ///
 /// [`Profile::artefacts`]: en16931::validation::profile::Profile::artefacts
 #[test]
 fn every_declared_artefact_ref_is_one_xtask_fetches() {
     let fetch = read("xtask/src/fetch.rs");
-    let fetched: Vec<String> = [
-        "CEN_REF",
-        "PEPPOL_REF",
-        "KOSIT_SCHEMATRON_REF",
-        "KOSIT_CONFIG_REF",
-    ]
-    .iter()
-    .map(|name| {
-        const_str(&fetch, name).unwrap_or_else(|| panic!("xtask/src/fetch.rs defines {name}"))
-    })
-    .collect();
+    // Compare pairs, so one repository with another's ref fails.
+    let fetched = fetched_pairs(&fetch);
+    assert!(
+        fetched.len() >= 4,
+        "fetch.rs parsed to too few sources: {fetched:?}"
+    );
 
     for profile in en16931::profiles::ALL {
         for artefact in profile.artefacts {
             assert!(
-                fetched.iter().any(|r| r == artefact.git_ref),
+                fetched
+                    .iter()
+                    .any(|(repo, r)| repo == artefact.repo && r == artefact.git_ref),
                 "{} claims to be verified against {} {}, which `xtask fetch` \
                  never clones — the conformance suites cannot have run against \
                  it. Fetched: {fetched:?}",
@@ -228,7 +217,6 @@ fn every_declared_artefact_ref_is_one_xtask_fetches() {
         }
     }
 
-    // `CEN_REF` is the one with a public copy in the library.
     assert_eq!(
         en16931::profiles::CEN.git_ref,
         en16931::ARTEFACT_VERSION,
@@ -236,103 +224,143 @@ fn every_declared_artefact_ref_is_one_xtask_fetches() {
     );
 }
 
-// ── The skew nothing was watching ─────────────────────────────────────────────
+/// `fetch.rs`'s `ORDER_SOURCES` equals the formats tests' `AUTHORITY_SOURCES`.
+#[test]
+fn the_authority_source_lists_agree() {
+    let order = const_list(&read("xtask/src/fetch.rs"), "ORDER_SOURCES")
+        .expect("fetch.rs declares ORDER_SOURCES");
+    let suites = const_list(
+        &read("crates/en16931-formats/tests/common/mod.rs"),
+        "AUTHORITY_SOURCES",
+    )
+    .expect("the formats test support declares AUTHORITY_SOURCES");
+    assert!(!order.is_empty());
+    assert_eq!(order, suites, "ORDER_SOURCES and AUTHORITY_SOURCES differ");
+}
+
+/// The pin table on the site's conformance page names every pin `fetch.rs`
+/// holds, at its value.
+#[test]
+fn the_published_pin_tables_name_every_pin() {
+    let fetch = read("xtask/src/fetch.rs");
+    for page in ["site/content/docs/conformance.md"] {
+        if !workspace_root().join(page).exists() {
+            continue;
+        }
+        let text = read(page);
+        for name in [
+            "CEN_REF",
+            "PEPPOL_REF",
+            "KOSIT_SCHEMATRON_REF",
+            "KOSIT_CONFIG_REF",
+            "ZUGFERD_CORPUS_REF",
+            "UBL_SHA256",
+        ] {
+            let value =
+                const_str(&fetch, name).unwrap_or_else(|| panic!("fetch.rs defines {name}"));
+            assert!(
+                text.contains(&format!("`{value}`")),
+                "{page} does not state {name} = {value}"
+            );
+        }
+    }
+}
+
+// ── Every authority's CEN release ─────────────────────────────────────────────
 
 mod common;
 
-/// The CEN release **KoSIT built against**, which is not the one this crate runs.
-///
-/// # Why one CEN pin cannot serve every profile
-///
-/// The core profile's authority is CEN, so it should run CEN's newest release.
-/// XRechnung's authority is **KoSIT**, and a KoSIT release names the CEN
-/// Schematron it was built and tested against — `v2026-01-31` says
-/// *"Using CEN Schematron Rules 1.3.15"*. The German reference validator runs
-/// that combination and nothing else.
-///
-/// So while the two differ, this crate's XRechnung profiles run CEN's code
-/// lists from a release KoSIT has not adopted, and the divergences are real
-/// rather than theoretical. Between 1.3.15 and 1.3.16 CEN:
-///
-/// | | |
-/// |---|---|
-/// | removed `BGN` and `ANG` from ISO 4217 | Bulgaria adopted the euro; `ANG` became `XCG` |
-/// | added `XCG` | the Caribbean guilder |
-/// | moved document type codes `502` and `503` | from the **invoice** list to the **credit note** list in `BR-CL-01` |
-/// | added ISO 6523 ICD `0245`–`0248` | new registered schemes |
-/// | dropped `BR-CO-25` from the abstract model | this crate already carries it as `Source::StandardOnly` |
-///
-/// A Bulgarian-lev invoice is therefore **fatal here and valid for KoSIT** —
-/// the direction a validator must never be wrong in, because it stops a
-/// document nobody else would have stopped.
-///
-/// # What this test is for
-///
-/// Not to resolve the skew: which release to follow is a judgement, and
-/// following CEN's newest is the defensible one for a crate whose conformance
-/// suite runs CEN's own 1.3.16 test files. It is to make the skew **impossible
-/// to hold accidentally** — it fails when KoSIT names a CEN release this crate
-/// has not been told about, so a divergence is always a decision somebody made
-/// rather than one nobody noticed.
-///
-/// When KoSIT catches up, `KOSIT_BUILT_AGAINST` becomes equal to
-/// `ARTEFACT_VERSION` and the declaration below is deleted.
-#[test]
-fn the_cen_release_kosit_built_against_is_the_one_we_think_it_is() {
-    /// What `spec/validator-configuration-xrechnung`'s changelog is expected to
-    /// name, at the release `xtask` pins.
-    const KOSIT_BUILT_AGAINST: &str = "1.3.15";
-
-    let Some(spec) = common::require("the KoSIT/CEN skew check") else {
-        return;
-    };
-    let changelog = spec.join("validator-configuration-xrechnung/CHANGELOG.md");
-    let text = std::fs::read_to_string(&changelog)
-        .unwrap_or_else(|e| panic!("{}: {e}", changelog.display()));
-
-    // The first `CEN Schematron Rules <version>` in the file belongs to the
-    // newest entry, which is the release `xtask` pins.
-    let needle = "CEN Schematron Rules ";
-    let at = text
-        .find(needle)
-        .unwrap_or_else(|| panic!("{} no longer names a CEN release", changelog.display()))
-        + needle.len();
-    let named: String = text[at..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-
-    assert_eq!(
-        named, KOSIT_BUILT_AGAINST,
-        "KoSIT's pinned configuration now names CEN {named}, not {KOSIT_BUILT_AGAINST}. \
-         Re-read the diff between the two CEN releases and update the divergence table \
-         on this test — the XRechnung profiles run CEN's code lists, and a change to \
-         them changes which documents Germany's reference validator and this crate \
-         disagree about."
-    );
-
-    // The whole point is that the two differ. If they stop differing, the
-    // declaration above is dead and must be removed rather than left to rot.
-    assert_ne!(
-        named,
-        en16931::ARTEFACT_VERSION,
-        "KoSIT has caught up with CEN {}: delete KOSIT_BUILT_AGAINST and this test, \
-         and the skew section from the documentation with it.",
-        en16931::ARTEFACT_VERSION
-    );
+/// The CEN release an authority's pinned artefact says it was built on.
+struct Declaration {
+    authority: &'static str,
+    /// Relative to the reference corpus.
+    file: &'static str,
+    /// The text immediately before the version — the first occurrence counts.
+    needle: &'static str,
 }
 
-/// The concrete consequence, asserted rather than described.
-///
-/// `BGN` is the sharp end of the skew above: CEN removed it in 1.3.16 because
-/// Bulgaria adopted the euro, KoSIT has not adopted 1.3.16, and a German
-/// invoice denominated in Bulgarian lev is accepted by the reference validator
-/// and rejected here.
-///
-/// Asserted so the divergence is a **fact in the suite** rather than a sentence
-/// in a document, and so it changes loudly when a regenerated code list moves.
+/// Every pinned authority whose artefact names a CEN release: KoSIT in its
+/// changelog, OpenPeppol in its bundled CEN Schematron's header.
+const DECLARATIONS: &[Declaration] = &[
+    Declaration {
+        authority: "KoSIT",
+        file: "validator-configuration-xrechnung/CHANGELOG.md",
+        needle: "CEN Schematron Rules ",
+    },
+    Declaration {
+        authority: "OpenPeppol",
+        file: "peppol-bis-invoice-3/rules/sch/CEN-EN16931-UBL.sch",
+        needle: "Schematron version ",
+    },
+];
+
+/// A declared difference between an authority's CEN release and this crate's;
+/// `diverging` asserts each code value the two releases disagree on.
+struct Skew {
+    authority: &'static str,
+    /// The CEN release the authority names.
+    names: &'static str,
+    diverging: fn(),
+}
+
+/// Empty: at the pinned releases every authority names CEN 1.3.16.
+const DECLARED_SKEWS: &[Skew] = &[];
+
+/// Every pinned authority builds on the CEN release this crate runs, or the
+/// skew is declared in [`DECLARED_SKEWS`] (and fails once it disappears).
 #[test]
-fn the_currency_divergence_is_exactly_these_three_codes() {
+fn every_authority_names_the_cen_release_we_run() {
+    let Some(spec) = common::require("the per-authority CEN release check") else {
+        return;
+    };
+    for d in DECLARATIONS {
+        let path = spec.join(d.file);
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let at = text.find(d.needle).unwrap_or_else(|| {
+            panic!(
+                "{} ({}) no longer names a CEN release",
+                d.authority,
+                path.display()
+            )
+        }) + d.needle.len();
+        let named: String = text[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let ours = en16931::ARTEFACT_VERSION
+            .strip_prefix("validation-")
+            .expect("ARTEFACT_VERSION is a `validation-` tag");
+
+        match DECLARED_SKEWS.iter().find(|s| s.authority == d.authority) {
+            None => assert_eq!(
+                named, ours,
+                "{} now builds on CEN {named}, and this crate runs CEN {ours}. Read the \
+                 diff between the two releases: either move the pins together, or declare \
+                 the skew in DECLARED_SKEWS with each diverging code value asserted.",
+                d.authority
+            ),
+            Some(skew) => {
+                assert_ne!(
+                    named, ours,
+                    "{} has caught up with CEN {ours}: delete its DECLARED_SKEWS entry",
+                    d.authority
+                );
+                assert_eq!(
+                    named, skew.names,
+                    "{} now names CEN {named}, not the declared {}",
+                    d.authority, skew.names
+                );
+                (skew.diverging)();
+            }
+        }
+    }
+}
+
+/// CEN 1.3.16's ISO 4217 list where it differs from 1.3.15: `BGN` and `ANG`
+/// removed, `XCG` added.
+#[test]
+fn cen_1_3_16_currency_codes() {
     use en16931::invoice::Code;
     use en16931::{Invoice, validate};
 
@@ -342,19 +370,8 @@ fn the_currency_divergence_is_exactly_these_three_codes() {
         validate(&inv).has("BR-CL-04")
     };
 
-    // Withdrawn by CEN 1.3.16, still accepted by KoSIT's pinned configuration.
-    assert!(
-        fires("BGN"),
-        "CEN 1.3.16 removed BGN; this crate must reject it"
-    );
-    assert!(
-        fires("ANG"),
-        "CEN 1.3.16 removed ANG; this crate must reject it"
-    );
-    // Added by 1.3.16, so KoSIT's validator rejects what this crate accepts.
-    assert!(
-        !fires("XCG"),
-        "CEN 1.3.16 added XCG; this crate must accept it"
-    );
+    assert!(fires("BGN"), "CEN 1.3.16 removed BGN");
+    assert!(fires("ANG"), "CEN 1.3.16 removed ANG");
+    assert!(!fires("XCG"), "CEN 1.3.16 added XCG");
     assert!(!fires("EUR"), "the control");
 }

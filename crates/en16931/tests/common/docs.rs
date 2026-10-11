@@ -1,11 +1,5 @@
-//! Reading the project's own prose back, so a documented number can be checked.
-//!
-//! Shared by [`documented_numbers`](../documented_numbers.rs) and
-//! [`corpus`](../corpus.rs): the figures live in different suites — the registry
-//! counts here, the coverage split in the corpus gate — but they are quoted in
-//! the same six files, so the scanning belongs in one place.
-//!
-//! See `tests/documented_numbers.rs` for why any of this exists.
+//! Reading the project's own prose back, so a documented number can be
+//! checked. Shared by `documented_numbers.rs` and `corpus.rs`.
 
 #![allow(dead_code, reason = "each suite uses the part of this it needs")]
 
@@ -19,17 +13,9 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Every file whose prose is part of the published documentation.
-///
-/// The site is in here because it is the *most* public of them and the least
-/// likely to be reread: a README is at least seen by anyone opening the
-/// repository.
-///
-/// `CHANGELOG.md` is deliberately **not** here. Its job is to record what was
-/// true at each release, so a superseded figure and a current one sit in the
-/// same file by design and a scanner cannot tell them apart. Nothing else in
-/// the tree quotes a superseded figure: prose that describes a past state
-/// belongs in the changelog, not in documentation.
+/// Every file whose prose is part of the published documentation: the
+/// READMEs, the site (with its social card), and every source file. `CHANGELOG.md` is not, since it
+/// records figures as they were at each release.
 pub fn documentation() -> Vec<(String, String)> {
     let root = workspace_root();
     let mut out = Vec::new();
@@ -43,17 +29,11 @@ pub fn documentation() -> Vec<(String, String)> {
     for crate_dir in ["en16931", "en16931-formats", "en16931-cli"] {
         add(&format!("crates/{crate_dir}/README.md"));
     }
+    // The site's default description, which every page without its own carries.
+    add("site/config.toml");
 
-    // **Every** source file, not only the two crate roots. This project puts as
-    // much explanatory prose in module headers as in its READMEs — the twenty-one
-    // `BR-DEC-*` in `amount.rs`, the tolerance table in `validation/rules/`, the
-    // withdrawn-scheme table in `codes/guard.rs` — and rustdoc publishes all of
-    // it. Scanning `lib.rs` alone meant the most detailed prose in the workspace
-    // was the least checked.
-    //
-    // Scanning code as well as comments is harmless: a claim is literal prose
-    // either side of one number, so an array of code values matches nothing.
-    let mut stack = vec![root.join("site/content")];
+    // Every source file: rustdoc publishes module prose too.
+    let mut stack = vec![root.join("site/content"), root.join("site/static")];
     for crate_dir in ["en16931", "en16931-formats", "en16931-cli"] {
         stack.push(root.join(format!("crates/{crate_dir}/src")));
     }
@@ -66,7 +46,10 @@ pub fn documentation() -> Vec<(String, String)> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "md" || e == "rs") {
+            } else if path
+                .extension()
+                .is_some_and(|e| matches!(e.to_str(), Some("md" | "rs" | "svg")))
+            {
                 let rel = path
                     .strip_prefix(&root)
                     .unwrap_or(&path)
@@ -96,37 +79,21 @@ pub struct Claim {
     pub expected: usize,
 }
 
-/// The characters this project uses between the thousands of a figure.
-///
-/// The two invisible ones are not decoration. A number typed with a
-/// non-breaking space looks identical to one typed with a plain space, and if
-/// the scanner split on it the figure would simply stop being checked — one
-/// character nobody can see switching off a test nobody would miss.
+/// The characters this project uses between the thousands of a figure,
+/// including the two invisible spaces.
 const SEPARATORS: [char; 4] = [' ', '_', '\u{a0}', '\u{202f}'];
 
 /// Strip the separators and read the figure.
 ///
-/// `None` for a run that cannot be a count. Since this scans source as well as
-/// prose it meets things that are digits without being numbers — the IBAN
-/// `DE89370400440532013000` in `rules/xrechnung.rs` is twenty-two of them — and a
-/// documentation scanner that panics on a test fixture is a scanner nobody can
-/// point at the whole tree.
+/// `None` for a run too large to be a count (an IBAN in a test fixture).
 fn parse(found: &str) -> Option<usize> {
     found.replace(SEPARATORS, "").parse().ok()
 }
 
 /// Every maximal run of digits-and-separators, as `(number, start, end)`.
 ///
-/// A run has to *start* at a digit, and may contain [`SEPARATORS`] — `1 339`,
-/// `1_339` — because that is how this project writes thousands. `end` is always
-/// just past the last **digit**, so a trailing separator belongs to the sentence
-/// rather than to the number. Runs too large for a `usize` are skipped: see
-/// [`parse`].
-///
-/// Over `char`s rather than bytes, because two of the separators are multi-byte.
-/// A byte-wise version accepted only ASCII space and underscore, which made
-/// `parse`'s handling of `\u{a0}` unreachable and its doc comment — and a test
-/// asserting the behaviour — describe something that never happened.
+/// A run starts at a digit and may contain [`SEPARATORS`] (`1 339`, `1_339`);
+/// `end` is just past the last digit. Runs too large for a `usize` are skipped.
 pub fn digit_runs(text: &str) -> Vec<(usize, usize, usize)> {
     let mut runs = Vec::new();
     let mut chars = text.char_indices().peekable();
@@ -150,28 +117,12 @@ pub fn digit_runs(text: &str) -> Vec<(usize, usize, usize)> {
     runs
 }
 
-/// A minimal matcher, because a regex crate for seven patterns is not worth a
-/// dependency in a workspace whose whole argument is dependency count.
+/// Every number matching `pattern`: literal text either side of one `<N>`,
+/// case-sensitive.
 ///
-/// The grammar is exactly what the claims below need: literal text either side
-/// of one `<N>`. Case-sensitive, because these are sentences someone wrote.
-///
-/// Two refinements that are not decoration:
-///
-/// * **A word boundary after the match.** Without it `"<N> business rules"`
-///   matches *"317 business rulesets"*, and a claim that matches more than it
-///   means is worse than one that matches nothing.
-/// * **`EN 16931` is not a number.** The standard's name ends in four digits
-///   and appears in every other sentence here, so an unanchored pattern like
-///   `"<N> business rules"` finds it in *"the EN 16931 business rules"*. This is
-///   the one place a project-specific exception is honest rather than a hack.
-///
-/// The boundary applies only when the pattern's own tail could run into a word —
-/// that is, when it ends in an alphanumeric. A pattern ending in punctuation or
-/// a space has already established the boundary itself, and demanding a second
-/// one makes it match nothing: `"Code lists — <N> "` was silently dead for
-/// exactly that reason, because the character after its trailing space is the
-/// `v` of *values*.
+/// A pattern ending in an alphanumeric needs a word boundary after the match
+/// (`317 business rulesets` does not match `<N> business rules`), and the
+/// `16931` of `EN 16931` is never a number.
 pub fn find_all(pattern: &str, text: &str) -> Vec<usize> {
     let parts: Vec<&str> = pattern.split("<N>").collect();
     assert_eq!(parts.len(), 2, "a claim has exactly one <N>: {pattern}");
@@ -197,11 +148,8 @@ pub fn find_all(pattern: &str, text: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Check a set of claims against every documentation file, and fail with all
-/// of the mismatches at once.
-///
-/// All of them, not the first: a number that moved usually moved in six places,
-/// and reporting one per run turns a five-minute fix into six.
+/// Check a set of claims against every documentation file, failing with all
+/// mismatches at once, and with every claim that matched nothing.
 pub fn check(claims: &[Claim]) {
     let docs = documentation();
     let mut wrong = Vec::new();
@@ -219,11 +167,6 @@ pub fn check(claims: &[Claim]) {
                 }
             }
         }
-        // **Per claim**, not in aggregate: comparing the total against
-        // `claims.len()` is satisfied by one popular pattern matching a dozen
-        // times, so a claim whose sentence had been reworded would stop
-        // checking anything and the suite would stay green. Every pattern has
-        // to find its own sentence.
         if matched == 0 {
             never_matched.push(format!(
                 "  {:?} — for {}; measured {}",

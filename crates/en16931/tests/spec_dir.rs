@@ -1,15 +1,9 @@
-//! `spec/` is found where the workspace keeps it, and its absence is reported.
-//!
-//! See `tests/common/mod.rs` for why this exists: the crate's move into
-//! `crates/en16931/` silently disabled every artefact-reading suite, and they
-//! reported green.
+//! The reference corpus is found at the workspace level, or its absence is
+//! reported (and fails when `EN16931_REQUIRE_SPEC` is set).
 
 mod common;
 
 use common::{REQUIRE, spec_root};
-use std::path::Path;
-
-/// The suite is only meaningful with the artefacts, so it says so either way.
 
 #[test]
 fn the_artefact_directory_is_found_or_its_absence_is_reported() {
@@ -21,18 +15,18 @@ fn the_artefact_directory_is_found_or_its_absence_is_reported() {
                  than none, because the suites would check a subset and pass",
                 p.display()
             );
-            // The path that broke: `spec/` is the workspace's, never a member's.
-            assert_ne!(
-                p,
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("spec"),
-                "spec/ resolved inside the crate rather than at the workspace root"
+            // The corpus is the workspace's, never a member's.
+            assert!(
+                !p.starts_with(env!("CARGO_MANIFEST_DIR")),
+                "the reference corpus resolved inside the crate ({}) rather than \
+                 in the workspace",
+                p.display()
             );
         }
         None => {
             assert!(
                 std::env::var_os(REQUIRE).is_none(),
-                "{REQUIRE} is set but there is no spec/ anywhere above {}",
-                env!("CARGO_MANIFEST_DIR")
+                "{REQUIRE} is set but there is no reference corpus — run `cargo xtask fetch`"
             );
         }
     }

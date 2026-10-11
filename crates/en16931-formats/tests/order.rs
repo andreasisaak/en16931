@@ -1,26 +1,20 @@
 #![cfg(any(feature = "ubl", feature = "cii"))]
 
-//! The writer emits elements in UBL's schema order.
-//!
-//! UBL content models are XSD `sequence`s. A document carrying exactly the right
-//! elements in the wrong order is **invalid**, and no Schematron rule reports it
-//! — ordering is the schema's job, and this crate ships no schema. Without this
-//! test the failure surfaces at a counterparty's validator, weeks later, as
-//! "your invoice is malformed" with no rule id attached.
-//!
-//! The expected order is [`en16931_formats::ubl::order`], derived from 319 published
-//! instances rather than transcribed.
+//! The writer emits elements in UBL's schema order. A wrong order is
+//! schema-invalid and no Schematron rule reports it. The expected order is
+//! [`en16931_formats::ubl::order`], derived from published instances.
 
 #![cfg(feature = "ubl")]
 
 mod common;
 
 macro_rules! syntaxes {
-    ($($feature:literal => $module:ident),* $(,)?) => {$(
+    ($($feature:literal => $module:ident, $syntax:ident),* $(,)?) => {$(
         #[cfg(feature = $feature)]
         mod $module {
             use super::common;
-            use en16931_formats::$module::{self as syntax, order};
+            use en16931_formats::$module::order;
+            use en16931_formats::Syntax;
 
             /// Every `(parent, children)` adjacency in a document.
             fn walk(doc: &roxmltree::Document<'_>) -> Vec<(String, Vec<String>)> {
@@ -43,7 +37,9 @@ macro_rules! syntaxes {
             }
 
             fn check(inv: &en16931::Invoice) {
-                let xml = syntax::to_string(inv);
+                let xml = en16931_formats::write_unchecked(inv, Syntax::$syntax)
+                    .expect("the fixture carries everything the schema requires")
+                    .xml;
                 let doc = roxmltree::Document::parse(&xml)
                     .expect("the writer emits well-formed XML");
                 let mut checked = 0usize;
@@ -85,8 +81,7 @@ macro_rules! syntaxes {
                 check(&common::maximal_credit_note());
             }
 
-            /// The table must stay sorted, or `children_of`'s binary search
-            /// silently returns `None` and this whole suite checks nothing.
+            /// The table must stay sorted for `children_of`'s binary search.
             #[test]
             fn the_table_is_sorted_and_findable() {
                 let mut sorted = order::ORDER.to_vec();
@@ -100,6 +95,6 @@ macro_rules! syntaxes {
 }
 
 syntaxes! {
-    "ubl" => ubl,
-    "cii" => cii,
+    "ubl" => ubl, Ubl,
+    "cii" => cii, Cii,
 }

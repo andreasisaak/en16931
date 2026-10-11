@@ -1,32 +1,17 @@
-//! The `en16931` code-list generator — `crates/en16931/src/codes/generated.rs`.
+//! The `en16931` code-list generator: `crates/en16931/src/codes/generated.rs`,
+//! from the `BR-CL-*` assertions of the CEN code-list Schematron plus Peppol's lists.
 //!
-//! # Why a generator at all
-//!
-//! The `BR-CL-*` rules reference roughly 4 400 code values across eighteen lists
-//! — 2 162 UN/ECE Rec 20/21 unit codes alone. Hand-maintaining them is not an
-//! option, and skipping them is not either: a wrong unit code is a rejected
-//! invoice.
-//!
-//! # Why the extraction is careful
-//!
-//! A Schematron `test` is a **program**, not a data structure. `BR-CL-01`'s test
-//! is a disjunction over `self::` with *two* different lists — 50 codes for
-//! `cbc:InvoiceTypeCode` and 13 for `cbc:CreditNoteTypeCode`. An extractor that
-//! takes the first `contains(…)` literal and stops reports a confident, precise,
-//! wrong answer.
-//!
-//! So every table declares how its list is selected ([`Select`]), and the
-//! generator **fails** when the artefact does not match that declaration: a rule
-//! that suddenly carries two different lists where one was expected stops the
-//! build rather than silently picking one.
+//! A Schematron `test` can hold several lists (`BR-CL-01` has one per
+//! `self::` guard), so every table declares how its list is selected
+//! ([`Select`]), and the generator fails when the artefact does not match.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::read;
 
-/// The pinned artefact revision. Bump deliberately, in step with
-/// `fetch-spec.sh` and `en16931::ARTEFACT_VERSION`.
+/// The pinned artefact revision. Must equal `fetch::CEN_REF` and
+/// `en16931::ARTEFACT_VERSION` (asserted by `artefact_pin.rs`).
 const ARTEFACT: &str = "validation-1.3.16";
 
 const CODES_SCH: &str = "eInvoicing-EN16931/ubl/schematron/codelist/EN16931-UBL-codes.sch";
@@ -73,10 +58,8 @@ struct PeppolTable {
     doc: &'static str,
 }
 
-/// A Peppol list that must remain byte-identical to a CEN table.
-///
-/// The rule documentation says they mirror; the generator proves it, so the
-/// claim cannot rot into a lie.
+/// A Peppol list that must stay identical to a CEN table; the generator fails
+/// otherwise.
 struct Mirror {
     list: &'static str,
     cen_table: &'static str,
@@ -220,12 +203,7 @@ type Branch = (Option<String>, Vec<String>);
 type Asserts = BTreeMap<String, Vec<Branch>>;
 
 /// Every `contains(' … ')` literal in a `test`, attributed to the `self::X`
-/// guard that precedes it.
-///
-/// Splitting the file on `<assert` and pattern-matching inside each chunk looks
-/// like it works and then silently attributes one assertion's literals to its
-/// neighbour — the same class of error as reading only the first branch of a
-/// disjunction. So the file is parsed as XML.
+/// guard that precedes it. Parsed as XML so literals stay with their assertion.
 fn load_asserts(xml: &str) -> Result<Asserts, String> {
     let doc = roxmltree::Document::parse(xml).map_err(|e| e.to_string())?;
     let mut out: Asserts = Asserts::new();
@@ -246,10 +224,7 @@ fn load_asserts(xml: &str) -> Result<Asserts, String> {
 }
 
 /// Each `contains(' … ')` literal, with everything in the expression before it.
-///
-/// Only literals that are the argument of `contains(` count: a `test` also
-/// carries separators and short guards in single quotes, and treating those as
-/// code lists is how a table gains three spurious entries.
+/// Other single-quoted literals (separators, guards) are ignored.
 fn single_quoted(expr: &str) -> Vec<(&str, &str)> {
     let mut out = Vec::new();
     let bytes = expr.as_bytes();
@@ -332,19 +307,11 @@ fn attribute<'a>(chunk: &'a str, name: &str) -> Option<&'a str> {
     Some(&chunk[start..end])
 }
 
-/// UNCL 4451 for `BR-CL-08`, as the **union** over CEN's three syntax bindings.
+/// UNCL 4451 for `BR-CL-08`, as the union over CEN's UBL, CII and EDIFACT
+/// bindings, which froze different UNTDID directory revisions. The crate is
+/// syntax-independent, so it accepts any code a binding accepts.
 ///
-/// The three disagree, because each froze a different UNTDID directory
-/// revision: EDIFACT has 381 codes, UBL 383, CII 401. They form a strict chain,
-/// so this is directory drift rather than a substantive disagreement about what
-/// UNCL 4451 contains. This crate is syntax-independent and cannot know which
-/// syntax an invoice will be written to, so it takes the union: rejecting a code
-/// that a CEN binding accepts is a false positive, and a false positive on a
-/// legally valid invoice is worse than accepting a code some older directory
-/// lacked.
-///
-/// If the chain ever *breaks* — one binding gaining a code another dropped —
-/// that is a real divergence, and this fails rather than papering over it.
+/// Fails unless the three lists are nested (each a subset of the next larger).
 fn note_subject_codes(spec: &Path, log: &mut Vec<String>) -> Result<Vec<String>, String> {
     let mut found: Vec<(&str, BTreeSet<String>)> = Vec::new();
     for (syntax, rel) in PREPROCESSED {
@@ -405,17 +372,17 @@ fn note_subject_codes(spec: &Path, log: &mut Vec<String>) -> Result<Vec<String>,
         .collect())
 }
 
-/// One `pub static NAME: &[&str]` table.
-fn rust_slice(name: &str, doc: &str, rule: &str, codes: &[String]) -> String {
+/// One `pub static NAME: &[&str]` table; `source` names the publication the
+/// rule comes from.
+fn rust_slice(name: &str, doc: &str, rule: &str, source: &str, codes: &[String]) -> String {
     let uniq: BTreeSet<&String> = codes.iter().collect();
     let mut s = format!(
-        "/// {doc}\n///\n/// Source: `{rule}`, CEN validation artefacts `{ARTEFACT}`. {} values.\n\
+        "/// {doc}\n///\n/// Source: `{rule}`, {source}. {} values.\n\
          /// Sorted, so [`lookup`](super::contains) can binary-search it.\n\
          pub static {name}: &[&str] = &[\n",
         uniq.len()
     );
-    // rustfmt reflows this anyway; emitting one per line keeps the generator
-    // simple and the pre-format diff readable.
+    // One per line; rustfmt reflows it.
     for c in &uniq {
         s.push_str(&format!(
             "    \"{}\",\n",
@@ -436,19 +403,17 @@ pub fn generate(spec: &Path) -> Result<(String, Vec<String>), String> {
          //! **Do not edit.** Regenerate with `cargo xtask codegen` after\n\
          //! `cargo xtask fetch`, and review the diff.\n\
          //!\n\
-         //! Artefact revision: `{ARTEFACT}`. Peppol tables: Peppol BIS Billing 3.0.\n\
+         //! Artefact revision: `{ARTEFACT}`. Peppol tables: Peppol BIS Billing {}.\n\
          //!\n\
-         //! Every table here is re-verified against the artefacts by\n\
-         //! `tests/codelists.rs`, which runs whenever `spec/` is present. That test\n\
-         //! exists because a Schematron `test` is a program, not a data structure:\n\
-         //! `BR-CL-01` alone carries two different lists in one disjunctive\n\
-         //! expression, and an extractor that reads only the first is confidently\n\
-         //! wrong.\n"
+         //! Every table is re-verified against the artefacts by\n\
+         //! `tests/codelists.rs` whenever the reference corpus is present.\n",
+        crate::fetch::PEPPOL_RELEASE
     )];
 
+    let cen = format!("CEN validation artefacts `{ARTEFACT}`");
     let mut emitted: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     let mut total = 0usize;
-    // Every table name, in emission order, for the generated index below.
+    // Every table name, for the generated `TABLES` index.
     let mut names: Vec<String> = Vec::new();
 
     for table in TABLES {
@@ -544,7 +509,7 @@ pub fn generate(spec: &Path) -> Result<(String, Vec<String>), String> {
             table.rule
         ));
         names.push(table.name.to_owned());
-        parts.push(rust_slice(table.name, table.doc, table.rule, &uniq));
+        parts.push(rust_slice(table.name, table.doc, table.rule, &cen, &uniq));
         emitted.insert(table.name, uniq);
     }
 
@@ -580,7 +545,16 @@ pub fn generate(spec: &Path) -> Result<(String, Vec<String>), String> {
         let rule = format!("PEPPOL-EN16931-{}", t.rule);
         log.push(format!("  {:30} {:5}  ({rule})", t.name, codes.len()));
         names.push(t.name.to_owned());
-        parts.push(rust_slice(t.name, t.doc, &rule, codes));
+        parts.push(rust_slice(
+            t.name,
+            t.doc,
+            &rule,
+            &format!(
+                "Peppol BIS Billing {} Schematron",
+                crate::fetch::PEPPOL_RELEASE
+            ),
+            codes,
+        ));
     }
 
     let notes = note_subject_codes(spec, &mut log)?;
@@ -596,16 +570,15 @@ pub fn generate(spec: &Path) -> Result<(String, Vec<String>), String> {
         "BT-21 — UNCL 4451. The **union** over CEN's UBL, CII and EDIFACT bindings, which \
          froze different UNTDID directory revisions; see `xtask/`.",
         "BR-CL-08",
+        &cen,
         &notes,
     ));
 
     let tables = TABLES.len() + PEPPOL_TABLES.len() + 1;
     log.push(format!("\n{total} code values across {tables} tables"));
 
-    // An index of everything above, so the count the documentation quotes is a
-    // value the test suite can read rather than a number someone typed. Emitted
-    // rather than hand-written for the same reason as the tables themselves: a
-    // nineteenth list would otherwise be one nobody added here.
+    // The `TABLES` index, read by `tests/documented_numbers.rs` for the
+    // documented list and value counts.
     names.sort_unstable();
     let mut index = String::from(
         "/// Every generated code list, by the name it has in this module.\n         ///\n         /// Generated alongside the tables, so it cannot omit one. `TABLES.len()`\n         /// and the sum of the slice lengths are the two figures the documentation\n         /// quotes, and `tests/documented_numbers.rs` reads them from here.\n         pub static TABLES: &[(&str, &[&str])] = &[\n",

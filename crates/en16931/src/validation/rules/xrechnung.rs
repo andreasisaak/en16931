@@ -1,21 +1,14 @@
 //! XRechnung's conditional rules — §7.3.2's one axis that needs code.
 //!
-//! Thirteen `BR-DE-*` rules are pure narrowings and live in
+//! Twelve `BR-DE-*` rules are pure narrowings and live in
 //! [`crate::profiles::XRECHNUNG`]'s `restrictions` as data. These are the rest:
-//! rules whose condition depends on *another* term's value, which no
-//! [`crate::validation::profile::Restriction`] variant can express and none
-//! should try to.
+//! rules whose condition depends on another term's value, which no
+//! [`crate::validation::profile::Restriction`] variant can express.
 //!
-//! # Three of them have nothing left to check
-//!
-//! `BR-DE-23-b`, `-24-b` and `-25-b` each say that when BT-81 names one payment
-//! means, the other two groups *"dürfen nicht übermittelt werden"*. Because
-//! [`crate::invoice::PaymentMeans`] is an **enum**, that combination cannot be
-//! written down — so the rules are registered with a constant-pass evaluation,
-//! like the `BR-DEC-*` family.
-//!
-//! The `-a` halves remain real: they tie the *variant* to BT-81's **value**,
-//! which the type system cannot see.
+//! `BR-DE-23-b`, `-24-b` and `-25-b` (only one payment-means group) are
+//! unrepresentable because [`crate::invoice::PaymentMeans`] is an enum, so they
+//! are registered with a constant-pass evaluation. The `-a` halves tie the
+//! variant to BT-81's value and are checked.
 
 use super::{Findings, Rule, RuleId, Severity, Source};
 use crate::VatCategory;
@@ -179,9 +172,8 @@ rule!(BR_DE_30, "BR-DE-30", Fatal, terms: [BtId(90)],
 /// `CC##ZZZxxxxxxxx`: country, two mod-97 check digits over the national
 /// identifier, a three-character business code, then the identifier itself.
 ///
-/// Without the `sepa` feature this is a shape check only — the check digits are
-/// not verified, because the algorithm strips the business code before
-/// computing them and getting that subtly wrong is worse than not checking.
+/// Without the `sepa` feature this is a shape check only; the check digits are
+/// not verified.
 #[must_use]
 pub fn is_valid_creditor_identifier(s: &str) -> bool {
     #[cfg(feature = "sepa")]
@@ -201,15 +193,9 @@ pub fn is_valid_creditor_identifier(s: &str) -> bool {
 
 /// `EN-SEPA-01` — BT-90 should be a well-formed SEPA Creditor Identifier.
 ///
-/// **This crate's own rule**, namespaced so it can never be mistaken for CEN's
-/// or KoSIT's. `BR-DE-30` requires BT-90 to be *present* and no rule anywhere
-/// checks that it is well formed — yet a direct debit quoting a malformed
-/// creditor identifier is rejected by the creditor's bank, not by the buyer, and
-/// long after the invoice was accepted.
-///
-/// A warning, not an error: the document is lawful and the standard does not ask
-/// for this. With the `sepa` feature the check is EPC AT-02 including the
-/// mod-97 check digits; without it, the shape only.
+/// This crate's own rule (`BR-DE-30` only requires BT-90 to be present). A
+/// warning; with the `sepa` feature it includes the mod-97 check digits,
+/// without it the shape only.
 pub static EN_SEPA_01: Rule = Rule {
     id: RuleId::new("EN-SEPA-01"),
     severity: Severity::Warning,
@@ -243,11 +229,7 @@ rule!(BR_DE_31, "BR-DE-31", Fatal, terms: [BtId(91)],
 
 // ── BR-DE-26 — a corrected invoice references the original ────────────────────
 
-// `Warning`, and the German text says why: *"**soll** … übermittelt werden"* —
-// should, not must. KoSIT ships it `flag="warning"`, and a validator that
-// rejects a corrected invoice over a missing BG-3 rejects documents the German
-// reference validator accepts. See `XR_LEVELS` for the four others in this
-// class.
+// `Warning` (*"soll"*), as KoSIT ships it.
 rule!(BR_DE_26, "BR-DE-26", Warning, terms: [bt::TYPE_CODE, bt::PRECEDING_INVOICE],
 "Wenn im Element \"Invoice type code\" (BT-3) der Code 384 (Corrected invoice) übergeben \
  wird, soll PRECEDING INVOICE REFERENCE (BG-3) mindestens einmal übermittelt werden.",
@@ -261,24 +243,10 @@ rule!(BR_DE_26, "BR-DE-26", Warning, terms: [bt::TYPE_CODE, bt::PRECEDING_INVOIC
 
 // ── BR-DE-19 / BR-DE-20 — IBAN, checked offline ───────────────────────────────
 
-/// ISO 13616 / ISO 7064 mod-97-10, and the country registry when available.
-///
-/// An **offline** check either way: no network, so it runs on `wasm32` like
-/// everything else. It cannot tell you the account exists — only that the string
-/// is not a typo, which is what catches the overwhelming majority of real
-/// errors.
-///
-/// # Two strengths, and the difference is real
-///
-/// The built-in check is the mod-97-10 checksum and nothing else. That is
-/// correct as far as it goes and **blind to length**: `DE89370400440532013000`
-/// is 22 characters, which is right for Germany, but a 21-character string with
-/// a valid checksum passes too, and no German bank will accept it.
-///
-/// With the **`sepa` feature**, the check is [`sepa::validate_iban`] — the full
-/// ISO 13616 registry, 89 countries, each with its own length and BBAN
-/// structure. `BR-DE-19` and `BR-DE-20` are warnings either way; with the
-/// feature they are warnings you can act on.
+/// Offline IBAN check: ISO 7064 mod-97-10, plus (with the `sepa` feature) the
+/// ISO 13616 registry's per-country length and BBAN structure via
+/// [`sepa::validate_iban`]. Without the feature, wrong lengths with a valid
+/// checksum pass.
 #[must_use]
 pub fn is_valid_iban(s: &str) -> bool {
     #[cfg(feature = "sepa")]
@@ -310,9 +278,8 @@ pub fn is_valid_iban_checksum(s: &str) -> bool {
     {
         return false;
     }
-    // Move the first four characters to the end, map letters to 10..35, then
-    // take the remainder mod 97 digit by digit — the number is far too large for
-    // any integer type.
+    // Move the first four characters to the end, map letters to 10..35, and
+    // take the remainder mod 97 incrementally.
     let rearranged = compact[4..].chars().chain(compact[..4].chars());
     let mut remainder: u32 = 0;
     for c in rearranged {
@@ -358,12 +325,7 @@ rule!(BR_DE_20, "BR-DE-20", Warning, terms: [BtId(91)],
     }
 });
 
-// ── BR-DE-27 / BR-DE-28 — contact formats ─────────────────────────────────────
-//
-// Both `Warning`, as KoSIT ships them. A telephone number with two digits and
-// an address that is not quite an address are data-quality problems, not
-// grounds for refusing an invoice, and the rule texts say *"sollen"* rather
-// than *"müssen"* for exactly that reason.
+// ── BR-DE-27 / BR-DE-28 — contact formats (`Warning`, as KoSIT ships them) ───
 
 rule!(BR_DE_27, "BR-DE-27", Warning, terms: [BtId(42)],
 "In BT-42 sollen mindestens drei Ziffern enthalten sein.",
@@ -387,9 +349,9 @@ rule!(BR_DE_28, "BR-DE-28", Warning, terms: [BtId(43)],
     }
 });
 
-/// BR-DE-28's shape test, which is deliberately weaker than a full RFC 5322
-/// parse: exactly one `@`, at least two characters either side, neither
-/// adjacent character a space or a dot, and no leading or trailing dot.
+/// BR-DE-28's shape test (not RFC 5322): exactly one `@`, at least two
+/// characters either side, neither adjacent character a space or a dot, and
+/// no leading or trailing dot.
 fn plausible_email(s: &str) -> bool {
     let at: Vec<usize> = s.match_indices('@').map(|(i, _)| i).collect();
     if at.len() != 1 {
@@ -437,6 +399,89 @@ pub static ALL: &[&Rule] = &[
 mod tests {
     use super::*;
 
+    /// The checksum fallback at its length limits and with malformed country
+    /// or check-digit positions.
+    #[test]
+    fn the_iban_checksum_holds_at_its_edges() {
+        for good in [
+            "XX631",
+            "XX88AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "XX5712",
+            "DE89370400440532013000",
+        ] {
+            assert!(is_valid_iban_checksum(good), "{good}");
+        }
+        for bad in [
+            "XX08AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // 35 characters, checksum holds
+            "1X7512345",                           // a digit for a country letter
+            "X16312345",
+            "XXB022222", // a letter for a check digit
+            "XX7I92345",
+        ] {
+            assert!(!is_valid_iban_checksum(bad), "{bad}");
+        }
+    }
+
+    /// `BR-DEX-02` holds at every level of a sub-line tree, not only at the
+    /// first: a grandchild total that disagrees with its parent is reported.
+    #[test]
+    fn a_nested_sub_line_total_is_checked_too() {
+        use crate::extensions::SubInvoiceLine;
+        use crate::{InvoiceAmount, Quantity};
+        let line = |net: &str| {
+            crate::invoice::InvoiceLine::new(
+                "1",
+                "x",
+                Quantity::ONE,
+                "C62",
+                InvoiceAmount::parse(net).expect("amount"),
+                "S",
+                None,
+            )
+        };
+        let sub = |net: &str, children: Vec<SubInvoiceLine>| SubInvoiceLine {
+            line: line(net),
+            vat: None,
+            children,
+        };
+        let mut inv = Invoice {
+            lines: vec![line("100.00")],
+            ..Default::default()
+        };
+        // The first level adds up (100 = 100); the second does not (100 ≠ 50).
+        inv.extensions.sub_invoice_lines =
+            vec![(0, vec![sub("100.00", vec![sub("50.00", vec![])])])];
+        let mut out = Vec::new();
+        let mut sink = crate::validation::Findings::for_test(&mut out, &extension::BR_DEX_02);
+        (extension::BR_DEX_02.eval)(&inv, &mut sink);
+        assert_eq!(out.len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn two_characters_either_side_of_the_at_are_enough() {
+        assert!(plausible_email("ab@cd"));
+    }
+
+    /// An empty BT-90 is `BR-DE-30`'s concern, not a malformed identifier.
+    #[test]
+    fn an_empty_creditor_identifier_is_not_reported_as_malformed() {
+        use crate::invoice::{DirectDebit, PaymentInstructions, PaymentMeans};
+        let inv = Invoice {
+            payment: Some(PaymentInstructions {
+                means: Some(PaymentMeans::DirectDebit(DirectDebit {
+                    creditor_identifier: Some(String::new()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let mut sink = crate::validation::Findings::for_test(&mut out, &EN_SEPA_01);
+        (EN_SEPA_01.eval)(&inv, &mut sink);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
     #[test]
     fn iban_mod_97_accepts_real_ibans_and_rejects_typos() {
         // Published test IBANs.
@@ -457,6 +502,29 @@ mod tests {
             "",
         ] {
             assert!(!is_valid_iban(bad), "{bad:?} should be invalid");
+        }
+    }
+
+    /// `BR-TMP-2` is KoSIT's `$XR-URL-REGEX`, not a stricter idea of a URL.
+    #[test]
+    fn br_tmp_2_accepts_what_kosits_regex_accepts() {
+        for ok in [
+            "https://example.org/doc.pdf",
+            "urn:isbn:0451450523",
+            "mailto:rechnung@example.de",
+            "ftp+s.x-y:",
+        ] {
+            assert!(is_absolute_url(ok), "{ok}");
+        }
+        for bad in [
+            "not-a-url",
+            "/relative/path",
+            "a:b",
+            "1http://x",
+            " https://x",
+            "",
+        ] {
+            assert!(!is_absolute_url(bad), "{bad:?}");
         }
     }
 
@@ -481,8 +549,6 @@ mod tests {
 
     #[test]
     fn the_b_halves_are_unrepresentable_rather_than_unchecked() {
-        // `PaymentMeans` is an enum, so "credit transfer AND card" cannot be
-        // written down. The rules stay in the registry so `explain` works.
         for r in [&BR_DE_23_B, &BR_DE_24_B, &BR_DE_25_B] {
             let mut out = Vec::new();
             let mut sink = crate::validation::Findings::for_test(&mut out, r);
@@ -493,14 +559,12 @@ mod tests {
 
     #[test]
     fn both_iban_rules_are_advisory() {
-        // KoSIT flags these `soll`, and an IBAN this crate cannot verify against
-        // a registry is a warning, not a rejection.
         assert_eq!(BR_DE_19.severity, Severity::Warning);
         assert_eq!(BR_DE_20.severity, Severity::Warning);
     }
 }
 
-// ── The rest of XRechnung 3.0.2 ───────────────────────────────────────────────
+// ── The rest of XRechnung 3.0 ─────────────────────────────────────────────────
 
 rule!(BR_DE_2, "BR-DE-2", Fatal, terms: [BtId(41), BtId(42), BtId(43)],
 "Die Gruppe \"SELLER CONTACT\" (BG-6) muss übermittelt werden.",
@@ -536,9 +600,7 @@ rule!(BR_DE_11, "BR-DE-11", Fatal, terms: [BtId(78)],
 rule!(BR_DE_22, "BR-DE-22", Fatal, terms: [BtId(125)],
 "Das \"filename\"-Attribut aller \"EmbeddedDocumentBinaryObject\"-Elemente muss eindeutig sein.",
 |inv, f| {
-    // Quadratic, and deliberately so: BG-24 is a handful of documents, and a
-    // `HashSet` would pull `std` into a module that does not otherwise need it.
-    // The finding is raised on the *duplicate*, which is the one to rename.
+    // Quadratic (BG-24 is small); reported on the duplicate.
     for (i, doc) in inv.attachments.iter().enumerate() {
         let Some(name) = doc.attachment.as_ref().map(crate::Attachment::filename) else {
             continue;
@@ -560,26 +622,14 @@ rule!(BR_DE_18, "BR-DE-18", Fatal, terms: [bt::PAYMENT_TERMS],
     let Some(terms) = inv.payment_terms.as_deref() else {
         return;
     };
-    // XRechnung binds this to a regex; this crate has no regex dependency and
-    // will not take one for a single rule, so the grammar is parsed directly.
-    // The grammar is small and fully specified, which is why that is safe here
-    // and would not be for something like an email address.
+    // XRechnung's regex, parsed by hand.
     let mut bad = terms
         .lines()
         .map(str::trim)
         .any(|line| line.starts_with('#') && !is_skonto_line(line));
 
-    // The second half of the rule, and the easy half to miss. KoSIT asserts it
-    // separately:
-    //
-    // ```xslt
-    // matches(cac:PaymentTerms/cbc:Note[1]/tokenize(., '#.+#')[last()], '^\s*\n')
-    // ```
-    //
-    // Everything after the **last** `#…#` must begin with a newline, so a Skonto
-    // block that ends without one is invalid even though every line parses.
-    // KoSIT's own suite has two cases for exactly this ("Every skonto entry
-    // should end with a newline") and nothing else catches it.
+    // KoSIT's second assertion: everything after the last `#…#` must begin
+    // with a newline.
     if let Some(last_hash) = terms.rfind('#') {
         let tail = &terms[last_hash + 1..];
         if terms.contains("#SKONTO#") && !tail.trim_start_matches([' ', '\t', '\r']).starts_with('\n')
@@ -598,9 +648,8 @@ rule!(BR_DE_18, "BR-DE-18", Fatal, terms: [bt::PAYMENT_TERMS],
 /// #SKONTO#TAGE=<digits>#PROZENT=<digits>.<2 digits>[#BASISBETRAG=[-]<digits>.<2 digits>]#
 /// ```
 ///
-/// Note the two-decimal amounts are **exact**, not "up to two": `PROZENT=3` and
-/// `PROZENT=3.0` are both invalid, which surprises people and is what the rule
-/// says.
+/// Amounts have exactly two decimals: `PROZENT=3` and `PROZENT=3.0` are
+/// invalid.
 fn is_skonto_line(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("#SKONTO#TAGE=") else {
         return false;
@@ -637,7 +686,7 @@ fn is_two_dp(s: &str, allow_sign: bool) -> bool {
         && frac.bytes().all(|b| b.is_ascii_digit())
 }
 
-rule!(BR_TMP_2, "BR-TMP-2", Warning, terms: [BtId(124)],
+rule!(BR_TMP_2, "BR-TMP-2", Fatal, terms: [BtId(124)],
 "BT-124 \"External document location\" muss eine absolute URL mit gültigem Schema enthalten.",
 |inv, f| {
     for (i, doc) in inv.attachments.iter().enumerate() {
@@ -649,17 +698,21 @@ rule!(BR_TMP_2, "BR-TMP-2", Warning, terms: [BtId(124)],
     }
 });
 
-/// `scheme://…` with a plausible RFC 3986 scheme.
+/// KoSIT's `$XR-URL-REGEX`, `^([a-zA-Z])([a-zA-Z0-9+.-])+:.*`: a letter, at
+/// least one more scheme character, then `:` (so `urn:…` and `mailto:…`
+/// pass).
 fn is_absolute_url(s: &str) -> bool {
-    let Some((scheme, rest)) = s.split_once("://") else {
+    let bytes = s.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_alphabetic) {
         return false;
-    };
-    !scheme.is_empty()
-        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        && scheme
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
-        && !rest.is_empty()
+    }
+    // The scheme class excludes `:`, so the regex's only possible match ends
+    // at the first byte outside it.
+    let end = 1 + bytes[1..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        .count();
+    end >= 2 && bytes.get(end) == Some(&b':')
 }
 
 rule!(BR_DE_TMP_32, "BR-DE-TMP-32", Info, terms: [BtId(72), BtId(73), BtId(134)],
@@ -678,16 +731,9 @@ rule!(BR_DE_TMP_32, "BR-DE-TMP-32", Info, terms: [BtId(72), BtId(73), BtId(134)]
 
 /// XRechnung CVD — the EU Clean Vehicles Directive variant.
 ///
-/// Directive (EU) 2019/1161 obliges public bodies to meet minimum procurement
-/// targets for clean road vehicles, which means the *invoice* has to carry
-/// enough to count one: which vehicle category, and whether it is clean.
-/// XRechnung's CVD variant is a second CIUS on top of the first, selected by its
-/// own `CustomizationID`, and these seven rules are what it adds.
-///
-/// It is a good demonstration of why [`crate::validation::profile::Restriction`]
-/// is not enough on its own: `BR-DE-CVD-03` is *"at least one line must carry
-/// both a `CVD` classification and a `cva` attribute"*, which is a search over
-/// two nested groups, not a narrowing of a term.
+/// Directive (EU) 2019/1161: the invoice states each vehicle's category and
+/// whether it is clean. A second CIUS on top of XRechnung, selected by its own
+/// `CustomizationID`; these are the eight rules it adds.
 pub mod cvd {
     use super::{Findings, Group, Invoice, Path, Rule, RuleId, Severity, Source};
     use crate::bt::BtId;
@@ -862,10 +908,9 @@ pub mod cvd {
 
 /// The `BR-DEX-*` family — XRechnung's **Extension**, not its CIUS.
 ///
-/// §4.3's second mechanism, and the clearest example of it in the wild. Every
-/// rule here either governs a group the core model has no term for
-/// ([`crate::extensions::SubInvoiceLine`], [`crate::extensions::ThirdPartyPayment`])
-/// or **widens** something core EN 16931 narrows:
+/// An Extension (§4.3): every rule here either governs a group the core model
+/// has no term for ([`crate::extensions::SubInvoiceLine`],
+/// [`crate::extensions::ThirdPartyPayment`]) or widens the core:
 ///
 /// | | Core | Extension |
 /// |---|---|---|
@@ -873,13 +918,7 @@ pub mod cvd {
 /// | scheme identifiers | ISO 6523 ICD | + `XR01`, `XR02`, `XR03` |
 /// | BT-115 | `BR-CO-16` | **`BR-DEX-09`**, with third-party payments added |
 ///
-/// Widening is what makes it an Extension. A CIUS may not do it, which is why
-/// this is a separate profile with its own specification identifier rather than
-/// more restrictions on [`crate::profiles::XRECHNUNG`].
-///
-/// `XR01`…`XR03` are DiGA codes — *Digitale Gesundheitsanwendungen*, German
-/// prescribable health apps, where a statutory insurer settles part of an
-/// invoice addressed to the insured. That is also what `BG-DEX-09` exists for.
+/// `XR01`…`XR03` are DiGA codes (*Digitale Gesundheitsanwendungen*).
 pub mod extension {
     use super::{Findings, Group, Invoice, Path, Rule, RuleId, Severity, Source};
     use crate::bt::BtId;
@@ -949,7 +988,7 @@ pub mod extension {
                 continue;
             }
             check_sum(line.net_amount, subs, Path::at_term(Group::Line, i, BtId(131)), f);
-            // …and recursively, for sub-lines that decompose further.
+            // Recursively, for nested sub-lines.
             for s in subs {
                 check_subtree(s, Path::at_term(Group::Line, i, BtId(131)), f);
             }
@@ -1003,16 +1042,8 @@ pub mod extension {
     "Any scheme identifier in cac:PartyIdentification MUST be coded using one of the ISO 6523 ICD \
      list, extended by the DiGA codes.",
     |inv, f| {
-        // It replaces `BR-CL-10`, so it inherits that rule's context *and* its
-        // `SEPA` carve-out — KoSIT's assertion keeps the clause verbatim:
-        //
-        // ```xpath
-        // … or (contains(' SEPA ', …) and ((ancestor::cac:AccountingSupplierParty)
-        //                               or (ancestor::cac:PayeeParty)))
-        // ```
-        //
-        // Dropping it would make the Extension *narrower* than the CIUS it
-        // extends, which is the one thing §4.3 says an Extension does not do.
+        // Replaces `BR-CL-10`, keeping its context and its `SEPA` exception
+        // for the seller and payee.
         let ok = |scheme: &str, sepa_ok: bool| icd_or_diga(scheme) || (sepa_ok && scheme == "SEPA");
         for (g, ids, sepa_ok) in [
             (Group::Seller, &inv.seller.identifiers[..], true),
@@ -1039,9 +1070,7 @@ pub mod extension {
     "Any scheme identifier in cac:PartyLegalEntity MUST be coded using one of the ISO 6523 ICD \
      list, extended by the DiGA codes.",
     |inv, f| {
-        // `BR-CL-11`'s context, with the DiGA codes added: any party's legal
-        // entity, the payee's included. No `SEPA` clause here — that one belongs
-        // to `BR-DEX-04`'s context alone.
+        // `BR-CL-11`'s context plus the DiGA codes; no `SEPA` exception.
         for (g, party) in [(Group::Seller, &inv.seller), (Group::Buyer, &inv.buyer)] {
             if party
                 .legal_registration
@@ -1115,8 +1144,8 @@ pub mod extension {
     "Amount due for payment (BT-115) = Invoice total amount with VAT (BT-112) - Paid amount \
      (BT-113) + Rounding amount (BT-114) + Σ Third party payment amount (BT-DEX-002).",
     |inv, f| {
-        // This *replaces* BR-CO-16, which the Extension profile suppresses:
-        // without the third-party term the two disagree by exactly that sum.
+        // Replaces BR-CO-16, which the Extension profile re-levels to
+        // information.
         let t = &inv.totals;
         let zero = crate::InvoiceAmount::ZERO;
         let Ok(third_party) = inv.extensions.third_party_total() else {
@@ -1212,9 +1241,7 @@ pub mod extension {
 mod sepa_tests {
     use super::*;
 
-    /// The `sepa` feature must never *reject* something the checksum accepts
-    /// for the wrong reason — it should only reject more, and only on length or
-    /// structure.
+    /// The registry check accepts what the checksum accepts on real IBANs.
     #[test]
     fn the_registry_check_is_strictly_stronger() {
         // Real IBANs, valid under both.
@@ -1231,17 +1258,11 @@ mod sepa_tests {
         assert!(!is_valid_iban("DE89370400440532013001"));
     }
 
-    /// The whole point of the feature: a checksum-valid string of the wrong
-    /// length for its country.
-    ///
-    /// `DE` IBANs are 22 characters. This one is 20 and its check digits are
-    /// consistent, so the checksum alone cannot tell — and no German bank would
-    /// accept it.
+    /// The registry rejects a checksum-valid `DE` IBAN of 19 characters
+    /// (`DE` IBANs are 22).
     #[test]
     #[cfg(feature = "sepa")]
     fn the_registry_catches_a_wrong_length_iban() {
-        // Constructed so mod-97-10 passes: the registry is the only thing that
-        // can reject it.
         let short = "DE29100000001234567";
         if is_valid_iban_checksum(short) {
             assert!(
@@ -1249,7 +1270,6 @@ mod sepa_tests {
                 "the ISO 13616 registry must reject a 19-character DE IBAN"
             );
         }
-        // Length is what differs; the country is real either way.
         assert!(is_valid_iban("DE89370400440532013000"));
     }
 

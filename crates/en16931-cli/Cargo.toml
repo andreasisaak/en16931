@@ -1,10 +1,10 @@
 [package]
 name        = "en16931-cli"
 description = """\
-The EN 16931 validator as a command. Validates UBL, CII and ZUGFeRD/Factur-X \
-PDFs against the core model, XRechnung and Peppol BIS Billing 3.0; converts \
-between the two syntaxes; compares two documents as invoices rather than as \
-XML; reports as text, JSON or SVRL.\
+The EN 16931 e-invoice validator as a command: validate UBL, CII and \
+ZUGFeRD / Factur-X PDFs against EN 16931, XRechnung and Peppol BIS Billing 3.0, \
+convert between UBL and CII, extract and embed ZUGFeRD payloads, and compare \
+two documents as invoices. Reports as text, JSON or SVRL.\
 """
 keywords   = ["einvoice", "en16931", "xrechnung", "zugferd", "cli"]
 categories = ["command-line-utilities", "finance"]
@@ -17,26 +17,19 @@ authors.workspace      = true
 license.workspace      = true
 repository.workspace   = true
 
-# The package is `en16931-cli`, the command is `en16931`: the library owns the
-# crate name on crates.io. `doc = false` because rustdoc would write this to the
-# same `en16931/index.html` as the library, and `cargo doc --workspace` then
-# reports a collision and silently keeps one.
+# The package is `en16931-cli`, the command `en16931`. `doc = false`: its docs
+# would collide with the library's `en16931/index.html`.
 [[bin]]
 name = "en16931"
 path = "src/main.rs"
 doc  = false
 
 [dependencies]
-# Everything on, deliberately: a binary is in nobody's dependency graph, and a
-# validator that could not read the PDF you handed it because of a compile-time
-# flag would be a worse tool for no gain. Named here rather than in
-# `[workspace.dependencies]` so the libraries' own test matrices stay narrow.
+# Every feature on: a binary is in nobody's dependency graph.
 en16931 = { workspace = true, features = ["serde", "svrl", "sepa"] }
 en16931-formats = { workspace = true, features = ["ubl", "cii", "zugferd", "serde"] }
 
-# Already in the graph through `en16931`. Needed because `diff` compares
-# *numbers* that serialise as strings: `Percentage` renders "25.0" from UBL and
-# "25" from CII, and those are one value.
+# `diff` compares numbers by value ("25.0" and "25" are one rate).
 rust_decimal = { workspace = true }
 clap        = { version = "4.6", features = ["derive", "wrap_help"] }
 serde_json  = "1"

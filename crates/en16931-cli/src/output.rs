@@ -1,23 +1,21 @@
-//! Turning results into the three shapes the command can print.
+//! Rendering results as text, JSON or SVRL.
 //!
-//! # Why the JSON is not `serde_json::to_value(&report)`
-//!
-//! [`en16931::report::Report`] exists precisely so a stored report has a shape
-//! that is allowed to be boring, versioned by [`en16931::report::SCHEMA`]. The
-//! command emits that, plus the two things only the command knows: which file a
-//! report came from, and what the reader could not map on the way in.
+//! Text is `en16931_formats::Received`'s `Display`, JSON the interchange shape
+//! [`en16931::report::Report`], SVRL what `en16931::svrl` renders from it. This
+//! module arranges documents and adds the source file of each report.
 
 use std::fmt::Write as _;
+use std::path::PathBuf;
 
-use en16931::report::Report;
 use en16931::validation::profile::{Profile, Restriction};
-use en16931::validation::{Rule, Source, ValidationReport};
+use en16931::validation::{Rule, Source};
+use en16931_formats::{Received, Recommendation};
 
 use crate::input::Loaded;
 use crate::{CatalogueFormat, Format};
 
-/// Print validation results in the requested shape.
-pub fn validation(o: &mut String, results: &[(Loaded, ValidationReport)], format: Format) {
+/// Print received documents in the requested shape.
+pub fn validation(o: &mut String, results: &[(PathBuf, Received)], format: Format) {
     match format {
         Format::Text => validation_text(o, results),
         Format::Json => validation_json(o, results),
@@ -25,70 +23,86 @@ pub fn validation(o: &mut String, results: &[(Loaded, ValidationReport)], format
     }
 }
 
-fn validation_text(o: &mut String, results: &[(Loaded, ValidationReport)]) {
-    for (i, (loaded, report)) in results.iter().enumerate() {
+fn validation_text(o: &mut String, results: &[(PathBuf, Received)]) {
+    for (i, (source, received)) in results.iter().enumerate() {
         if i > 0 {
             let _ = writeln!(o);
         }
-        // The path first: a run over a directory is unreadable otherwise, and
-        // this is the line a person greps for.
-        let _ = writeln!(o, "{} — {}", loaded.source.display(), loaded.container);
-        for note in &loaded.notes {
-            let _ = writeln!(o, "  ! {note}");
-        }
-        let _ = writeln!(o, "{report}");
+        let _ = writeln!(o, "{}", source.display());
+        let _ = writeln!(o, "{received}");
     }
     if results.len() > 1 {
-        let bad = results.iter().filter(|(_, r)| !r.is_valid()).count();
-        let _ = writeln!(o, "\n{} document(s), {bad} invalid", results.len());
+        let count = |r: Recommendation| {
+            results
+                .iter()
+                .filter(|(_, x)| x.recommendation == r)
+                .count()
+        };
+        let _ = writeln!(
+            o,
+            "\n{} document(s): {} accepted, {} rejected, {} undefined",
+            results.len(),
+            count(Recommendation::Accept),
+            count(Recommendation::Reject),
+            count(Recommendation::Undefined)
+        );
     }
 }
 
-fn validation_json(o: &mut String, results: &[(Loaded, ValidationReport)]) {
-    let docs: Vec<_> = results
+/// The interchange shape of one received document, naming its file.
+fn interchange(source: &std::path::Path, received: &Received) -> en16931::report::Report {
+    let mut report = received.to_interchange();
+    report.source = Some(source.display().to_string());
+    if let Some(required) = report.required.as_deref_mut() {
+        required.source.clone_from(&report.source);
+    }
+    report
+}
+
+fn validation_json(o: &mut String, results: &[(PathBuf, Received)]) {
+    // Always an array, even for one document.
+    let reports: Vec<_> = results
         .iter()
-        .map(|(loaded, report)| {
-            let mut value = serde_json::to_value(Report::of(report))
-                .expect("a Report serialises; every field is a string, a bool or a number");
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert(
-                    "source".to_owned(),
-                    loaded.source.display().to_string().into(),
-                );
-                obj.insert("container".to_owned(), loaded.container.to_string().into());
-                obj.insert("readerNotes".to_owned(), loaded.notes.clone().into());
-            }
-            value
-        })
+        .map(|(source, received)| interchange(source, received))
         .collect();
-    // A single document still comes back as an array. A consumer that has to
-    // branch on the shape of the top level to find out how many documents it
-    // asked about is a consumer that will get it wrong once.
-    let out = serde_json::json!({
-        "schema": en16931::report::SCHEMA,
-        "valid": results.iter().all(|(_, r)| r.is_valid()),
-        "documents": docs,
-    });
     let _ = writeln!(
         o,
         "{}",
-        serde_json::to_string_pretty(&out).expect("the value was just built")
+        serde_json::to_string_pretty(&reports).expect("a report serialises")
     );
 }
 
-fn validation_svrl(o: &mut String, results: &[(Loaded, ValidationReport)]) {
-    // SVRL has one `schematron-output` per validated document, so several
-    // documents are several documents. Concatenating them into one file would
-    // produce something no SVRL reader accepts.
-    for (loaded, report) in results {
-        if results.len() > 1 {
-            let _ = writeln!(o, "<!-- {} -->", loaded.source.display());
+fn validation_svrl(o: &mut String, results: &[(PathBuf, Received)]) {
+    // One `schematron-output` per report; with several, each is preceded by
+    // a comment naming it.
+    let reports: Vec<_> = results
+        .iter()
+        .map(|(source, received)| interchange(source, received))
+        .collect();
+    let several = reports.len() > 1 || reports.iter().any(|r| r.required.is_some());
+    for report in &reports {
+        for (r, label) in std::iter::once((report, "as declared"))
+            .chain(report.required.as_deref().map(|r| (r, "as required")))
+        {
+            if several {
+                let name = r.source.as_deref().unwrap_or("-").replace("--", "-");
+                let _ = writeln!(o, "<!-- {name} {label} -->");
+            }
+            let _ = write!(o, "{}", en16931::svrl::to_svrl(r));
         }
-        let _ = write!(o, "{}", en16931::svrl::to_svrl(report));
     }
 }
 
 // ── inspect ──────────────────────────────────────────────────────────────────
+
+/// What a document is: its syntax, inside a PDF or not.
+fn container(d: &Loaded) -> String {
+    if d.read.pdf.is_some() {
+        format!("ZUGFeRD / Factur-X (PDF/A-3 + {})", d.read.syntax)
+    } else {
+        d.read.syntax.to_string()
+    }
+}
 
 /// What a document is, without a verdict on it.
 pub fn inspect_text(o: &mut String, docs: &[Loaded]) {
@@ -96,24 +110,18 @@ pub fn inspect_text(o: &mut String, docs: &[Loaded]) {
         if i > 0 {
             let _ = writeln!(o);
         }
-        let inv = &d.invoice;
+        let inv = &d.read.invoice;
         let _ = writeln!(o, "{}", d.source.display());
-        let _ = writeln!(o, "  syntax        {}", d.container);
-        if let Some(p) = d.zugferd_profile {
-            let _ = writeln!(o, "  ZUGFeRD       {p:?}  ({:?})", p.is_en16931_invoice());
+        let _ = writeln!(o, "  syntax        {}", container(d));
+        if let Some(pdf) = &d.read.pdf {
+            let _ = writeln!(o, "  ZUGFeRD       {:?}", pdf.profile);
         }
         let _ = writeln!(o, "  kind          {:?}", inv.kind);
         row(o, "BT-24 profile", inv.specification_id.as_deref());
-        // What the declared BT-24 resolves to here, which is the question behind
-        // "will this validate against what I think it will".
-        let resolved = inv
-            .specification_id
-            .as_deref()
-            .and_then(en16931::profiles::for_specification_id);
         let _ = writeln!(
             o,
-            "  rule set      {}",
-            resolved.map_or("EN 16931 (BT-24 unknown here)", |p| p.id)
+            "  declares      {}",
+            en16931::profiles::classify(inv.specification_id.as_deref())
         );
         row(o, "BT-1 number", inv.number.as_deref());
         let _ = writeln!(
@@ -133,8 +141,8 @@ pub fn inspect_text(o: &mut String, docs: &[Loaded]) {
         let _ = writeln!(o, "  BG-23 groups  {}", inv.vat_breakdown.len());
         let _ = writeln!(o, "  BT-112 gross  {}", inv.totals.gross_total);
         let _ = writeln!(o, "  BT-115 due    {}", inv.totals.due);
-        for note in &d.notes {
-            let _ = writeln!(o, "  ! {note}");
+        for e in d.read.report().entries() {
+            let _ = writeln!(o, "  ! {e}");
         }
     }
 }
@@ -143,38 +151,23 @@ fn row(o: &mut String, label: &str, value: Option<&str>) {
     let _ = writeln!(o, "  {label:<13} {}", value.unwrap_or("—"));
 }
 
-/// The same, as JSON.
+/// The same, as the interchange shape with no rules run.
 pub fn inspect_json(o: &mut String, docs: &[Loaded]) {
-    let out: Vec<_> = docs
+    let reports: Vec<_> = docs
         .iter()
         .map(|d| {
-            serde_json::json!({
-                "source": d.source.display().to_string(),
-                "container": d.container.to_string(),
-                "zugferdProfile": d.zugferd_profile.map(|p| format!("{p:?}")),
-                "specificationId": d.invoice.specification_id,
-                "ruleSet": d.invoice.specification_id.as_deref()
-                    .and_then(en16931::profiles::for_specification_id)
-                    .map(|p| p.id),
-                "kind": format!("{:?}", d.invoice.kind),
-                "number": d.invoice.number,
-                "issueDate": d.invoice.issue_date.map(|x| x.to_string()),
-                "typeCode": d.invoice.type_code.as_ref().map(|c| c.as_str()),
-                "currency": d.invoice.currency.as_ref().map(|c| c.as_str()),
-                "sellerName": d.invoice.seller.name,
-                "buyerName": d.invoice.buyer.name,
-                "lineCount": d.invoice.lines.len(),
-                "vatBreakdownCount": d.invoice.vat_breakdown.len(),
-                "grossTotal": d.invoice.totals.gross_total.to_string(),
-                "amountDue": d.invoice.totals.due.to_string(),
-                "readerNotes": d.notes,
-            })
+            let mut r = d.read.report().to_interchange();
+            r.source = Some(d.source.display().to_string());
+            r.declaration = Some(
+                en16931::profiles::classify(d.read.invoice.specification_id.as_deref()).to_string(),
+            );
+            r
         })
         .collect();
     let _ = writeln!(
         o,
         "{}",
-        serde_json::to_string_pretty(&out).expect("the value was just built")
+        serde_json::to_string_pretty(&reports).expect("a report serialises")
     );
 }
 
@@ -182,8 +175,7 @@ pub fn inspect_json(o: &mut String, docs: &[Loaded]) {
 
 /// One rule, with its provenance and the terms it touches.
 pub fn rule(o: &mut String, r: &'static Rule) {
-    // Which profiles run it, and at what severity — the answer to "why did my
-    // validator not object to this?"
+    // Which profiles run it, and at what severity.
     let carried: Vec<(&'static str, en16931::Severity)> = en16931::profiles::ALL
         .iter()
         .filter_map(|p| {
@@ -194,12 +186,8 @@ pub fn rule(o: &mut String, r: &'static Rule) {
         })
         .collect();
 
-    // An id can name two rules with two consequences — `PEPPOL-EN16931-R120` is
-    // Peppol's *fatal* rule and XRechnung's *warning* one, because KoSIT's build
-    // rewrites the flag on the way in. Printing either instance's severity in
-    // the header states one authority's answer as if it were the answer, so
-    // where they differ the header declines to and the `run by` line carries
-    // every profile's.
+    // Severity can differ by profile (`PEPPOL-EN16931-R120` is fatal in Peppol,
+    // a warning in XRechnung); then the `run by` line carries each profile's.
     let varies = carried.iter().any(|(_, level)| *level != r.severity);
     let header = if varies {
         "varies by profile".to_owned()
@@ -243,13 +231,8 @@ pub fn restriction(o: &mut String, profile: &'static Profile, r: &'static Restri
     if let Restriction::CodeValues { allowed, .. } = r {
         let _ = writeln!(o, "  allowed: {}", allowed.join(", "));
     }
-    // Which profiles run it, and at what severity — the same line `explain`
-    // gives for a rule, and the answer to "why did this not reject my
-    // invoice?". A restriction is fatal by construction, so a lower severity
-    // here is always an authority's published `flag`, and always the thing the
-    // reader wanted to know: `BR-DE-17` is a **warning** in Germany because a
-    // lawful EN 16931 type code XRechnung does not admit is a scoping question
-    // rather than a malformed document.
+    // Which profiles run it, and at what severity. A restriction is fatal
+    // unless an authority's published `flag` lowers it (`BR-DE-17` is a warning).
     let carried: Vec<String> = en16931::profiles::ALL
         .iter()
         .filter_map(|p| {
@@ -290,26 +273,10 @@ pub struct Difference {
     pub right: String,
 }
 
-/// Compare two invoices field by field.
+/// Compare two invoices field by field, through their `serde` form.
 ///
-/// # Why through `serde`, and what that costs
-///
-/// A hand-written walk over 164 business terms would give paths spelled
-/// `BG-25[2]/BT-152`, which is this project's usual currency — and it would be
-/// a second model to keep in step with the first, silently missing whichever
-/// field was added without a matching arm. The serialised form cannot miss one:
-/// it *is* the model.
-///
-/// The cost is that a path reads `lines[1].vat.rate` rather than
-/// `BG-25[2]/BT-152`. For a diff that is arguably the better half of the trade —
-/// the reader is looking at their own data structure, not at a rule — but it is
-/// a real difference from how findings are reported, and worth knowing.
-///
-/// Arrays of unequal length are reported per index rather than as one
-/// wholesale difference, so removing the first of five lines does not read as
-/// five unrelated changes plus a length change. It reads as five, which is
-/// honest: after a removal every subsequent index really does hold something
-/// else.
+/// Paths are model paths (`lines[1].vat.rate`), not BT/BG paths. Arrays are
+/// compared per index.
 pub fn model_differences(
     a: &en16931::Invoice,
     b: &en16931::Invoice,
@@ -366,44 +333,16 @@ fn walk(a: &serde_json::Value, b: &serde_json::Value, at: &str, out: &mut Vec<Di
     }
 }
 
-/// Whether two JSON values are the same number written to two **scales**.
+/// Whether two JSON strings are the same decimal written to two scales
+/// (`25.0` vs `25`), which the model treats as equal.
 ///
-/// The model's numeric types serialise as **strings**, deliberately: a JSON
-/// number is a float in most readers, and an invoice total that survives a
-/// round trip through `f64` is a coincidence rather than a guarantee. The
-/// consequence here is that a scale difference looks like a text difference —
-/// UBL writes `25.0` for BT-152 where CII writes `25`.
-///
-/// The model does not agree that those differ: `Percentage` compares by value,
-/// and `19` and `19.00` are one VAT breakdown group in `Eq`, `Ord` **and**
-/// `Hash`. A diff that contradicts the model it is diffing is worse than no
-/// diff, because it manufactures work — the first real conversion this was run
-/// against reported three differences and all three were this.
-///
-/// # Scale only, and that word is load-bearing
-///
-/// This compared `x.parse::<Decimal>() == y.parse::<Decimal>()`, which is a
-/// wider claim than the one above and a wrong one. Going through `serde` means
-/// the *type* is gone by the time the two values meet, so every `String` term
-/// was being compared as a number if it happened to look like one — and then
-/// **`"0001"` and `"1"` were the same invoice number.** So were the post codes
-/// `01067` (Dresden) and `1067`, the line ids `01` and `1`, and the order
-/// reference `007`. `en16931 diff` would print *"identical as invoices"* and
-/// exit `0` on a conversion that had eaten a leading zero, which is the one
-/// answer a pipeline acts on.
-///
-/// A scale difference is precisely a difference in *trailing fractional* zeros,
-/// so that is what is compared. Leading zeros are text, and text is what a
-/// document reference is.
-///
-/// Only string-to-string: a string against a number, or against `null`, is a
-/// genuine change of shape.
+/// Only trailing fractional zeros are ignored: leading zeros are text
+/// (`"0001"` and `"1"` are different invoice numbers). Only string-to-string.
 fn same_number(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     let (Some(x), Some(y)) = (a.as_str(), b.as_str()) else {
         return false;
     };
-    // Both have to be decimals at all, so a term like `"REF.0"` against `"REF"`
-    // is never quietly folded together.
+    // Both must be decimals, so `"REF.0"` and `"REF"` stay different.
     if x.parse::<rust_decimal::Decimal>().is_err() || y.parse::<rust_decimal::Decimal>().is_err() {
         return false;
     }
@@ -424,9 +363,7 @@ fn trimmed_scale(s: &str) -> &str {
 }
 
 /// A one-character marker: added, removed, or changed.
-///
-/// `+` and `-` are relative to the **left** document, which is the one named
-/// first — the same convention as `diff(1)`, so nobody has to look it up.
+/// `+` and `-` are relative to the left document, as in `diff(1)`.
 fn marker(d: &Difference) -> char {
     match (d.left.as_str(), d.right.as_str()) {
         ("null", _) => '+',
@@ -436,16 +373,13 @@ fn marker(d: &Difference) -> char {
 }
 
 pub fn diff_text(o: &mut String, a: &Loaded, b: &Loaded, differences: &[Difference]) {
-    let _ = writeln!(o, "--- {} — {}", a.source.display(), a.container);
-    let _ = writeln!(o, "+++ {} — {}", b.source.display(), b.container);
-    for note in a.notes.iter().chain(&b.notes) {
-        let _ = writeln!(o, "  ! {note}");
+    let _ = writeln!(o, "--- {} — {}", a.source.display(), container(a));
+    let _ = writeln!(o, "+++ {} — {}", b.source.display(), container(b));
+    for e in a.read.entries.iter().chain(&b.read.entries) {
+        let _ = writeln!(o, "  ! {e}");
     }
 
     if differences.is_empty() {
-        // Worth saying explicitly when the two are in different syntaxes: that
-        // is the case where "no output" would look like the command had failed
-        // to notice they are different files.
         let _ = writeln!(o, "\nidentical as invoices");
         return;
     }
@@ -476,15 +410,13 @@ pub fn diff_json(
     differences: &[Difference],
 ) -> Result<(), String> {
     let value = serde_json::json!({
-        "left":  { "source": a.source.display().to_string(), "container": a.container.to_string() },
-        "right": { "source": b.source.display().to_string(), "container": b.container.to_string() },
+        "left":  { "source": a.source.display().to_string(), "container": container(a) },
+        "right": { "source": b.source.display().to_string(), "container": container(b) },
         "identical": differences.is_empty(),
         "differences": differences.iter().map(|d| serde_json::json!({
             "at": d.at,
             "change": marker(d).to_string(),
-            // Parsed back from the rendered form, so the JSON carries real
-            // values rather than strings of JSON — a consumer should be able to
-            // compare `left` against its own data without unquoting first.
+            // Parsed back so the JSON carries values, not JSON strings.
             "left": serde_json::from_str::<serde_json::Value>(&d.left)
                 .unwrap_or(serde_json::Value::Null),
             "right": serde_json::from_str::<serde_json::Value>(&d.right)
@@ -499,12 +431,9 @@ pub fn diff_json(
 
 // ── profiles ─────────────────────────────────────────────────────────────────
 
-/// Every profile this build can validate against.
 /// `en16931 categories S O` — the verdict, and the way out of a refusal.
 ///
-/// Prints the categories with their full names first: a caller who typed `O`
-/// meaning "other" rather than "outside the scope of VAT" has made the mistake
-/// this command exists to catch, and only the name shows it.
+/// Prints the categories with their full names first, so a misread code shows.
 pub fn categories(o: &mut String, cats: &[en16931::VatCategory]) {
     for c in cats {
         let _ = writeln!(o, "  {:<3} {}", c.code(), c.name());
@@ -528,11 +457,9 @@ pub fn categories(o: &mut String, cats: &[en16931::VatCategory]) {
     }
 }
 
+/// Every profile this build can validate against.
 pub fn profiles(o: &mut String) {
-    // Column widths are measured, never guessed. The `verified against` block
-    // below was written with a hard-coded `{:<44}`, and the longest repository
-    // name is 45 characters — so the table shipped one column out of true, and
-    // would have again the next time an authority renamed a repository.
+    // Column widths are measured from the data.
     let name = width(en16931::profiles::ALL.iter().map(|p| p.slug), "PROFILE");
     let id = width(en16931::profiles::ALL.iter().map(|p| p.id), "NAME");
     let _ = writeln!(
@@ -547,10 +474,7 @@ pub fn profiles(o: &mut String) {
             p.slug,
             p.id,
             p.check_ids().count(),
-            // §4.4.2 asks this of a CIUS, and the core model is not one — "no"
-            // there would read as a defect rather than as "the question does not
-            // arise". Of the four that are CIUSes, three answer no, each because
-            // its authority reports a core rule at a lower severity.
+            // §4.4.2 conformance; the core model is not a CIUS.
             if p.underlying.is_empty() {
                 "n/a"
             } else if p.is_conformant_cius() {
@@ -563,20 +487,25 @@ pub fn profiles(o: &mut String) {
     }
     let _ = writeln!(
         o,
-        "\nPROFILE is what `--profile` takes; NAME is what a report prints. CHECKS\n\
+        "\nPROFILE is what `--require` takes; NAME is what a report prints. CHECKS\n\
          counts the rules and restrictions a profile declares, and a report says the\n\
          same number for every document: every check runs, whether or not it has\n\
          anything to report. `en16931 rules --profile <PROFILE>` lists them."
     );
+    // ZUGFeRD / Factur-X: read and required, never written.
+    let _ = writeln!(o, "\nZUGFeRD / Factur-X (read and required, not written):");
+    let zslug = width(en16931::profiles::ZUGFERD.iter().map(|p| p.slug), "");
+    let zid = width(en16931::profiles::ZUGFERD.iter().map(|p| p.id), "");
+    for p in en16931::profiles::ZUGFERD {
+        let _ = writeln!(
+            o,
+            "  {:<zslug$}  {:<zid$}  {}",
+            p.slug, p.id, p.specification_id
+        );
+    }
     let _ = writeln!(o, "\nedition: {}", en16931::DEFAULT_EDITION);
 
-    // The releases these profiles were verified against. Deduped and listed
-    // once rather than repeated per profile: four rows of the same four
-    // repositories is a wall, and which profile draws on which is already the
-    // answer `explain` gives for a specific rule. A single global
-    // "artefacts: validation-1.3.16" would be worse than either — `BR-DE-15` is
-    // KoSIT's and moves on KoSIT's cadence, so that line names the wrong
-    // authority for four of the five profiles.
+    // The artefact releases these profiles were verified against, deduplicated.
     let mut seen: Vec<&en16931::validation::profile::ArtefactRef> = Vec::new();
     for p in en16931::profiles::ALL {
         for a in p.artefacts {
@@ -601,10 +530,7 @@ pub fn profiles(o: &mut String) {
     let _ = writeln!(o, "({})", en16931::ATTRIBUTION);
 }
 
-/// The widest of `values` and `header`, in characters.
-///
-/// Characters rather than bytes: a repository name is ASCII today and a profile
-/// name need not be, and `{:<n}` counts characters.
+/// The widest of `values` and `header`, in characters (as `{:<n}` counts).
 fn width<'a>(values: impl Iterator<Item = &'a str>, header: &str) -> usize {
     values
         .map(|v| v.chars().count())
@@ -615,7 +541,7 @@ fn width<'a>(values: impl Iterator<Item = &'a str>, header: &str) -> usize {
 
 // ── text wrapping ────────────────────────────────────────────────────────────
 
-/// Greedy wrap. Rule texts are long sentences and a terminal is not.
+/// Greedy word wrap.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
@@ -636,51 +562,20 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 // ── the rule catalogue ───────────────────────────────────────────────────────
 
-/// Every rule the build ships, optionally narrowed to a profile or a term.
+/// Every rule the build ships, optionally narrowed to a profile or a term,
+/// derived from the registry.
 ///
-/// # Why a command and not a documentation page
-///
-/// The catalogue is derived from the registry, so it cannot drift from what the
-/// validator actually runs — which a hand-written table of 317 rules would, on
-/// the first release nobody remembered to update it. It is also the shape you
-/// want when a counterparty quotes an id you do not recognise, or when you need
-/// to know what changed between two versions:
-///
-/// ```sh
-/// en16931 rules --format json > new.json && diff old.json new.json
-/// ```
-///
-/// # Restrictions are in it
-///
-/// A profile's §7.3.2 narrowings are *data* rather than predicates, so they are
-/// not `Rule`s — but they are published under real ids, they are what a German
-/// counterparty quotes (`BR-DE-3`, `BR-DE-15`, `BR-DE-17`), and they are counted
-/// in the CHECKS column `en16931 profiles` prints. Leaving them out made
-/// `--profile "XRechnung 3.0"` list 270 of the 282 checks it declares, and the
-/// twelve missing were the German ones. The JSON did not so much as mention
-/// them, which is the shape people diff across releases.
-///
-/// They are listed with `source: "profile"` — the same word
-/// [`en16931::report::Entry`] uses for a finding whose id resolves to no rule —
-/// because the wording is this crate's rendering of a narrowing, not an
-/// authority's sentence, and the catalogue must not imply otherwise.
+/// With a profile, its §7.3.2 restrictions (`BR-DE-3`, …) are listed after the
+/// rules: source `profile` in text, a `restriction` kind in JSON.
 pub fn catalogue(
     o: &mut String,
     profile: Option<&'static Profile>,
     term: Option<en16931::BtId>,
     format: CatalogueFormat,
 ) {
-    // With a profile named: exactly what that profile runs. Without one: every
-    // rule the build ships, which is the union across profiles and therefore has
-    // duplicates — XRechnung's rules reach the registry three times, once per
-    // KoSIT variant.
-    //
-    // Deduplicated on `(id, severity, text)` rather than on the id alone,
-    // because the registry deliberately holds **two** `PEPPOL-EN16931-R120`:
-    // Peppol's, which is fatal, and the one XRechnung's build rewrites to a
-    // warning. Collapsing by id would hide the one difference between them that
-    // matters, and listing every copy would print the other 150 rules three
-    // times over.
+    // Without a profile: the union across profiles, deduplicated on
+    // `(id, severity, text)` so both `PEPPOL-EN16931-R120` variants (fatal in
+    // Peppol, warning in XRechnung) are kept.
     let candidates: Vec<&'static Rule> = match profile {
         Some(p) => en16931::validation::rules::CORE
             .iter()
@@ -722,8 +617,7 @@ pub fn catalogue(
                     o,
                     "{:<26} {:<12} {:<18} {}",
                     r.id(),
-                    // A restriction always rejects; §7.3.2 has no advisory
-                    // narrowing, and `Restriction::check` writes `Fatal`.
+                    // `Restriction::check` always writes `Fatal`.
                     "fatal",
                     "profile",
                     restriction_text(r),
@@ -796,10 +690,8 @@ const fn restriction_kind(r: &Restriction) -> &'static str {
     }
 }
 
-/// A restriction rendered as one sentence, matching what a finding would say.
-///
-/// Uses [`TermAccessor::label`] rather than formatting the pair here, so this
-/// and the finding cannot describe the same narrowing two different ways.
+/// A restriction rendered as one sentence, using the term's `label()` as a
+/// finding does.
 fn restriction_text(r: &Restriction) -> String {
     let label = r.term().label();
     match r {
@@ -821,9 +713,6 @@ const fn short_source(s: Source) -> &'static str {
 }
 
 /// The first sentence of a rule text, for a one-line table.
-///
-/// Truncating at a fixed width cuts mid-word and mid-`(BT-…)`; the rules are
-/// written as sentences, so the first one is a summary the authority wrote.
 fn first_sentence(text: &str) -> String {
     let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     match line.find(". ") {
@@ -836,12 +725,7 @@ fn first_sentence(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A scale difference is not a difference; a **leading zero** is.
-    ///
-    /// Comparing parsed `Decimal`s would make `"0001"` and `"1"` the same
-    /// invoice number, and `01067` and `1067` the same Dresden post code — on a
-    /// command whose exit code says whether a conversion preserved the
-    /// document.
+    /// A scale difference is not a difference; a leading zero is.
     #[test]
     fn only_a_trailing_fractional_zero_is_not_a_difference() {
         let s = |v: &str| serde_json::Value::String(v.to_owned());
@@ -863,9 +747,7 @@ mod tests {
                 "{x} vs {y} differs in more than scale"
             );
         }
-        // Not a number at all, and not folded together by the trimming.
         assert!(!same_number(&s("REF.0"), &s("REF")));
-        // And a shape change is never a scale difference.
         assert!(!same_number(&s("1"), &serde_json::Value::Null));
     }
 
