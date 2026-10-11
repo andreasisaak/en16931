@@ -1,10 +1,9 @@
 # cargo-mutants configuration — https://mutants.rs/
-# Run through the justfile: `just mutants-diff` (what CI runs on a pull request),
+# Run through the justfile: `just mutants-diff` (the lines a change touches),
 # `just mutants` for the full sweep. Schema: `cargo mutants --emit-schema=config`.
 #
-# Pull requests: the lines they change, in CI (`mutants` workflow job, one job,
-# bounded). The full sweep is manual — `just mutants`, or the `mutants.yml`
-# workflow — optional and slow. Survivors and their reasons live in
+# Local and optional; not run in CI. The full sweep is manual — `just mutants`,
+# or the `mutants.yml` workflow — and slow. Survivors and their reasons live in
 # `.cargo/mutants-baseline.txt`.
 
 # Every feature: `zugferd`, `serde` and `svrl` gate code that is mutated and tested.

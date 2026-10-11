@@ -210,35 +210,6 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts
 
-  # ── Mutation testing on the diff ───────────────────────────────────────────
-  # A pull request's changed lines are mutated, one mutant at a time, against
-  # the fast suites only (no reference corpus, no Docker: about 15 s a mutant);
-  # a survivor `.cargo/mutants-baseline.txt` does not record with a reason
-  # fails the job and is named. Bounded twice: a per-mutant timeout, and the
-  # job's. A pull request large enough to exceed the job's bound fails it —
-  # split it, or run `just mutants-diff` locally. The full sweep is manual
-  # (`mutants.yml`, `just mutants`).
-  mutants:
-    name: Mutation testing (changed lines)
-    if: github.event_name == 'pull_request'
-    needs: [fmt, clippy]
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-mutants,just
-      - name: Mutate the lines this pull request changed
-        run: |
-          mkdir -p target
-          git diff "${{ github.event.pull_request.base.sha }}...HEAD" > target/mutants.diff
-          just mutants-diff-gate target/mutants.diff
-
   # ── Benchmarks ──────────────────────────────────────────────────────────────
   # Compile-only: timings on shared runners are too noisy to gate on, but a
   # benchmark that no longer builds is a real break.

@@ -75,8 +75,8 @@ the pinned authorities move to their current releases.
 - `en16931_formats::Syntax` and `en16931_formats::Error` are
   `#[non_exhaustive]`; their variants depend on the enabled features.
 - `#![forbid(unsafe_code)]` in `en16931-formats` and `en16931-cli`.
-- For contributors: cargo-fuzz targets (`just fuzz`), mutation testing of
-  changed lines in CI (`just mutants-diff`), a veraPDF PDF/A-3b gate for
+- For contributors: cargo-fuzz targets (`just fuzz`), local mutation testing
+  (`just mutants-diff`, `just mutants`), a veraPDF PDF/A-3b gate for
   `embed`, and an OASIS UBL 2.1 schema gate beside the CII D16B one.
 
 ### Changed

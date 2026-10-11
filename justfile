@@ -367,7 +367,7 @@ fuzz TARGET SECS="60":
 
 # ── Mutation testing (cargo-mutants; config in .cargo/mutants.toml) ───────────
 #
-# CI mutates the lines a pull request changes (`mutants-diff-gate`). The full
+# Local only, not in CI. `mutants-diff` mutates the lines a change touches. The full
 # sweep (`mutants`) is optional and slow — run it by hand, or through the
 # `mutants.yml` workflow. Survivors are recorded in .cargo/mutants-baseline.txt,
 # one `survivor  # reason` per line; a run fails on a survivor that is not

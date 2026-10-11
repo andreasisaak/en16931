@@ -59,7 +59,7 @@ each skips with a printed line when its tool is missing, and fails under
 | `just audit` | security advisories over `Cargo.lock`; nothing is ignored |
 | `just ci` | all of the above that CI runs |
 | `just fuzz <target> [seconds]` | one cargo-fuzz target (`read`, `extract`, `roundtrip`, `embed`); needs nightly and `cargo-fuzz` |
-| `just mutants-diff` | mutate the lines your change touches, as CI does; fails on a survivor the baseline does not record |
+| `just mutants-diff` | mutate the lines your change touches; fails on a survivor the baseline does not record |
 | `just mutants` | the full mutation sweep of the rules — optional and slow |
 
 A few notes:
@@ -74,10 +74,9 @@ A few notes:
   patterns (`/NOTES.md`, not `NOTES.md`).
 - **`just wasm`** builds `-p en16931` only; the formats crate's PDF parser does
   not build for that target.
-- **Mutation testing**: CI mutates the lines a pull request changes, against the
-  fast suites, and fails on a survivor `.cargo/mutants-baseline.txt` does not
-  record with a reason; `just mutants-diff` runs the same locally. `just
-  mutants` is the full, slow sweep of the rules.
+- **Mutation testing** is local and optional: `just mutants-diff` mutates the
+  lines your change touches; `just mutants` is the full, slow sweep of the rules.
+  It is not run in CI.
 - **Fuzzing** runs in CI for 60 seconds per target; `just fuzz <target> 3600`
   is a long local run.
 
