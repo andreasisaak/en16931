@@ -16,11 +16,39 @@ Five profiles ship:
 | XRechnung 3.0 | 282 | no | `…#compliant#urn:xeinkauf.de:kosit:xrechnung_3.0` |
 | XRechnung 3.0 CVD | 290 | no | `…#compliant#…:xrechnung:cvd_0.9` |
 | XRechnung 3.0 Extension | 296 | no | `…#conformant#…:extension:xrechnung_3.0` |
-| Peppol BIS Billing 3.0 | 273 | **yes** | `…#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0` |
+| Peppol BIS Billing 3.0 | 290 | **yes** | `…#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0` |
 
 *Checks* counts what a profile declares. A report says how many actually ran for
 the document in hand, which can be one lower — `EN-EXT-01` has nothing to say
 about an invoice carrying no extension data.
+
+A profile is named by its slug, its display name, an alias (`core` for EN 16931,
+`bis3` or `peppol-bis-3` for Peppol) or its BT-24, and parses like any other
+value; an unknown name lists the slugs:
+
+```rust
+let p: &Profile = "core".parse()?;                      // EN 16931
+let err = "xrechung".parse::<&Profile>().unwrap_err();  // unknown profile "xrechung"; known: en16931, …
+```
+
+Each also has a valid example to start from,
+`en16931::examples::for_profile(&profiles::XRECHNUNG)`.
+
+A **received** document is also recognised by the ZUGFeRD / Factur-X profiles'
+own identifiers, through `en16931::profiles::classify`. They are outside the
+five — nothing is written or proved for them — but parse by slug like them
+(`zugferd-minimum`, `zugferd-basic-wl`, `zugferd-basic`, `zugferd-extended`),
+and each says which rules run:
+
+| ZUGFeRD / Factur-X | Runs | An EN 16931 invoice? |
+|---|---|---|
+| MINIMUM | `BR-CO-15` only | no — no lines; *undefined* on receipt |
+| BASIC WL | `BR-CO-11` … `BR-CO-16` | no — no lines; *undefined* on receipt |
+| BASIC (`#compliant#`) | every core rule | yes |
+| EXTENDED (`#conformant#`) | every core rule | yes |
+
+Any other BT-24 — a foreign CIUS, an earlier XRechnung's identifier — names no
+profile here, and a receiver following KoSIT rejects the document.
 
 ## A CIUS is a set of restrictions
 
@@ -37,8 +65,8 @@ derived from them:
 use en16931::profiles;
 use en16931::validation::profile::Restriction;
 
-// Eleven of XRechnung's BR-DE rules are pure `Mandatory` restrictions, and two
-// are `CodeValues`. All thirteen are data, not code; the rest need code.
+// Ten of XRechnung's BR-DE rules are `Mandatory` restrictions and two are
+// `CodeValues`: twelve rules that are data, not code.
 let ids: Vec<_> = profiles::XRECHNUNG.restrictions.iter().map(Restriction::id).collect();
 assert!(ids.contains(&"BR-DE-3"));    // Seller city (BT-37) shall be present
 assert!(ids.contains(&"BR-DE-17"));   // BT-3 restricted to eight codes
@@ -84,28 +112,17 @@ that takes one physically cannot be handed an unchecked invoice, or one checked
 against a different profile — the mistake that produces a document which passed
 your validator and fails the receiver's.
 
-### The proof has to be earned
+### Widening only where it holds
 
-`widen()` exists only where §4.4.4 actually holds, and whether it holds is
-computed rather than declared: `Profile::is_conformant_cius()` reads the
-profile's severity overrides and answers `false` if any of them relaxes a core
-rule.
-
-It answers `false` for three shipped profiles, and every one of those `false`s
-closed a real hole. A `Validated<XRechnungCvd> → Validated<En16931>` conversion
-once compiled, producing a **proof of core validity for an invoice violating
-`BR-CL-13`**. A serialiser trusting the core proof — the entire purpose of the
-type — would have been handed a document no core-only receiver can process. The
-same hole existed one layer up for plain XRechnung, because KoSIT relaxes
-`BR-CL-23` for every scenario, so a unit code outside CEN's Rec 20 table leaves
-an invoice valid as an XRechnung and invalid as a core invoice.
-
-Both conversions are gone, and a property test asserts the surviving guarantee
-over generated documents rather than one fixture: *if a conformant CIUS accepts
-it, core accepts it.*
-
-Re-validate instead. `Validated::<En16931>::new(invoice)` is one line, and it is
-a line that can honestly fail.
+`widen()` exists only where §4.4.4 holds, and whether it holds is computed:
+`Profile::is_conformant_cius()` reads the profile's severity overrides and
+answers `false` if any of them relaxes a core rule. It answers `false` for the
+three XRechnung profiles — KoSIT relaxes `BR-CL-21` and `BR-CL-23` (CVD also
+`BR-CL-13`, the Extension further code-list rules),
+so an invoice can be a valid XRechnung and an invalid core invoice. They have no
+`widen()`; re-validate with `Validated::<En16931>::new(invoice)` instead. A
+property test asserts the guarantee over generated documents: *if a conformant
+CIUS accepts it, core accepts it.*
 
 ## Profiles are siblings, not levels
 
@@ -140,10 +157,18 @@ Two are **rewritten on the way in**, and both differences are observable:
 So the two profiles hold **separate instances** of those rules rather than
 sharing one.
 
-Reading KoSIT's validator configuration suggests the opposite — it lists CEN's
-Schematron and KoSIT's own, and no Peppol. That is true, and it does not mean
-what it looks like: the second one *already contains* Peppol's rules by the time
-the validator loads it.
+KoSIT's validator configuration lists only CEN's Schematron and KoSIT's own;
+the second already contains the merged Peppol rules.
+
+## Peppol's national rules
+
+Of the **102** national rules in Peppol BIS Billing 3.0.21, the 31 German
+`DE-R-*` rules are KoSIT's own under Peppol ids and run under the XRechnung
+profiles, and **71 are not implemented** (DK 14, GR 19, IS 10, IT 4, NL 9, NO 2,
+SE 13; 61 fatal and 10 warning). Some check a national registry's identifier
+format or check digit; many are ordinary rules scoped by the seller's country —
+`NL-R-002` and `IT-R-002`…`004` make the seller's address mandatory, `SE-R-006`
+restricts the VAT rate.
 
 ## An Extension adds — and KoSIT ships one of each
 
@@ -269,14 +294,10 @@ assert!(VatCategory::can_share_document(&[SplitPayment, ZeroRated]).is_ok());
 assert!(VatCategory::can_share_document(&[SplitPayment, Standard]).is_err());
 ```
 
-The case that forced it is German municipal billing. A *hoheitliche
-Abwassergebühr* is not subject to VAT (`O`); drinking water is taxable (`S`);
-and `BR-O-11` … `BR-O-14` forbid `O` from sharing a document with anything at
-all — so the combined invoice **over 90 % of municipalities issue has no valid
-EN 16931 rendering**. That is the standard's decision, not an implementation
-choice, and no library can fix it. What a library owes is a refusal that names
-the reason *before* the work, and a clause the biller can quote to whoever asked
-for the invoice.
+A German municipal invoice combining a *hoheitliche Abwassergebühr* (`O`) with
+drinking water (`S`) has no valid EN 16931 rendering, since `BR-O-11` …
+`BR-O-14` forbid `O` from sharing a document; the refusal names that reason
+before the work.
 
 On the command line:
 
@@ -299,7 +320,7 @@ that will fire. `BR-O-11` covers a second breakdown group, `-12` a line, `-13` a
 allowance and `-14` a charge, and which reports depends on where the other
 category appears — which a set of codes cannot know.
 
-## What is next
+## See also
 
 - **[Syntaxes](@/docs/syntaxes.md)** — turning a proof into UBL or CII.
 - **[Conformance](@/docs/conformance.md)** — how the profile claims are measured.

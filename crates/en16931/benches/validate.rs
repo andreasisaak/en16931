@@ -1,25 +1,9 @@
-//! How long validation takes, measured rather than asserted.
+//! Validation time (`cargo bench`). Target: a 5-line invoice through the core
+//! rule set in well under 100 µs.
 //!
-//! `README.md` claims this crate is "µs, not ms, and no JVM" against the
-//! Schematron-driven tools. That is a performance claim made in a document that
-//! spends a section on the cost of unverified claims, so it needs a number.
-//!
-//! The target: **a typical 5-line invoice through the full core rule set in well
-//! under 100 µs.**
-//!
-//! Run with `cargo bench`. The interesting comparisons are:
-//!
-//! * `validate/core/5` — the headline number.
-//! * `profile/XRechnung 3.0/5` — 282 checks instead of 227, so the marginal cost
-//!   of a profile is visible.
-//! * `validate/core/100` and `validate/core/1000` — whether the per-line rules
-//!   stay linear. A validator that goes quadratic on line count is fine on
-//!   examples and dies on a telecoms bill with 5 000 call records.
-//!
-//! Those are the ids `criterion` actually prints. This list named
-//! `core/5-lines` and `xrechnung/5-lines`, neither of which has ever existed —
-//! a documentation bug in the one file whose whole subject is measuring rather
-//! than asserting.
+//! * `validate/core/5`: the headline number.
+//! * `profile/<id>/5`: the marginal cost of each profile's extra checks.
+//! * `validate/core/{1,100,1000}`: per-line rules must stay linear.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use en16931::invoice::*;

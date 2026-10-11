@@ -13,6 +13,13 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# cargo-fuzz's working directories: crash inputs (`artifacts/`), the corpus a run
+# grows (`corpus/`), coverage data. Only the hand-made seeds in `fuzz/seeds/` are
+# source; `just fuzz` writes new inputs to `target/fuzz-corpus/`.
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
@@ -31,15 +38,6 @@ target
 # already existing elements were commented out
 
 #/target
-
-# Reference specifications and validation artefacts (see spec/README.md).
-# Not committed: the CEN validation artefacts are EUPL-1.2 and the vendor
-# specifications carry their own terms — keeping them out of the repo keeps
-# both crates' MIT OR Apache-2.0 licensing clean. Fetch with `just spec`.
-#
-# One tree at the workspace root, serving both crates. It used to be two.
-/spec/
-
 
 # Local working notes, kept out of the repository.
 #
@@ -64,12 +62,35 @@ __pycache__/
 # Zola's build output for the documentation site (see `just site`).
 /site/public/
 
-# Internal architecture notes (see concepts/README.md).
+# ── Internal notes, feature specifications and third-party sources ─────────────
+
+# Architecture notes (see concepts/README.md): the D/R-numbered decisions and
+# risks, and ROADMAP.md, the spec of specs — every open item names its feature
+# specification.
 #
 # Anchored, for the reason the block above gives. These are working documents:
 # they cite the specifications by clause, quote the artefacts, and record what
 # each design decision cost — none of which is a claim this repository makes to
 # its users. `site/` is the public narrative and `CHANGELOG.md` the history;
-# `concepts/` is neither, and is not scanned by `just tracked` because it is not
-# a directory the build reads.
+# `concepts/` is neither.
+#
+# The third-party corpus — CEN / KoSIT / Peppol validation artefacts, published
+# instances, the standard — lives at `concepts/reference/` and is covered by
+# this line. The CEN artefacts are EUPL-1.2 and the vendor specifications carry
+# their own terms; keeping them out of the repository keeps every crate here
+# MIT OR Apache-2.0. `just references` (`cargo xtask fetch`) rebuilds it. Its
+# location is defined once, as `EN16931_REFERENCE` in `.cargo/config.toml`, so
+# nothing public has to name a path into `concepts/`.
 /concepts/
+
+# This project's own feature specifications, and the Spec Kit machinery that
+# produces them: one `specs/NNN-slug/` per ROADMAP item (spec, plan, research,
+# tasks), `.specify/memory/constitution.md`, and the `/speckit-*` skills. Same
+# rule as `concepts/` — internal, and the published tree may not cite a path its
+# reader does not have; `just concepts-check` fails on one that does.
+/specs/
+/.specify/
+/.claude/
+
+# Until 2026-10-10 the corpus was fetched into `spec/`; a stale copy stays ignored.
+/spec/

@@ -1,15 +1,15 @@
 //! Writing the semantic model as UN/CEFACT CII D16B.
 //!
-//! Ordering and the prohibitions are the shared serialiser's job, so this module is
-//! purely the *mapping*: which of CII's three document parts each business term
-//! lives in. That is the part no amount of cleverness derives — it was read off
-//! 170 published instances into [`super::order`], and this file places terms
-//! into the structure that table describes.
+//! Ordering (from [`super::order`], generated from the D16B schema) and the
+//! prohibitions are the shared serialiser's job; this module maps each business
+//! term into CII's three document parts.
 
 use en16931::invoice::*;
 use en16931::{Date, DocumentReference, Identifier, InvoiceAmount};
 
 use super::{ns, order, prohibitions};
+use crate::Written;
+use crate::report::{Entry, Kind};
 use crate::xml::{Xml, base64};
 
 /// How the serialiser answers CII's two questions.
@@ -23,16 +23,6 @@ static RULES: crate::xml::Rules = crate::xml::Rules {
 /// `udt:DateTimeString`, `udt:DateString` and `qdt:DateTimeString` alike.
 pub(super) const DATE_FORMAT: &str = "102";
 
-/// What writing produced.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct Written {
-    /// The document.
-    pub xml: String,
-    /// Terms CII has no place for, as `Parent/child`. Normally empty.
-    pub dropped: Vec<String>,
-}
-
 /// An amount, as CII writes it.
 fn amt(a: InvoiceAmount) -> String {
     a.to_string()
@@ -40,9 +30,7 @@ fn amt(a: InvoiceAmount) -> String {
 
 /// `<ram:Foo><udt:DateTimeString format="102">20260115</udt:DateTimeString></ram:Foo>`
 ///
-/// CII never writes a bare date. Every one is wrapped and formatted, and the
-/// format attribute is not optional — a `udt:DateTimeString` without it is
-/// ambiguous between `CCYYMMDD` and half a dozen UN/EDIFACT 2379 codes.
+/// The `format` attribute is always written.
 fn date(x: &mut Xml, wrapper: &str, d: Date) {
     dated(x, wrapper, "udt:DateTimeString", d);
 }
@@ -75,11 +63,8 @@ fn dated(x: &mut Xml, wrapper: &str, element: &str, d: Date) {
     });
 }
 
-/// BT-149 with BT-150, and **no `unitCode` when BT-150 is absent**.
-///
-/// Writing `unitCode=""` instead made the reader hand back `Some("")`, which
-/// `PEPPOL-EN16931-R130` compares against BT-130 and rejects — a fatal finding
-/// created by the round trip, on six of the published CII instances.
+/// BT-149 with BT-150, and no `unitCode` when BT-150 is absent (an empty one
+/// reads back as `Some("")` and trips `PEPPOL-EN16931-R130`).
 fn basis_quantity(x: &mut Xml, p: &en16931::invoice::PriceDetails) {
     let Some(q) = p.base_quantity else { return };
     let unit = p
@@ -91,8 +76,7 @@ fn basis_quantity(x: &mut Xml, p: &en16931::invoice::PriceDetails) {
     x.leaf("ram:BasisQuantity", &attrs, &q.to_string());
 }
 
-/// The `ram:ChargeIndicator` wrapper, which is how CII tells an allowance from
-/// a charge — the same job UBL's `cbc:ChargeIndicator` does one level up.
+/// The `ram:ChargeIndicator` wrapper, telling an allowance from a charge.
 fn charge_indicator(x: &mut Xml, is_charge: bool) {
     x.group("ram:ChargeIndicator", |x| {
         x.leaf(
@@ -114,11 +98,10 @@ fn ident(x: &mut Xml, name: &str, i: &Identifier) {
 
 /// Write an invoice as CII D16B, reporting anything the syntax could not carry.
 ///
-/// There is one document element for both invoices and credit notes: CII
-/// distinguishes them by BT-3 alone, so unlike [`fn@crate::ubl::write`] this
-/// function never branches on [`en16931::DocumentKind`].
+/// One document element for invoices and credit notes; CII distinguishes them
+/// by BT-3 alone.
 #[must_use]
-pub fn write(inv: &Invoice) -> Written {
+pub(crate) fn write(inv: &Invoice) -> Written {
     let ccy = inv.currency.as_ref().map_or("", Code::as_str);
 
     let mut x = Xml::new(
@@ -150,6 +133,31 @@ pub fn write(inv: &Invoice) -> Written {
     });
 
     // ---- 2. the document itself -----------------------------------------
+    // D16B requires `ram:ID` and `ram:IssueDateTime`; a missing BT-1 or BT-2 is
+    // reported, not invented (BR-02 / BR-03 stop `crate::write` before this).
+    for (absent, term, element, rule) in [
+        (inv.number.is_none(), "BT-1", "ram:ID", "BR-02"),
+        (
+            inv.issue_date.is_none(),
+            "BT-2",
+            "ram:IssueDateTime",
+            "BR-03",
+        ),
+    ] {
+        if absent {
+            x.note(
+                Entry::new(
+                    Kind::Schema,
+                    format!("rsm:ExchangedDocument/{element}"),
+                    format!(
+                        "absent, and D16B requires it: the document is not schema-valid \
+                         ({rule} reports the absence on the model)"
+                    ),
+                )
+                .term(term),
+            );
+        }
+    }
     x.group_required("rsm:ExchangedDocument", |x| {
         if let Some(n) = &inv.number {
             x.leaf("ram:ID", &[], n);
@@ -163,8 +171,7 @@ pub fn write(inv: &Invoice) -> Written {
         for n in &inv.notes {
             x.group("ram:IncludedNote", |x| {
                 x.leaf("ram:Content", &[], n.note.as_deref().unwrap_or_default());
-                // BT-21 has an element of its own here, where UBL splices it
-                // into the note text as `#AAI#`. CII is the tidier of the two.
+                // BT-21 has its own element in CII.
                 if let Some(c) = &n.subject_code {
                     x.leaf("ram:SubjectCode", &[], c.as_str());
                 }
@@ -172,58 +179,55 @@ pub fn write(inv: &Invoice) -> Written {
         }
     });
 
-    // CII has **one** document element where UBL has two, so the credit-note
-    // distinction lives entirely in BT-3. A model that says "credit note" while
-    // carrying an invoice type code therefore cannot be written down here — the
-    // reader on the far side has nothing but BT-3 to go on and will read it back
-    // as an invoice.
-    //
-    // That is a property of the syntax, not a bug, and it is exactly why UBL's
-    // `<CreditNote>` root exists. What would be a bug is losing it in silence:
-    // KoSIT ships negative instances of precisely this shape.
+    // The credit-note distinction lives only in BT-3, so a credit note with an
+    // invoice type code reads back as an invoice; that loss is reported.
     if matches!(inv.kind, DocumentKind::CreditNote)
         && !inv
             .type_code
             .as_ref()
             .is_some_and(|c| c.is_in(en16931::codes::generated::CREDIT_NOTE_TYPE_CODES))
     {
-        x.dropped(format!(
-            "the document is a credit note and BT-3 is {}, which is not a UNTDID 1001 \
-             credit-note code — CII carries the distinction in BT-3 alone, so it reads \
-             back as an invoice (BR-CL-01 reports the same disagreement on the model)",
-            inv.type_code
-                .as_ref()
-                .map_or("absent".to_owned(), |c| format!("{:?}", c.as_str()))
-        ));
+        let e = Entry::new(
+            Kind::Dropped,
+            "rsm:ExchangedDocument/ram:TypeCode",
+            "the document is a credit note and BT-3 is not a UNTDID 1001 credit-note \
+             code — CII carries the distinction in BT-3 alone, so it reads back as an \
+             invoice (BR-CL-01 reports the same disagreement on the model)",
+        )
+        .term("BT-3");
+        x.note(match &inv.type_code {
+            Some(c) => e.value(c.as_str()),
+            None => e,
+        });
     }
 
-    // BG-DEX-01 and BG-DEX-09 are the XRechnung Extension's, and this binding
-    // writes neither — but for **two different reasons**, and conflating them
-    // told a user to fix something that is not broken.
-    //
-    // Sub invoice lines are the one XRechnung positively refuses in CII:
-    // `BR-DEX-15` asserts `not(exists(//ram:ParentLineID))` and says so in
-    // words — *"This CII file might use the concept of Sub Invoice Lines.
-    // However XRechnung does not support this."* Writing them would produce a
-    // document KoSIT objects to, so **not** writing them is correct rather than
-    // unfinished. The note says which rule, because "use UBL" without the
-    // reason reads as a workaround for a missing feature.
+    // BG-DEX-01 and BG-DEX-09 (XRechnung Extension) are not written, for
+    // different reasons. Sub invoice lines: XRechnung refuses them in CII
+    // (`BR-DEX-15`, `not(exists(//ram:ParentLineID))`).
     if !inv.extensions.sub_invoice_lines.is_empty() {
-        x.dropped(
-            "BG-DEX-01 SUB INVOICE LINE — XRechnung does not support sub invoice lines in \
-             CII at all (BR-DEX-15 forbids ram:ParentLineID), so they are not written here. \
-             UBL carries them; CII cannot"
-                .to_owned(),
+        x.note(
+            Entry::new(
+                Kind::Dropped,
+                "ram:IncludedSupplyChainTradeLineItem",
+                "XRechnung does not support sub invoice lines in CII at all (ram:ParentLineID \
+                 is forbidden), so they are not written",
+            )
+            .term("BG-DEX-01")
+            .rule("BR-DEX-15")
+            .hint("UBL carries them; write UBL"),
         );
     }
-    // Third party payments are a genuine gap: KoSIT ships a CII Extension
-    // scenario and no rule forbids them, so this binding simply does not write
-    // them yet.
+    // Third party payments: no rule forbids them in CII, but this binding does
+    // not write them; reported as dropped.
     if !inv.extensions.third_party_payments.is_empty() {
-        x.dropped(
-            "BG-DEX-09 THIRD PARTY PAYMENT — the CII binding does not write this XRechnung \
-             Extension group yet; use UBL, where it does"
-                .to_owned(),
+        x.note(
+            Entry::new(
+                Kind::Dropped,
+                "ram:ApplicableHeaderTradeSettlement",
+                "the CII binding does not write this XRechnung Extension group yet",
+            )
+            .term("BG-DEX-09")
+            .hint("UBL carries it; write UBL"),
         );
     }
 
@@ -237,8 +241,8 @@ pub fn write(inv: &Invoice) -> Written {
         settlement(x, inv, ccy);
     });
 
-    let (xml, dropped) = x.finish();
-    Written { xml, dropped }
+    let (xml, entries) = x.finish();
+    Written { xml, entries }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,8 +287,7 @@ fn agreement(x: &mut Xml, inv: &Invoice) {
         for a in &inv.attachments {
             attachment(x, a);
         }
-        // BT-17 and BT-18 ride on `AdditionalReferencedDocument` with a type
-        // code, exactly as they ride on UBL's `AdditionalDocumentReference`.
+        // BT-17 and BT-18 ride on `AdditionalReferencedDocument` with a type code.
         if let Some(t) = &inv.tender_reference {
             x.group("ram:AdditionalReferencedDocument", |x| {
                 x.leaf("ram:IssuerAssignedID", &[], t.as_str());
@@ -303,9 +306,8 @@ fn agreement(x: &mut Xml, inv: &Invoice) {
         if let Some(p) = &inv.project_reference {
             x.group("ram:SpecifiedProcuringProject", |x| {
                 x.leaf("ram:ID", &[], p.as_str());
-                // `ram:Name` is mandatory inside this aggregate and EN 16931
-                // has no term for it. CEN's own examples carry the reference
-                // again rather than inventing a title.
+                // `ram:Name` is mandatory with no EN 16931 term; CEN's
+                // examples repeat the reference.
                 x.leaf("ram:Name", &[], p.as_str());
             });
         }
@@ -340,15 +342,11 @@ fn attachment(x: &mut Xml, a: &SupportingDocument) {
 
 /// A trade party.
 ///
-/// `seller` selects the terms that exist only on the seller: BT-33 (additional
-/// legal information) has no buyer counterpart, and writing one would be the
-/// CII equivalent of the `UBL-CR-244` bug.
+/// `seller` selects the seller-only terms, such as BT-33.
 fn party(x: &mut Xml, wrapper: &str, p: &Party, seller: bool) {
     x.group(wrapper, |x| {
         for i in &p.identifiers {
-            // A scheme-qualified identifier is `ram:GlobalID` with `@schemeID`;
-            // an unqualified one is `ram:ID`. Two elements for one business
-            // term, which is why the reader has to merge them back.
+            // Scheme-qualified: `ram:GlobalID` with `@schemeID`; else `ram:ID`.
             if i.scheme().is_some() {
                 ident(x, "ram:GlobalID", i);
             } else {
@@ -401,8 +399,7 @@ fn party(x: &mut Xml, wrapper: &str, p: &Party, seller: bool) {
             });
         }
         if let Some(t) = &p.tax_registration {
-            // `FC` rather than `VA`: a non-VAT registration, which is what
-            // BT-32 is and what the reader tells apart by the same code.
+            // `FC`, not `VA`: BT-32 is a non-VAT registration.
             x.group("ram:SpecifiedTaxRegistration", |x| {
                 x.leaf("ram:ID", &[("schemeID", "FC")], t);
             });
@@ -411,8 +408,7 @@ fn party(x: &mut Xml, wrapper: &str, p: &Party, seller: bool) {
 }
 
 fn address(x: &mut Xml, a: &PostalAddress) {
-    // `group` drops an aggregate whose body writes nothing, so a blank address
-    // needs no separate emptiness check — one rule, not two that can disagree.
+    // `group` drops a blank address.
     x.group("ram:PostalTradeAddress", |x| {
         if let Some(p) = &a.post_code {
             x.leaf("ram:PostcodeCode", &[], p);
@@ -443,25 +439,14 @@ fn address(x: &mut Xml, a: &PostalAddress) {
 // ---------------------------------------------------------------------------
 
 fn delivery(x: &mut Xml, inv: &Invoice) {
-    // `ram:ApplicableHeaderTradeDelivery` is mandatory in the D16B sequence
-    // and may legitimately be empty — a minimal invoice delivers nothing.
-    //
-    // Empty is *correct*, not merely tolerated, and this has been questioned
-    // from outside, so the evidence: the D16B XSD gives the element no
-    // `minOccurs`, which defaults to 1 — omitting it fails schema validation
-    // outright — and KoSIT carves exactly this element out of the
-    // empty-element rule *by hand*. Peppol BIS publishes no CII Schematron at
-    // all (it is UBL-only), so R008 reaches CII only through KoSIT's
-    // translation, `xrechnung-schematron`'s src/xsl/peppol-into-xr.xsl —
-    // which, under the comment "add R008 to CII", authors the context as
+    // `ram:ApplicableHeaderTradeDelivery` is mandatory in D16B (no
+    // `minOccurs`) and may be empty. KoSIT's CII translation of Peppol R008
+    // exempts it from the empty-element rule:
     //
     //   //*[not(name() = 'ram:ApplicableHeaderTradeDelivery')
     //      and not(*) and not(normalize-space())]
     //
-    // A validator that flags `<ram:ApplicableHeaderTradeDelivery/>` under
-    // R008 is applying Peppol's UBL-targeted rule to CII without the
-    // authority's carve-out. Do not "fix" this by omitting the element: that
-    // trades a spurious warning for a hard XSD failure.
+    // Do not omit it: that fails the XSD.
     x.group_required("ram:ApplicableHeaderTradeDelivery", |x| {
         if let Some(d) = &inv.delivery {
             if d.party_name.is_some() || d.location.is_some() || d.address.is_some() {
@@ -505,6 +490,24 @@ fn delivery(x: &mut Xml, inv: &Invoice) {
 // ---------------------------------------------------------------------------
 
 fn settlement(x: &mut Xml, inv: &Invoice, ccy: &str) {
+    // BT-8 in CII's spelling (UNTDID 2475). A value with no CII spelling is
+    // not written; `BR-CL-06` reports it on the model.
+    let bt8 = inv.vat_point_date_code.as_ref().and_then(|c| {
+        let cii = super::vat_point_date_code_to_cii(c.as_str());
+        if cii.is_none() {
+            x.note(
+                Entry::new(
+                    Kind::Dropped,
+                    "ram:ApplicableTradeTax/ram:DueDateTypeCode",
+                    "no CII spelling — ram:DueDateTypeCode carries 5, 29 or 72 for the \
+                     model's 3, 35 or 432 (BR-CL-06 reports it on the model)",
+                )
+                .term("BT-8")
+                .value(c.as_str()),
+            );
+        }
+        cii
+    });
     x.group_required("ram:ApplicableHeaderTradeSettlement", |x| {
         if let Some(p) = &inv.payment
             && let Some(PaymentMeans::DirectDebit(d)) = &p.means
@@ -543,7 +546,7 @@ fn settlement(x: &mut Xml, inv: &Invoice, ccy: &str) {
         if let Some(p) = &inv.payment {
             payment_means(x, p);
         }
-        for b in &inv.vat_breakdown {
+        for (i, b) in inv.vat_breakdown.iter().enumerate() {
             x.group("ram:ApplicableTradeTax", |x| {
                 x.leaf("ram:CalculatedAmount", &[], &amt(b.tax_amount));
                 x.leaf("ram:TypeCode", &[], "VAT");
@@ -555,13 +558,15 @@ fn settlement(x: &mut Xml, inv: &Invoice, ccy: &str) {
                 if let Some(c) = &b.exemption_reason_code {
                     x.leaf("ram:ExemptionReasonCode", &[], c.as_str());
                 }
-                // BT-7 and BT-8 sit on the *tax breakdown* in CII, not on the
-                // document as they do in UBL. Repeated on each entry, which is
-                // what the standard says and what the reader collapses.
-                if let Some(c) = &inv.vat_point_date_code {
-                    x.leaf("ram:DueDateTypeCode", &[], c.as_str());
+                // BT-7 and BT-8 sit on the tax breakdown. BT-8 may repeat if
+                // identical (`CII-SR-462`); BT-7 only once in the document
+                // (`CII-SR-461`), so it goes on the first entry only.
+                if let Some(c) = bt8 {
+                    x.leaf("ram:DueDateTypeCode", &[], c);
                 }
-                if let Some(d) = inv.vat_point_date {
+                if i == 0
+                    && let Some(d) = inv.vat_point_date
+                {
                     plain_date(x, "ram:TaxPointDate", d);
                 }
                 if let Some(r) = b.rate {
@@ -628,9 +633,7 @@ fn settlement(x: &mut Xml, inv: &Invoice, ccy: &str) {
                 x.leaf("ram:AllowanceTotalAmount", &[], &amt(a));
             }
             x.leaf("ram:TaxBasisTotalAmount", &[], &amt(t.taxable_total));
-            // The one amount CII requires a currency on, and the reason is
-            // BT-111: the VAT total may be stated in the accounting currency
-            // as well, and the two are told apart by `@currencyID` alone.
+            // `@currencyID` tells BT-110 from BT-111 (accounting currency).
             if let Some(v) = t.vat_total {
                 x.leaf("ram:TaxTotalAmount", &[("currencyID", ccy)], &amt(v));
             }
@@ -658,18 +661,18 @@ fn settlement(x: &mut Xml, inv: &Invoice, ccy: &str) {
                     formatted_date(x, "ram:FormattedIssueDateTime", d);
                 }
             });
-            if !rest.is_empty() {
-                let refs: Vec<_> = rest
-                    .iter()
-                    .map(|p| format!("{:?}", p.reference.as_str()))
-                    .collect();
-                x.dropped(format!(
-                    "BG-3 PRECEDING INVOICE REFERENCE {} — CII allows only one \
-                     ram:InvoiceReferencedDocument, so only the first ({:?}) is written; \
-                     UBL carries them all",
-                    refs.join(", "),
-                    p.reference.as_str()
-                ));
+            for (i, r) in rest.iter().enumerate() {
+                x.note(
+                    Entry::new(
+                        Kind::Dropped,
+                        "ram:ApplicableHeaderTradeSettlement/ram:InvoiceReferencedDocument",
+                        "CII allows one ram:InvoiceReferencedDocument, so only the first \
+                         preceding invoice is written",
+                    )
+                    .term(format!("BG-3[{}]", i + 1))
+                    .value(r.reference.as_str())
+                    .hint("UBL carries them all"),
+                );
             }
         }
         if let Some(a) = &inv.accounting_reference {
@@ -681,14 +684,18 @@ fn settlement(x: &mut Xml, inv: &Invoice, ccy: &str) {
 }
 
 fn period(x: &mut Xml, wrapper: &str, p: &Period, what: &str) {
-    // See the UBL writer's twin: a pruned empty group is right for the document
-    // and loses the model's distinction between "absent" and "present and
-    // empty", which `BR-CO-19` / `BR-CO-20` are about. Reported, not silent.
+    // An empty BG-14 is pruned; reported, since the model distinguishes it
+    // from an absent one (`BR-CO-19` / `BR-CO-20`).
     if p.start.is_none() && p.end.is_none() {
-        x.dropped(format!(
-            "{what} is present with neither a start nor an end date, which \
-             {wrapper} cannot express (BR-CO-19 / BR-CO-20 report it on the model)"
-        ));
+        x.note(
+            Entry::new(
+                Kind::Dropped,
+                wrapper,
+                "present with neither a start nor an end date, which this element cannot \
+                 express (BR-CO-19 / BR-CO-20 report it on the model)",
+            )
+            .term(what),
+        );
         return;
     }
     x.group(wrapper, |x| {
@@ -702,14 +709,9 @@ fn period(x: &mut Xml, wrapper: &str, p: &Period, what: &str) {
 }
 
 fn payment_means(x: &mut Xml, p: &PaymentInstructions) {
-    // BG-17 is 0..n and D16B puts `ram:PayeePartyCreditorFinancialAccount` at
-    // **0..1** inside `ram:SpecifiedTradeSettlementPaymentMeans`
-    // (`TradeSettlementPaymentMeansType` in the XSD) — several accounts are
-    // several payment-means elements, exactly as in UBL, where CEN's own
-    // `guide-example1.xml` repeats `cac:PaymentMeans` per account. Two
-    // accounts inside one aggregate fails the schema — and a reader that keeps
-    // only the last element's accounts makes a round trip agree with itself
-    // while losing one, which is why both halves are pinned by tests.
+    // BG-17 is 0..n but `ram:PayeePartyCreditorFinancialAccount` is 0..1 in
+    // `ram:SpecifiedTradeSettlementPaymentMeans`, so each account gets its own
+    // payment-means element.
     let head = |x: &mut Xml| {
         if let Some(c) = &p.means_code {
             x.leaf("ram:TypeCode", &[], c.as_str());
@@ -761,8 +763,7 @@ fn payment_means(x: &mut Xml, p: &PaymentInstructions) {
                     });
                 }
             }
-            // An empty credit-transfer list: no account to carry, so one bare
-            // payment-means element with the code is all there is to say.
+            // An empty credit-transfer list: one bare payment-means element.
             Some(PaymentMeans::CreditTransfer(_)) | None => {}
         }
     });
@@ -829,10 +830,8 @@ fn line(x: &mut Xml, l: &InvoiceLine, i: usize, ccy: &str) {
                     x.leaf("ram:LineID", &[], o.as_str());
                 });
             }
-            // BT-148's gross price and BT-147's discount are one aggregate:
-            // the discount is an *applied allowance* on the gross price, and
-            // the net price BT-146 is a sibling. Same shape as UBL's
-            // price-level `cac:AllowanceCharge`, differently named.
+            // BT-147 is an applied allowance inside BT-148's gross-price
+            // aggregate; BT-146 is a sibling.
             if let Some(g) = l.price.gross_price {
                 x.group("ram:GrossPriceProductTradePrice", |x| {
                     x.leaf("ram:ChargeAmount", &[], &g.to_string());
@@ -845,15 +844,21 @@ fn line(x: &mut Xml, l: &InvoiceLine, i: usize, ccy: &str) {
                     }
                 });
             } else if l.price.price_discount.is_some() {
-                // CII nests BT-147 **inside** the gross-price aggregate, so a
-                // discount stated without a gross price has nowhere to go. UBL
-                // can carry it; CII cannot. No table sees that, because it is a
-                // property of the content model rather than of a prohibition —
-                // so the writer says so itself.
-                x.dropped(format!(
-                    "BG-25[{i}]/BT-147 (ram:AppliedTradeAllowanceCharge needs \
-                     ram:GrossPriceProductTradePrice, and BT-148 is absent)"
-                ));
+                // BT-147 without a gross price has nowhere to go in CII.
+                x.note(
+                    Entry::new(
+                        Kind::Dropped,
+                        "ram:GrossPriceProductTradePrice/ram:AppliedTradeAllowanceCharge",
+                        "CII nests the discount inside the gross price, and BT-148 is absent",
+                    )
+                    .term(format!("BG-25[{i}]/BT-147"))
+                    .value(
+                        l.price
+                            .price_discount
+                            .map(|d| d.to_string())
+                            .unwrap_or_default(),
+                    ),
+                );
             }
             x.group("ram:NetPriceProductTradePrice", |x| {
                 x.leaf("ram:ChargeAmount", &[], &l.price.net_price.to_string());
@@ -986,10 +991,14 @@ mod tests {
             out.xml
                 .contains("<ram:IssuerAssignedID>INV-1</ram:IssuerAssignedID>")
         );
-        let [note] = &out.dropped[..] else {
-            panic!("expected one note, got {:?}", out.dropped);
-        };
-        assert!(note.contains("\"INV-2\", \"INV-3\""), "{note}");
+        // BT-1 and BT-2 are absent here too; only the BG-3 note is this test's.
+        let lost: Vec<_> = out
+            .entries
+            .iter()
+            .filter(|d| d.term.as_deref().is_some_and(|t| t.starts_with("BG-3")))
+            .map(|d| d.value.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(lost, ["INV-2", "INV-3"], "{:?}", out.entries);
     }
 
     /// BT-7 sits in a `udt:DateType`, whose child is `udt:DateString`.
@@ -1049,6 +1058,12 @@ mod tests {
         ] {
             assert!(out.xml.contains(part), "missing {part}\n{}", out.xml);
         }
-        assert!(out.dropped.is_empty(), "{:?}", out.dropped);
+        // D16B requires BT-1 and BT-2; their absence is reported, nothing else.
+        let [bt1, bt2] = &out.entries[..] else {
+            panic!("expected the BT-1 and BT-2 notes, got {:?}", out.entries);
+        };
+        assert_eq!(bt1.term.as_deref(), Some("BT-1"));
+        assert_eq!(bt2.term.as_deref(), Some("BT-2"));
+        assert!(bt1.kind == crate::report::Kind::Schema && bt2.kind == crate::report::Kind::Schema);
     }
 }

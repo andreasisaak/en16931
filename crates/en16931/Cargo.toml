@@ -1,12 +1,12 @@
 [package]
 name        = "en16931"
 description = """\
-The EN 16931 semantic data model and its business rules, as Rust types. \
-Validates the model rather than a serialised document, so findings point at \
-BT-151 on line 3 instead of at an XPath. No XML, no PDF, no I/O.\
+The EN 16931 European e-invoice semantic model and its business rules as Rust \
+types: build, reconcile and validate an invoice against EN 16931, XRechnung \
+and Peppol BIS Billing 3.0, and get a typed proof of validity. No XML, no I/O.\
 """
 keywords   = ["einvoice", "en16931", "invoice", "xrechnung", "peppol"]
-categories = ["finance", "data-structures", "encoding"]
+categories = ["finance", "data-structures"]
 readme     = "README.md"
 
 version.workspace      = true
@@ -22,30 +22,26 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
-# Stronger payment-identifier checks via the `sepa` crate: the full ISO 13616
-# registry for BT-84's IBAN instead of the mod-97-10 checksum alone, plus an EPC
-# creditor-identifier check on BT-90. Off by default — it brings `quick-xml`.
+# IBAN checks against the ISO 13616 registry (not only mod-97-10) and the
+# `EN-SEPA-01` creditor-identifier check on BT-90, via the `sepa` crate.
 sepa = ["dep:sepa"]
-# Emit a `ValidationReport` as SVRL. **Adds no dependencies**: SVRL is a report
-# format, not an invoice syntax, so writing it needs escaping and nothing else.
+# Render a report as SVRL. Adds no dependencies.
 svrl = []
-# `serde` on all public types. Types carrying invariants re-run their validation
-# on deserialisation via `#[serde(try_from = ...)]`.
+# `serde` on all public types; types with invariants re-check them on deserialisation.
 serde = ["dep:serde", "rust_decimal/serde"]
 # Convert to and from `chrono::NaiveDate`.
 chrono = ["dep:chrono"]
 # Convert to and from `time::Date`.
 time = ["dep:time"]
-# Conversion from `billing::BillingDocument`.
+# `billing_adapter::from_billing`: a `billing` 0.16 document and a header to an invoice.
 billing = ["dep:billing"]
 
 [dependencies]
-# The same two `billing` has: an invoice model has no business pulling in a
-# runtime. Everything else is optional.
+# Two required dependencies; everything else is optional.
 rust_decimal.workspace = true
 thiserror.workspace    = true
 
-billing = { version = "0.15", optional = true }
+billing = { version = "0.16", optional = true }
 serde   = { workspace = true, optional = true }
 chrono  = { version = "0.4", optional = true, default-features = false }
 time    = { version = "0.3", optional = true, default-features = false }
@@ -54,14 +50,11 @@ sepa    = { version = "0.5", default-features = false, optional = true }
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["html_reports"] }
 proptest  = "1.11.0"
-# Test-only, for `tests/conformance.rs`. The library ships no XML and has no
-# XML dependency.
+# Test-only: the artefact suites read the reference corpus's XML.
 roxmltree    = { workspace = true }
 rust_decimal = { workspace = true, features = ["macros"] }
 serde_json   = "1"
 
-# Gated like the report shapes it demonstrates, rather than compiling to a
-# program that only prints "build with --features …".
 [[example]]
 name              = "report_formats"
 required-features = ["serde", "svrl"]

@@ -1,17 +1,11 @@
 //! CII prohibitions, extracted from CEN's Schematron as data.
 //!
-//! The CII half of the story [`crate::ubl::prohibitions`] tells, and the same
-//! caveat applies with more force: **the context is half the rule.**
+//! Each rule applies only under its Schematron context: `CII-DT-076`
+//! (`not(ram:ID)`) forbids `ram:ID` on the element the context selects, not
+//! everywhere. So [`forbidden_path`] matches context and relative path.
 //!
-//! `CII-DT-076` is `not(ram:ID)`, and it does *not* mean "no document may
-//! contain `ram:ID`" — it means the element that rule's context selects may not
-//! have one. An earlier version of this table dropped the context, and the
-//! writer duly discarded every `ram:ID` in the document. So each entry carries
-//! its context and [`forbidden_path`] matches both halves.
-//!
-//! CII has **no global attribute prohibitions** — its extension points are
-//! elements. The table is present and empty rather than absent, so both
-//! syntaxes offer the shared serialiser the same interface.
+//! CII has no global attribute prohibitions; [`FORBIDDEN_ATTRIBUTES`] is empty
+//! so both syntaxes share one interface.
 
 use super::prohibitions_generated as generated;
 pub use generated::{FORBIDDEN_ATTRIBUTES, FORBIDDEN_PATHS, TOTAL_PARAMS, UNEXTRACTED};
@@ -41,18 +35,8 @@ pub fn forbidden_attribute(name: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    /// **The index answers exactly what a full scan answers.**
-    ///
-    /// `forbidden_path` used to scan all of `FORBIDDEN_PATHS`; it now looks up
-    /// a bucket keyed by the path's last segment, which made writing a document
-    /// twenty to sixty times faster (D44). That is only sound if the two agree
-    /// on **every** input, including the ones where two prohibitions match and
-    /// the reported id has to be the same one.
-    ///
-    /// So the scan is kept here as the reference implementation and the two are
-    /// compared over every path the tables themselves describe — both the
-    /// matching case, built from each entry's own context and relative path,
-    /// and near misses built by nesting it one level deeper.
+    /// The last-segment index returns the same rule id as a linear scan, for
+    /// every table entry's own path and the same path nested one level deeper.
     #[test]
     fn the_index_agrees_with_a_full_scan() {
         fn by_scan(path: &str) -> Option<&'static str> {
@@ -65,12 +49,8 @@ mod tests {
         let mut checked = 0usize;
         for (_, ctx, rel) in FORBIDDEN_PATHS {
             let root = ctx.trim_start_matches('/');
-            // Two variants rather than four: the path this entry is about,
-            // and the same nested one level deeper — which an anchored context
-            // must refuse and a floating one must still match. That is the
-            // distinction the index could plausibly get wrong, and the sweep is
-            // quadratic in the table, so the other variants cost seconds and
-            // test nothing new.
+            // Nested one level deeper: an anchored context must refuse it, a
+            // floating one must still match.
             for path in [
                 format!("{root}/{rel}"),
                 format!("rsm:CrossIndustryInvoice/ram:Somewhere/{root}/{rel}"),
@@ -105,9 +85,7 @@ mod tests {
         const { assert!(UNEXTRACTED < 80) };
     }
 
-    /// The regression this module's context exists to prevent: `ram:ID` is a
-    /// legitimate element almost everywhere, and a context-free table forbade
-    /// it outright.
+    /// `ram:ID` is legitimate almost everywhere; only context-specific rules forbid it.
     #[test]
     fn ram_id_is_not_forbidden_outright() {
         for path in [
@@ -131,8 +109,7 @@ mod tests {
         }
     }
 
-    /// A prohibition in the table must still fire when it genuinely applies,
-    /// or the whole thing passes by checking nothing.
+    /// A prohibition still fires where it applies.
     #[test]
     fn a_real_prohibition_still_fires() {
         let (rule, ctx, rel) = FORBIDDEN_PATHS[0];

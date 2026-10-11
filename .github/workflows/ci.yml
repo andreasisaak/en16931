@@ -80,9 +80,9 @@ jobs:
         run: cargo clippy -p en16931 --all-targets --no-default-features --features svrl -- -D warnings
       - name: en16931 · serde only
         run: cargo clippy -p en16931 --all-targets --no-default-features --features serde -- -D warnings
-      # The calculation-engine seam. Its own combination, because `billing` is
-      # the only optional dependency that brings a whole domain model with it —
-      # and the adapter tracks its API, so a `cargo update` that moves `billing`
+      # The calculation-engine seam (`billing` 0.16). Its own combination, because
+      # `billing` is the only optional dependency that brings a whole domain model
+      # with it — and the seam tracks its API, so a `cargo update` that moves `billing`
       # must fail here rather than in `--all-features`, where the message would
       # be buried under everything else.
       - name: en16931 · billing adapter
@@ -121,7 +121,7 @@ jobs:
   # Five generated files across both crates — the code lists, and the element
   # order and prohibition tables for each syntax — are derived from the
   # artefacts, not written by hand. The conformance and corpus suites run CEN's
-  # and KoSIT's own instances. All of it needs `spec/`, which is not committed,
+  # and KoSIT's own instances. All of it needs the reference corpus, which is not committed,
   # so without this job the tables could drift and the suites would skip while
   # still reporting green.
   #
@@ -136,11 +136,27 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Fetch the CEN / KoSIT / Peppol artefacts
+      - name: Fetch the CEN / KoSIT / Peppol artefacts and the OASIS UBL 2.1 schemas
         run: cargo xtask fetch
+      # `xmllint` for the schema gate (`tests/schema_gate.rs`): every CII
+      # document the suites write is validated against CEN's D16B schema, every
+      # UBL document against the OASIS UBL 2.1 schemas. A
+      # test-time tool, never a dependency; under `EN16931_REQUIRE_SPEC` the
+      # gate fails rather than skips without it.
+      - name: Install xmllint
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libxml2-utils
+      # veraPDF for the PDF/A-3b gate (`tests/zugferd_embed.rs`): every PDF
+      # `zugferd::embed` writes is validated by veraPDF's REST service in its
+      # official image, which the test starts once through `testcontainers`.
+      # Pinned by tag and digest — the same reference the test names; pulled
+      # here so the download is a step of its own rather than a test timeout.
+      # Docker is preinstalled on the runner; under `EN16931_REQUIRE_SPEC` the
+      # gate fails rather than skips without it.
+      - name: Pull the veraPDF image
+        run: docker pull --platform linux/amd64 verapdf/rest:v1.30.2@sha256:341359ac6af558f35f03c355a798fec57ba049dd04f0a503f300170e1696573b
       - name: Generated code is current
         run: cargo xtask check
-      # `EN16931_REQUIRE_SPEC=1` turns "skip because spec/ is missing" into a
+      # `EN16931_REQUIRE_SPEC=1` turns "skip because the reference corpus is missing" into a
       # failure. Without it this job's guarantee is aspirational: the suites
       # skip silently, report green, and the run says the conformance corpus
       # passed when it validated nothing. That is not hypothetical — moving the
@@ -149,6 +165,50 @@ jobs:
         run: cargo test --workspace --all-features
         env:
           EN16931_REQUIRE_SPEC: "1"
+
+  # ── Fuzzing ─────────────────────────────────────────────────────────────────
+  # `fuzz/` is cargo-fuzz's own workspace (nightly, never built by the jobs
+  # above). Every target is built, then each runs for 60 s from the committed
+  # seeds: `read` (any bytes through `read`), `extract` (a PDF under small
+  # limits, and what it hands back stays within them), `roundtrip` (a generated
+  # invoice written as UBL and CII and read back: identical unless something
+  # was reported), `embed` (a fuzzed PDF/A as embed's input). A crash, a hang
+  # past 10 s or 2 GB of memory (resident, or in one allocation) fails the job
+  # and the input is uploaded. Long runs are local: `just fuzz <target> <secs>`.
+  fuzz:
+    name: Fuzz targets (build + 60 s each)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Build every target
+        working-directory: fuzz
+        # The host triple, explicitly: a prebuilt cargo-fuzz defaults to musl.
+        run: |
+          cargo +nightly fuzz build --target "$(rustc +nightly -vV | sed -n 's/^host: //p')"
+      - name: Run each target for 60 s
+        working-directory: fuzz
+        run: |
+          host="$(rustc +nightly -vV | sed -n 's/^host: //p')"
+          for t in read extract roundtrip embed; do
+            mkdir -p "$RUNNER_TEMP/corpus/$t"
+            cargo +nightly fuzz run --target "$host" "$t" "$RUNNER_TEMP/corpus/$t" "seeds/$t" \
+              -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=2048
+          done
+      - name: Keep the failing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
 
   # ── Benchmarks ──────────────────────────────────────────────────────────────
   # Compile-only: timings on shared runners are too noisy to gate on, but a
@@ -160,7 +220,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo bench -p en16931 --no-run --all-features
+      - run: cargo bench -p en16931 -p en16931-formats --no-run --all-features
 
   # ── MSRV ────────────────────────────────────────────────────────────────────
   # The toolchain comes from the manifests, so the job and they cannot disagree
@@ -245,26 +305,10 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      # Reads `.cargo/audit.toml`, which sets one advisory aside on the grounds
-      # that the crate is never compiled — `cargo audit` scans the lockfile, and
-      # a lockfile lists optional dependencies nothing enables.
+      # Nothing is set aside: no `.cargo/audit.toml` exists, and a yanked
+      # crate fails the job as well as an advisory does.
       - name: Run audit
-        run: cargo audit
-
-      # …and re-checks that reasoning against the real build graph, because an
-      # ignore nobody rechecks is how a live exposure ends up filed under a
-      # resolved one. Mirrors `just audit`; kept inline so the job does not need
-      # a `just` install for one step.
-      - name: Every set-aside advisory is still set aside for the right reason
-        run: |
-          graph=$(cargo tree --workspace --all-features --prefix none --edges normal,build,dev)
-          for crate in rkyv; do
-            if grep -qE "^${crate} v" <<<"$graph"; then
-              echo "::error::${crate} is now in the build graph — its audit ignore is false"
-              exit 1
-            fi
-            echo "  ${crate} absent from the build graph"
-          done
+        run: cargo audit --deny warnings
 
   # ── License / dependency policy ─────────────────────────────────────────────
   deny:

@@ -1,32 +1,17 @@
 //! The nine VAT category families — `BR-S-*`, `BR-Z-*`, `BR-E-*`, `BR-AE-*`,
 //! `BR-IC-*`, `BR-G-*`, `BR-O-*`, `BR-AF-*`, `BR-AG-*` — plus `BR-B-*`.
 //!
-//! # Why these are table-driven and the rest are not
-//!
-//! EN 16931-1 §6.4.3 writes these as **nine parallel tables**, one per category,
-//! with the same ten row headings. `BR-S-08` and `BR-Z-08` are the same sentence
-//! with a different category name and a different answer to "may this category
-//! appear at several rates". Hand-writing ninety near-identical predicates would
-//! be ninety chances to get one wrong, and the artefacts themselves are generated
-//! this way.
-//!
-//! So the *logic* lives in one checker per row, parameterised by a
-//! [`CategoryProfile`], and the [`crate::validation::Rule`] entries are emitted
-//! per category by a macro — each with **its own real id**, because a report that
-//! said `BR-CATEGORY-08` would be useless to anyone looking the rule up.
-//!
-//! # The asymmetries the table encodes
+//! EN 16931-1 §6.4.3 writes nine parallel tables with the same ten rows. Here
+//! each row is one checker parameterised by a [`CategoryProfile`], and a macro
+//! emits a [`crate::validation::Rule`] per category under its real id:
 //!
 //! | Row | Taxed (`S`, `L`, `M`) | Zero-tax (`Z`, `E`, `AE`, `K`, `G`, `O`) |
 //! |---|---|---|
-//! | `-01` groups | *at least one* — may repeat per rate | **exactly one** |
-//! | `-05/06/07` rate | `S` > 0; `L`/`M` ≥ 0 | `= 0`, except `O` which must be **absent** |
-//! | `-08` base | grouped by **(category, rate)** | grouped by category alone |
+//! | `-01` groups | at least one (may repeat per rate) | exactly one |
+//! | `-05/06/07` rate | `S` > 0; `L`/`M` ≥ 0 | `= 0`, except `O`: absent |
+//! | `-08` base | grouped by (category, rate) | grouped by category alone |
 //! | `-09` tax | `= base × rate`, ±1.00 | `= 0`, exact |
-//! | `-10` reason | **forbidden** | **required** |
-//!
-//! Every one of those columns differs, which is exactly why the standard writes
-//! nine tables rather than one rule with a category parameter.
+//! | `-10` reason | forbidden | required |
 
 use rust_decimal::Decimal;
 
@@ -82,25 +67,16 @@ pub struct CategoryProfile {
 }
 
 impl CategoryProfile {
-    /// Whether `-08` groups by `(category, rate)` rather than by category alone.
-    ///
-    /// Only the categories that may appear at several rates do — which is
-    /// exactly the categories whose `-01` says *"at least one"*.
-    ///
-    /// Public because [`crate::reconcile`](mod@crate::reconcile) must group BG-23 **the same way**
-    /// `-08` checks it. Two independent readings of "which rows are one group"
-    /// is exactly how a reconciler comes to produce a breakdown its own
-    /// validator rejects.
+    /// Whether `-08` groups by `(category, rate)` rather than by category alone
+    /// (true where `-01` says *"at least one"*). [`crate::reconcile`](mod@crate::reconcile)
+    /// groups BG-23 the same way.
     #[must_use]
     pub const fn grouped_by_rate(self) -> bool {
         matches!(self.groups, Groups::AtLeastOne)
     }
 }
 
-/// The nine tables, as data.
-///
-/// Public for the same reason as [`CategoryProfile::grouped_by_rate`]: the
-/// reconciler derives a breakdown from this table rather than restating it.
+/// The nine tables, as data (also used by the reconciler).
 #[must_use]
 pub const fn profile(category: VatCategory) -> CategoryProfile {
     use RateRule::{Absent, Positive, Zero as RZero, ZeroOrPositive};
@@ -113,9 +89,7 @@ pub const fn profile(category: VatCategory) -> CategoryProfile {
             (Groups::ExactlyOne, RZero, TZero)
         }
         OutOfScope => (Groups::ExactlyOne, Absent, TZero),
-        // `B` has only -01 and -02 in the artefacts, and neither is a rate or
-        // tax rule. The values here are never consulted: no `-05`/`-08`/`-09`
-        // rule is emitted for it.
+        // Never consulted: `B` has only `BR-B-01`/`-02`, no rate or tax rule.
         SplitPayment => (Groups::AtLeastOne, ZeroOrPositive, Derived),
     };
     CategoryProfile {
@@ -171,12 +145,8 @@ pub fn check_groups(inv: &Invoice, p: CategoryProfile, f: &mut Findings<'_>) {
     }
 }
 
-/// Which of a line, an allowance or a charge a rate rule governs.
-///
-/// The artefacts number these separately — `-05` for the line (BT-152), `-06`
-/// for the allowance (BT-96), `-07` for the charge (BT-103) — so a finding must
-/// say which. Reporting all three under `-05` would send a reader to the wrong
-/// row of the standard.
+/// Which of a line, an allowance or a charge a row governs; each has its own
+/// rule id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateContext {
     /// `-05` — BT-152 on an invoice line.
@@ -227,9 +197,6 @@ pub fn check_rate(inv: &Invoice, p: CategoryProfile, ctx: RateContext, f: &mut F
 
 /// What the `-02` / `-03` / `-04` rows require of the seller's and buyer's tax
 /// identifiers.
-///
-/// Every family has these three rows and they differ in four ways — which is
-/// why they are a table rather than a shared predicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentifierRule {
     /// `S`, `Z`, `E`, `AF`, `AG`: BT-31, BT-32 **or** BT-63.
@@ -309,10 +276,6 @@ const fn identifier_rule(category: VatCategory) -> IdentifierRule {
 
 /// `-08` — BT-116 equals Σ line net + Σ charges − Σ allowances for the category
 /// (and, for the categories that may repeat, the rate).
-///
-/// This is the keystone: it is the only rule tying the invoice lines to the VAT
-/// breakdown, and it is what makes a mis-attributed line a *reported* error
-/// rather than a silently wrong invoice.
 pub fn check_taxable_amount(inv: &Invoice, p: CategoryProfile, f: &mut Findings<'_>) {
     for (i, entry) in inv.vat_breakdown.iter().enumerate() {
         if entry.semantics() != Some(p.category) {
@@ -337,8 +300,7 @@ pub fn check_taxable_amount(inv: &Invoice, p: CategoryProfile, f: &mut Findings<
             .filter(|a| matches(&a.vat))
             .map(|a| a.amount);
 
-        // `continue`, not `return`: an overflow in one group must not silence
-        // the rule for the groups after it.
+        // On overflow, skip this group only.
         let (Ok(pos), Ok(neg)) = (
             InvoiceAmount::checked_sum(lines.chain(charges)),
             InvoiceAmount::checked_sum(allowances),
@@ -349,10 +311,8 @@ pub fn check_taxable_amount(inv: &Invoice, p: CategoryProfile, f: &mut Findings<
             continue;
         };
 
-        // ±1.00 on the signed values — `TaxableAmount - 1 < sum` and
-        // `TaxableAmount + 1 > sum`, as the artefacts write it. The `-09` row
-        // takes absolutes and this one does not, which is the sort of asymmetry
-        // that only survives being read off the Schematron.
+        // ±1.00 on the signed values, as the artefacts write it (unlike `-09`,
+        // which takes absolutes).
         if !within_vat_tolerance(entry.taxable_amount.into_decimal(), expected.into_decimal()) {
             f.arithmetic(
                 Path::at_term(Group::VatBreakdown, i, bt::VAT_TAXABLE_AMOUNT),
@@ -409,9 +369,7 @@ pub fn check_exemption_reason(inv: &Invoice, p: CategoryProfile, f: &mut Finding
 
 /// Emit one [`Rule`] per (family, row), each with its real id.
 macro_rules! family {
-    // `expr` rather than `literal`: the ids and texts are built with `concat!`,
-    // which is an expression at macro-expansion time even though it evaluates to
-    // a `&'static str` literal — exactly what `RuleId::new` and `#[doc]` want.
+    // `expr`, not `literal`: ids and texts are built with `concat!`.
     ($konst:ident, $id:expr, $cat:ident, $checker:ident, $text:expr) => {
         #[doc = $text]
         pub static $konst: Rule = Rule {
@@ -538,7 +496,7 @@ pub static BR_B_02: Rule = Rule {
     },
 };
 
-/// `BR-O-11` … `BR-O-14` — an `O` breakdown excludes everything else.
+/// `BR-O-11` — an `O` breakdown excludes other breakdown groups.
 pub static BR_O_11: Rule = Rule {
     id: RuleId::new("BR-O-11"),
     severity: Severity::Fatal,
@@ -558,7 +516,7 @@ pub static BR_O_11: Rule = Rule {
     },
 };
 
-/// `BR-O-12` … `BR-O-14` — nor content in another category.
+/// `BR-O-12` — nor an invoice line in another category.
 pub static BR_O_12: Rule = Rule {
     id: RuleId::new("BR-O-12"),
     severity: Severity::Fatal,
@@ -714,7 +672,6 @@ mod tests {
 
     #[test]
     fn every_family_emits_its_own_real_id() {
-        // A report saying `BR-CATEGORY-08` would be useless to look up.
         let ids: Vec<_> = ALL.iter().map(|r| r.id.as_str()).collect();
         for expect in [
             "BR-S-02", "BR-S-06", "BR-S-07", "BR-S-08", "BR-Z-09", "BR-E-10", "BR-AE-01",
@@ -728,11 +685,11 @@ mod tests {
     }
 
     #[test]
-    fn the_standards_ig_ip_spellings_resolve_to_the_artefacts_af_ag() {
-        // EN 16931-1 calls these families BR-IG-* and BR-IP-*; the artefacts
-        // call them BR-AF-* and BR-AG-*. Both must reach the same rule.
+    fn the_ig_ip_spellings_reach_no_rule() {
+        // EN 16931-1's BR-IG-*/BR-IP-* are not mapped onto BR-AF-*/BR-AG-*.
         let by = |q: &str| ALL.iter().find(|r| r.id.matches(q)).map(|r| r.id.as_str());
-        assert_eq!(by("BR-IG-1"), Some("BR-AF-01"));
-        assert_eq!(by("BR-IP-10"), Some("BR-AG-10"));
+        assert_eq!(by("BR-IG-1"), None);
+        assert_eq!(by("BR-IP-10"), None);
+        assert_eq!(by("BR-AF-1"), Some("BR-AF-01"));
     }
 }

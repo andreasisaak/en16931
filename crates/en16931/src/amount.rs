@@ -1,31 +1,9 @@
-//! [`InvoiceAmount`] — EN 16931 `Amount. Type`, and the reason 21 rules cannot fire.
+//! [`InvoiceAmount`] (EN 16931-1 §6.5.2 `Amount. Type`, at most two decimals)
+//! and [`UnitPriceAmount`] (§6.5.3, uncapped, for BT-146 … BT-148).
 //!
-//! # Why two decimals live in the type
-//!
-//! EN 16931-1 §6.5.2 defines the semantic data type directly:
-//!
-//! > This EN 16931_ Amount. Type is based on the Amount. Type as defined in
-//! > ISO 15000-5:2014, Annex B. **EN 16931_ Amount. Type is floating up to two
-//! > fraction digits.**
-//!
-//! Table 26 (§6.5.12) then lists every business term the cap applies to, and the
-//! CEN validation artefacts render that table as 21 separate assertions —
-//! `BR-DEC-01`, `-02`, `-05`, `-06`, `-09`..`-20`, `-23`..`-25`, `-27`, `-28`.
-//!
-//! A type that physically cannot hold a third decimal retires all 21 at compile
-//! time. They stay in the rule registry so `explain("BR-DEC-12")` works and a
-//! report can state they were checked, but their evaluation is a constant pass.
-//!
-//! This is the crate's thesis in one type: encode the normative *table* as a
-//! *type*, not as 21 runtime checks.
-//!
-//! # What is deliberately not this type
-//!
-//! `Unit Price Amount. Type` (§6.5.3) is a **different** semantic type, based on
-//! Amount but with no decimal cap — its own example in the standard is
-//! `10000.1234`. BT-146, BT-147 and BT-148 are unit prices. Using
-//! `InvoiceAmount` for a price would silently truncate `0.28901 EUR/kWh` to
-//! `0.29`, which is not a rounding error but a different price.
+//! The CEN artefacts render Table 26's decimal cap as 21 separate assertions
+//! (`BR-DEC-01`, `-02`, `-05`, `-06`, `-09`..`-20`, `-23`..`-25`, `-27`, `-28`);
+//! [`InvoiceAmount`] cannot hold a third decimal, so those rules always pass.
 
 use core::fmt;
 use core::iter::Sum;
@@ -43,15 +21,8 @@ const UNITS: i64 = 100;
 
 /// A monetary amount as EN 16931 carries it — EN 16931-1 §6.5.2 `Amount. Type`.
 ///
-/// Stored as `i64` minor units, so the representable range is roughly
-/// ±92 quadrillion major units and a third decimal place does not exist.
-///
-/// The currency is **not** part of this type: §6.5.2 says *"The currency of the
-/// amount is defined as a separate business term"* (BT-5), and it is stated once
-/// per document rather than per amount. Mixing currencies is therefore a
-/// document-level rule, not something this type can prevent — and pretending
-/// otherwise would put a `Currency` on all 21 amounts of an invoice that all
-/// necessarily share one.
+/// Stored as `i64` minor units. The currency is not part of the type; it is
+/// BT-5, stated once per document.
 ///
 /// ```
 /// use en16931::InvoiceAmount;
@@ -79,10 +50,7 @@ impl InvoiceAmount {
 
     /// Parse an exact decimal string: `"1190.00"`, `"-85.00"`, `"12"`, `"12.5"`.
     ///
-    /// **Refuses excess precision rather than rounding it.** `"0.005"` is an
-    /// error, not `0.01` and not `0.00` — a parser that rounds turns a caller's
-    /// mistake into a plausible wrong number, which is the failure mode this
-    /// whole crate exists to prevent.
+    /// More than two decimals is an error, never rounded.
     ///
     /// # Errors
     /// [`ParseAmountError`] for malformed input, more than two decimals, or a
@@ -106,9 +74,7 @@ impl InvoiceAmount {
             Some((i, f)) => (i, f),
             None => (digits, ""),
         };
-        // An empty integer part (".5") is rejected: EN 16931 amounts appear in
-        // documents read by humans, and a leading dot is a typo far more often
-        // than it is an intent.
+        // An empty integer part (".5") is rejected.
         if int_part.is_empty()
             || !int_part.bytes().all(|b| b.is_ascii_digit())
             || !frac_part.bytes().all(|b| b.is_ascii_digit())
@@ -127,35 +93,35 @@ impl InvoiceAmount {
         let overflow = || ParseAmountError::OutOfRange {
             input: s.to_owned(),
         };
-        let mut units: i64 = 0;
+        // Accumulate unsigned and sign last, so `InvoiceAmount::MIN` parses.
+        let mut units: u64 = 0;
         for b in int_part.bytes() {
             units = units
                 .checked_mul(10)
-                .and_then(|u| u.checked_add(i64::from(b - b'0')))
+                .and_then(|u| u.checked_add(u64::from(b - b'0')))
                 .ok_or_else(overflow)?;
         }
-        units = units.checked_mul(UNITS).ok_or_else(overflow)?;
+        units = units.checked_mul(UNITS as u64).ok_or_else(overflow)?;
         // Pad `"5"` to `"50"` so `"1.5"` is 150 minor units, not 105.
-        let mut frac: i64 = 0;
+        let mut frac: u64 = 0;
         for i in 0..SCALE as usize {
             let d = frac_part
                 .as_bytes()
                 .get(i)
-                .map_or(0, |b| i64::from(b - b'0'));
+                .map_or(0, |b| u64::from(b - b'0'));
             frac = frac * 10 + d;
         }
         units = units.checked_add(frac).ok_or_else(overflow)?;
-        Ok(Self(if neg { -units } else { units }))
+        let signed = if neg {
+            0i64.checked_sub_unsigned(units)
+        } else {
+            i64::try_from(units).ok()
+        };
+        signed.map(Self).ok_or_else(overflow)
     }
 
-    /// Convert from a [`Decimal`] **exactly**, or fail.
-    ///
-    /// This is the boundary an upstream calculation crosses. `billing`'s
-    /// `Amount::exact_to::<2>()` is the mirror of it: both refuse rather than
-    /// round, because rounding at an interchange boundary breaks the totals
-    /// identities the format also checks (BR-CO-10 and BR-CO-15 in particular —
-    /// three leaves of `0.005` round to `0.03` while their exact sum rounds to
-    /// `0.02`).
+    /// Convert from a [`Decimal`] exactly, or fail; never rounds, since
+    /// rounding per amount can break the BR-CO-10 / BR-CO-15 sums.
     ///
     /// # Errors
     /// [`AmountError::PrecisionLoss`] if `d` needs more than two decimals;
@@ -198,9 +164,7 @@ impl InvoiceAmount {
     /// `self + rhs`.
     ///
     /// # Errors
-    /// [`AmountError::Overflow`] — never wraps, never saturates. An invoice that
-    /// overflows `i64` minor units is a data error worth surfacing, not a number
-    /// worth guessing.
+    /// [`AmountError::Overflow`]; never wraps or saturates.
     pub fn checked_add(self, rhs: Self) -> Result<Self, AmountError> {
         self.0
             .checked_add(rhs.0)
@@ -228,11 +192,7 @@ impl InvoiceAmount {
         self.0.checked_neg().map(Self).ok_or(AmountError::Overflow)
     }
 
-    /// `|self|`.
-    ///
-    /// Needed by the VAT-derivation rules, which compare **absolute** values —
-    /// `BR-CO-17` and `BR-S-09` apply `abs()` to both operands before rounding,
-    /// which is what lets a credit note satisfy them.
+    /// `|self|`, as `BR-CO-17` and `BR-S-09` compare absolute values.
     ///
     /// # Errors
     /// [`AmountError::Overflow`] for [`InvoiceAmount::MIN`].
@@ -241,10 +201,6 @@ impl InvoiceAmount {
     }
 
     /// Sum without panicking on overflow.
-    ///
-    /// The totals chain — `BR-CO-10` through `BR-CO-16` — is a chain of sums
-    /// compared for **exact** equality, so this is the operation every one of
-    /// those rules is built on.
     ///
     /// # Errors
     /// [`AmountError::Overflow`].
@@ -325,9 +281,7 @@ impl From<InvoiceAmount> for Decimal {
     }
 }
 
-// Serde goes through the decimal *string*, never a float and never the raw
-// integer: a JSON number would lose exactness in any consumer using f64, and a
-// bare `1234` is indistinguishable from twelve hundred and thirty-four euros.
+// Serde uses the decimal string, never a float or the minor-unit integer.
 #[cfg(feature = "serde")]
 impl TryFrom<String> for InvoiceAmount {
     type Error = ParseAmountError;
@@ -366,7 +320,6 @@ mod tests {
 
     #[test]
     fn a_third_decimal_is_refused_not_rounded() {
-        // The whole point of the type. Neither 0.01 nor 0.00 — an error.
         assert!(matches!(
             InvoiceAmount::parse("0.005"),
             Err(ParseAmountError::TooManyDecimals { .. })
@@ -389,7 +342,7 @@ mod tests {
 
     #[test]
     fn fraction_padding_is_positional() {
-        // "1.5" is 150 minor units, not 105 — the classic off-by-a-digit.
+        // "1.5" is 150 minor units, not 105.
         assert_eq!(InvoiceAmount::parse("1.5").unwrap().to_minor_units(), 150);
         assert_eq!(InvoiceAmount::parse("1.05").unwrap().to_minor_units(), 105);
     }
@@ -410,6 +363,22 @@ mod tests {
         );
     }
 
+    /// Every amount, `MIN` and `MAX` included, parses back from its rendering.
+    #[test]
+    fn the_extremes_parse_from_their_own_rendering() {
+        for a in [InvoiceAmount::MIN, InvoiceAmount::MAX, InvoiceAmount::ZERO] {
+            assert_eq!(InvoiceAmount::parse(&a.to_string()), Ok(a), "{a}");
+        }
+        assert!(matches!(
+            InvoiceAmount::parse("-92233720368547758.09"),
+            Err(ParseAmountError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            InvoiceAmount::parse("92233720368547758.08"),
+            Err(ParseAmountError::OutOfRange { .. })
+        ));
+    }
+
     #[test]
     fn decimal_round_trips_exactly() {
         for s in ["1190.00", "-85.00", "0.07", "0.00"] {
@@ -421,9 +390,7 @@ mod tests {
         }
     }
 
-    /// Annex A.1.6 — *Example 5, Negative Invoice line*: 25 cases of pens at
-    /// 8,50 with 10 returned. Checks that the model can hold a mixed-sign
-    /// invoice and that the totals chain closes exactly at two decimals.
+    /// Annex A.1.6 (Example 5, negative invoice line): the totals close exactly.
     #[test]
     fn annex_a_1_6_negative_invoice_line() {
         let line1 = InvoiceAmount::parse("212.50").unwrap(); // BT-131, 25 × 8.50
@@ -436,8 +403,7 @@ mod tests {
         let bt_117 = InvoiceAmount::parse("31.88").unwrap();
         let exact = bt_106.into_decimal() * dec!(25) / dec!(100); // 31.875
         assert_eq!(exact, dec!(31.875));
-        // 31.875 is not representable, which is exactly why BR-CO-17 says
-        // "rounded to two decimals" and why the artefact then allows ±1.00.
+        // Not representable; BR-CO-17 rounds, and the artefact allows ±1.00.
         assert!(InvoiceAmount::from_decimal_exact(exact).is_err());
         assert!((bt_117.into_decimal() - exact).abs() < dec!(1));
 
@@ -447,11 +413,8 @@ mod tests {
         assert_eq!(bt_112.checked_sub(InvoiceAmount::ZERO).unwrap(), bt_112);
     }
 
-    /// Annex A.1.7 — *Example 6, Prepayment and negative Amount due*.
-    ///
-    /// Also pins the erratum: the annex's remark column says BT-115 is
-    /// "Invoice total **VAT** amount − Paid amount", but BR-CO-16 and the
-    /// example's own arithmetic use BT-112.
+    /// Annex A.1.7 (Example 6, prepayment and negative amount due). BT-115 is
+    /// BT-112 − BT-113 per BR-CO-16, not the annex remark's "VAT amount".
     #[test]
     fn annex_a_1_7_negative_amount_due() {
         let bt_112 = InvoiceAmount::parse("137.50").unwrap();
@@ -486,31 +449,9 @@ mod tests {
 
 /// A unit price — EN 16931-1 §6.5.3 `Unit Price Amount. Type`.
 ///
-/// > A unit price amount states a numerical monetary amount value for data
-/// > elements that contain item prices that may be multiplied by item
-/// > quantities.
-///
-/// Based on `Amount. Type` but **without its two-decimal cap** — the standard's
-/// own example for this type is `10000.1234`. That is the whole reason it is a
-/// separate type, and it is why [`InvoiceAmount`] must never be used for BT-146,
-/// BT-147 or BT-148: `0.28901 EUR/kWh` truncated to `0.29` is not a rounding
-/// error, it is a different price.
-///
-/// # Why negative values are representable
-///
-/// BR-27 (*"The Item net price (BT-146) shall NOT be negative"*) and BR-28 (the
-/// same for BT-148) are **rules**, not type invariants. The distinction this
-/// crate draws throughout:
-///
-/// - a **type** enforces what is *representable* — §6.5.2's two decimals, a
-///   calendar day that exists, the components a semantic type has;
-/// - a **rule** enforces what is *valid* — and an invalid document must still be
-///   representable, or a parser cannot load it in order to report why it fails.
-///
-/// A negative price is perfectly representable and simply violates BR-27. It
-/// also arises legitimately upstream: spot markets have negative prices
-/// (EPEX negative-price hours), and the conversion into EN 16931 flips the sign
-/// onto the quantity rather than dropping the line.
+/// No two-decimal cap (the standard's example is `10000.1234`); used for
+/// BT-146, BT-147 and BT-148. Negative values are representable so BR-27 /
+/// BR-28 can report them.
 ///
 /// ```
 /// use en16931::UnitPriceAmount;
@@ -548,11 +489,8 @@ impl UnitPriceAmount {
         self.0 < Decimal::ZERO
     }
 
-    /// `self - rhs`, for deriving BT-146 from BT-148 − BT-147.
-    ///
-    /// `PEPPOL-EN16931-R046` is an **exact** equality — unlike `R040` it carries
-    /// no `u:slack` — so the net price is derived rather than accepted, and a
-    /// caller cannot compute it and be a cent out.
+    /// `self - rhs`, for deriving BT-146 from BT-148 − BT-147
+    /// (`PEPPOL-EN16931-R046` is an exact equality).
     #[must_use]
     pub fn checked_sub(self, rhs: Self) -> Option<Self> {
         self.0.checked_sub(rhs.0).map(Self)

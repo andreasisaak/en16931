@@ -1,7 +1,7 @@
 +++
 title = "Syntaxes: UBL and CII"
 weight = 5
-description = "Read and write UBL 2.1 and UN/CEFACT CII D16B from the EN 16931 semantic model — generated element order, 1 218 prohibitions, and nothing dropped silently."
+description = "Read, write and convert UBL 2.1 and UN/CEFACT CII D16B through the EN 16931 semantic model — one call per task, generated element order, 1 218 prohibitions, and nothing dropped silently."
 +++
 
 CEN/TS 16931-2 names exactly two mandatory syntaxes, and a receiver must accept
@@ -13,7 +13,7 @@ both:
   both, with the kind in BT-3.
 
 `en16931-formats` binds the semantic model to both, in both directions, and
-re-implements not one of the 317 business rules. `en16931` decides whether an
+re-implements not one of the 334 business rules. `en16931` decides whether an
 invoice is *correct*; this crate decides what it looks like *on the wire*.
 
 ## Features, and what each one costs
@@ -22,7 +22,7 @@ invoice is *correct*; this crate decides what it looks like *on the wire*.
 |---|---|---|---|
 | `ubl` | ✅ | 13 crates | UBL 2.1 `Invoice` / `CreditNote`, both directions |
 | `cii` | — | 13 crates | UN/CEFACT CII D16B, both directions |
-| `zugferd` | — | **57 crates** | [ZUGFeRD / Factur-X](@/docs/zugferd.md) hybrid PDFs — **reading only** |
+| `zugferd` | — | **57 crates** | [ZUGFeRD / Factur-X](@/docs/zugferd.md) hybrid PDFs — reading, and embedding into PDF/A-3 |
 | `serde` | — | + `serde` | `Serialize` / `Deserialize` on this crate's own types |
 
 `zugferd` is off by default and that matters: the PDF layer brings AES,
@@ -34,29 +34,49 @@ Only reading pulls in a parser.
 
 ## Reading
 
+One call, from bytes, whatever the document is:
+
 ```rust
-let read = en16931_formats::ubl::from_str(&xml)?;
+let read = en16931_formats::read(&bytes)?;
 
 read.invoice;          // the semantic model
-read.unmapped;         // elements outside the EN 16931 subset
-read.malformed;        // present, but not representable
+read.syntax;           // Syntax::Ubl or Syntax::Cii — the document's own
+read.entries;          // everything the reader had to say, typed
+read.pdf;              // for a ZUGFeRD / Factur-X PDF: profile, XMP, divergences
 ```
 
-Or let the file say what it is:
+The syntax comes from the bytes — a PDF signature, else the document element
+(by name *and* namespace) — so there is nothing to choose and nothing to get
+wrong. The bytes may be UTF-8, UTF-8 with a byte-order mark or UTF-16 with one,
+the encodings XML 1.0 obliges a reader to accept; any other, declared or
+detected, is refused by name rather than guessed.
 
-```rust
-match en16931_formats::sniff(&xml) {
-    Some(Syntax::Ubl) => { /* … */ }
-    Some(Syntax::Cii) => { /* … */ }
-    None => { /* not an e-invoice this crate knows */ }
-}
+Every entry has a kind, the syntax path it is about, the business term where the
+binding knows it, the value, the artefact rule it cites and, where the remedy is
+known, a hint:
+
+| Kind | Means |
+|---|---|
+| `Unmapped` | an element outside the EN 16931 subset — another CIUS's addition, an extension |
+| `Malformed` | present, and not representable — a third decimal, a timestamp where a date belongs |
+| `Duplicate` | a second occurrence of an element the schema (or a CEN syntax rule) allows once; the first is read |
+| `Repeated` | the same, where CEN publishes the rule as a warning |
+| `Schema` | a spelling the schema does not admit, read anyway; writing, a required element the model lacks |
+| `Unreadable` | the bytes are not an invoice at all — not well-formed, an encoding refused, nested too deep, a PDF refused |
+| `Container` | a hybrid PDF's metadata disagrees with its payload without changing what it declares |
+| `Ambiguous` | the PDF's XMP profile and the payload's BT-24 disagree |
+| `Dropped` | writing: a term the target document has no place for |
+| `Prohibited` | writing: an element CEN's syntax rules fence out of the EN 16931 subset |
+| `Derived` | writing: a value the syntax requires and the model lacked, derived |
+
+`Unmapped` and `Malformed` are not errors on their own, and neither is silent. `Display` on an entry is the one text rendering:
+
+```text
+malformed    …/ChargeIndicator/Indicator (BG-20) = "yes" — not an xs:boolean [hint: the value must be `true` or `false`]
 ```
 
-Both lists matter. `unmapped` is how you find out a counterparty is sending
-something the standard has no term for; `malformed` is how you find out they are
-sending something the model refuses at the boundary — a third decimal, a
-timestamp where a calendar date belongs. Neither is an error on its own, and
-neither is silent.
+To validate as well, and get a decision, read with
+[`receive`](@/docs/validation.md) instead.
 
 ### The document is hostile until it parses
 
@@ -66,14 +86,11 @@ neither is silent.
 | **external entities** (XXE, file disclosure) | the same DTD refusal, for the same reason |
 | **nesting** | refused past `MAX_DEPTH` **before** parsing |
 
-The third is the one that had teeth. `roxmltree` recurses once per level of
-nesting and overflows the stack a few hundred levels in — and a stack overflow is
-**not a panic**: Rust can neither unwind it nor catch it, so the process aborts.
-Two lines of XML took down the caller, with nothing for `?` to catch.
-
-It cannot be handled afterwards, so it is refused before: one linear scan of the
-bytes, then `Error::TooDeep`. The limit is 64, the deepest of the 487 published
-instances is **9**, and the corpus suite fails if a future artefact release ships
+The XML parser recurses once per level, and a stack overflow is not a panic:
+Rust can neither unwind nor catch it, so the process would abort. Nesting is
+therefore measured in one linear scan of the bytes first, and a document past the
+limit is `Error::TooDeep`. The limit is 64; the deepest of the 501 published
+instances is **9**, and the corpus suite fails if an artefact release ships
 anything within three times the limit.
 
 Input size and time are deliberately *not* bounded here. A caller reading from a
@@ -91,81 +108,76 @@ optional time zone:
 ```
 
 Schema-valid, objected to by no Schematron rule, and written by default by
-Java's `XMLGregorianCalendar` — which a great many UBL producers are built on.
-`Date` holds a calendar day and nothing else, because EN 16931-1 §6.5.9 has no
-term for a time zone, so the zone is **dropped, not applied**:
-`2026-07-31+02:00` *is* the day 2026-07-31. Refusing it instead cost the whole
-business term — BT-2 came back absent and `BR-03` fired on an invoice that
-states its issue date perfectly well.
+Java's `XMLGregorianCalendar`. `Date` holds a calendar day and nothing else,
+because EN 16931-1 §6.5.9 has no term for a time zone, so the zone is **dropped,
+not applied**: `2026-07-31+02:00` *is* the day 2026-07-31.
 
-`cbc:ChargeIndicator` is the other one, and its failure is worse than a lost
-field. It is `xs:boolean`, whose lexical space is `{true, false, 1, 0}` — and
-it is the element that decides whether an amount is **added to or subtracted
-from** the invoice. A reader that knows only the two words turns a schema-valid
-`<cbc:ChargeIndicator>1</cbc:ChargeIndicator>` into an allowance: the same
-money, on the other side of the total. Both readers take all four forms now,
-and an indicator that is not a boolean at all is reported in `malformed` rather
-than folded into "allowance" — there is no safe default, so the answer is to
-say the document could not be read.
+`cbc:ChargeIndicator` is `xs:boolean`, whose lexical space is
+`{true, false, 1, 0}`, and it decides whether an amount is **added to or
+subtracted from** the invoice. Both readers take all four forms; an indicator
+that is not a boolean is reported as `Malformed`, never read as an allowance.
+
+## One business term, two code lists: BT-8
+
+The VAT point date code (BT-8) has three meanings in EN 16931 — invoice issue
+date, actual delivery date, paid to date — and CEN's two syntax bindings spell
+them from different code lists:
+
+| Meaning | Model and UBL (UNTDID 2005) | CII `ram:DueDateTypeCode` (UNTDID 2475) |
+|---|---|---|
+| invoice issue date | `3` | `5` |
+| actual delivery date | `35` | `29` |
+| paid to date | `432` | `72` |
+
+The model always holds the UNTDID 2005 code, so `BR-CL-06` is one rule whichever
+syntax a document came from. The CII reader translates on the way in and the
+CII writer on the way out; a CII value outside `5 29 72` is reported as
+`Malformed` and left out of the model — a `3` copied across would pass
+`BR-CL-06` in a document CEN's CII rules reject — and a model value with no CII
+spelling is not written and is reported as `Dropped`. CII repeats BT-8 in every
+VAT breakdown group, and CEN's `CII-SR-462` requires the repetitions to agree: a
+group that disagrees is reported as a `Duplicate` citing that rule, and the first
+is read.
 
 ## Writing
 
 ```rust
-let out = en16931_formats::ubl::write(&invoice);
-
-out.xml;
-out.dropped;          // e.g. BT-9 on a credit note
-```
-
-UBL's `<CreditNote>` has no `cbc:DueDate` and no `cac:ProjectReference`. Dropping
-them is correct; dropping them *quietly* means a payment due date vanishing
-between two systems with nothing in any log.
-
-### Why `to_string` returns `String` and not `Result`
-
-**Serialisation cannot fail, and that is a property of the model rather than an
-omission.** Every field of `Invoice` already holds a value the syntax can carry:
-`InvoiceAmount` cannot hold a third decimal, `Date` cannot hold something that is
-not a calendar day — which is exactly what `udt:DateTimeString format="102"`
-accepts, and nothing more. There is no state a writer could be handed that it
-would have to refuse, and writing into a `String` does no I/O.
-
-**Validity is a separate question, and it is the caller's.** An invoice with no
-seller serialises perfectly into a document no counterparty will accept.
-
-## Writing a proof, not a hope
-
-```rust
 use en16931::profiles::XRechnung;
 use en16931::validation::profile::Validated;
+use en16931_formats::Syntax;
 
 let proof: Validated<XRechnung> = Validated::new(invoice)?;
-let out = en16931_formats::ubl::write_validated(&proof);
+let out = en16931_formats::write(&proof, Syntax::Ubl);
+
+out.xml;
+out.entries;          // e.g. a `Dropped` BT-9 on a credit note
 ```
 
-`write_validated` stamps BT-24 from the profile that was actually proved. Two
-things become impossible rather than discouraged: serialising an unvalidated
-invoice, and a document claiming XRechnung 3.0 that was only checked against the
-bare core model — the most common way an invoice passes local validation and is
-rejected on receipt.
+`write` takes a **proof**, and stamps BT-24 from the profile that was actually
+proved. Two things become impossible rather than discouraged: serialising an
+unvalidated invoice, and a document claiming XRechnung 3.0 that was only checked
+against the bare core model — the most common way an invoice passes local
+validation and is rejected on receipt. Every written document comes back with
+its entries: UBL's `<CreditNote>` has no `cbc:DueDate` and no
+`cac:ProjectReference`, and dropping them is correct; dropping them *quietly*
+means a payment due date vanishing between two systems with nothing in any log.
 
-**When the profile is a runtime choice**, which is most of the time, the same
-guarantee is available as a `Result`:
+**A model nobody validated** — a document you did not author, on its way to
+another syntax — goes through `write_unchecked`:
 
 ```rust
-use en16931::profiles::XRECHNUNG;
-
-match en16931_formats::ubl::to_string_for(&invoice, &XRECHNUNG) {
-    Ok(xml) => submit(&xml),
-    // Neither a panic nor a silent fallback: the report says exactly which
-    // BR-DE rules the document still owes.
-    Err(e)  => eprintln!("{e}\n{}", e.report()),
+match en16931_formats::write_unchecked(&invoice, Syntax::Cii) {
+    Ok(out) => submit(&out.xml),
+    // The target schema has no form for this model — no BT-1, say. Nothing
+    // is emitted that the schema would reject.
+    Err(e) => eprintln!("{e}"),
 }
 ```
 
-It validates, stamps BT-24 **from the profile**, and only then writes — in that
-order, because a document validated carrying the caller's BT-24 and shipped
-carrying the profile's was checked as something other than what it claims to be.
+It is the one way to write without a proof, and it refuses a model the target
+syntax's schema cannot express, listing the `Schema` entries — so no public
+function emits a document its schema rejects, and none returns one without its
+report.
 
 ## The 91 % that costs a writer nothing
 
@@ -188,55 +200,73 @@ wildcard, `ends-with(name(), 'Amount')`), and they are *counted* rather than
 quietly omitted, so a test can report "1 111 of 1 218 checked" instead of
 implying a clean sweep.
 
-**The prohibitions are context-relative, and that is half the rule.**
-`CII-DT-076` is `not(ram:ID)`, and it does *not* mean "no document may contain
-`ram:ID`" — it means the element that rule's context selects may not have one. An
-earlier table dropped the context, and the writer duly discarded every `ram:ID`
-in the document. Each entry now carries `(rule, context, relative path)`, taken
-from the **preprocessed** artefacts where contexts are fully resolved rather than
-left as `$Variable` references.
+**The prohibitions are context-relative.** `CII-DT-076` is `not(ram:ID)`, and
+it means the element that rule's context selects may not have one — not that no
+document may contain `ram:ID`. Each entry carries `(rule, context, relative
+path)`, taken from the **preprocessed** artefacts, where contexts are fully
+resolved rather than left as `$Variable` references.
 
 ## The binding is data, not code
 
-Four tables are **generated from the authorities' artefacts**, never transcribed:
+Six tables are **generated from the authorities' artefacts**, never transcribed:
 
 | Table | Source | Size |
 |---|---|---|
-| UBL element order | **319** published UBL instances | 36 parents |
-| CII element order | **167** published CII instances | 38 parents |
+| UBL element order | **325** published UBL instances | 36 parents |
+| CII element order | CEN's D16B subset schema, over the parents and children of **175** published CII instances | 38 parents |
 | UBL prohibitions | preprocessed `EN16931-UBL-validation` | 1 548 paths + 21 attributes |
 | CII prohibitions | preprocessed `EN16931-CII-validation` | 447 paths |
+| UBL single occurrence | the OASIS UBL 2.1 schemas and CEN's `count(…) <= 1` rules | 239 rows |
+| CII single occurrence | CEN's D16B subset schema and CEN's `count(…) <= 1` rules | 177 rows |
 
 Both syntaxes' content models are XSD `sequence`s, so a document with exactly the
 right elements **in the wrong order** is invalid — and no Schematron rule says
-so, because ordering is the schema's job. The order is derived by topologically
-sorting the pairwise precedences observed across the whole corpus, taking the
-majority direction where instances disagree (much of that corpus is deliberately
-invalid). Derivation reports no unresolved conflicts, and the generator exits
-non-zero if it ever does.
+so, because ordering is the schema's job. CII's order is read from the D16B
+schema CEN validates against, which the reference corpus carries. UBL's is
+derived by topologically sorting the pairwise precedences observed across the
+corpus, taking the majority direction where instances disagree (much of that
+corpus is deliberately invalid). Derivation reports no unresolved conflicts,
+and the generator exits non-zero if it ever does. Every document the test
+suites write is then validated with `xmllint`: CII against the D16B schema, UBL
+against the OASIS UBL 2.1 schemas.
 
 The writers hand-sequence nothing: they emit in whatever order reads best, and
-the serialiser sorts by the table. That made a class of bug structurally
-impossible — UBL's two document elements disagree about where `cbc:TaxPointDate`
-goes, and a hand-sequenced writer got it wrong.
+the serialiser sorts by the table — which also handles UBL's two document
+elements disagreeing about where `cbc:TaxPointDate` goes.
 
 ## Converting between the two
 
-Conversion goes *through the model*, never element by element:
+Conversion goes *through the model*, never element by element — one call:
+
+```rust
+use en16931_formats::{Loss, Syntax};
+
+let converted = en16931_formats::convert(&bytes, Syntax::Cii, Loss::Refuse)?;
+converted.document;   // the CII
+converted.report;     // the source, received as it declares itself
+converted.written;    // what the writer said — a `Derived` BT-110, say
+converted.lost;       // empty under Loss::Refuse
+```
+
+Anything that would not reach the target — an element the reader did not map, a
+value it could not hold, a duplicate it did not read, a term the target cannot or
+may not carry — refuses the conversion with `ConvertError::Lossy`, naming each
+item, unless the caller passes `Loss::Allow`. Invalidity under the business
+rules is not a refusal: the report travels with the result and says so.
 
 ```sh
-en16931 convert rechnung.xml --to cii
+en16931 convert rechnung.xml --to cii                # refuses a lossy conversion
+en16931 convert rechnung.xml --to cii --allow-loss   # converts, and lists the loss
 ```
 
 An element-by-element transform has to know 164 × 2 bindings and cannot say what
 it lost. Going through the model means the same reader and writer everything else
-uses, and the same `dropped` report.
+uses, and the same typed entries.
 
 ## What crossing the syntaxes proves
 
-A same-syntax round trip cannot see a binding that is *consistently* wrong — a
-writer and its own reader agreeing on a mistake round-trip perfectly. Crossing
-breaks the agreement, and it is the only property here that can catch:
+A same-syntax round trip cannot see a binding that is *consistently* wrong;
+crossing the syntaxes catches:
 
 | | |
 |---|---|
@@ -245,13 +275,10 @@ breaks the agreement, and it is the only property here that can catch:
 | **a signal read from too narrow a set** | detecting a CII credit note from `381` alone reads `396`, `532` and `83` back as *invoices*, and `BR-CL-01` then reports a violation that is not one. Every published CII credit note uses `381`, so no corpus shows it. |
 | **an element that is two terms at once** | BT-111 and BT-110 are one element when BT-6 = BT-5 — which one reader can know and the other not. |
 
-And the two readers must agree about the **empty element**.
-`<cbc:BuyerReference/>` is an absent term, not a term whose value is the empty
-string, and a reader that answers `None` through its `text()` helper and
-`Some("")` at the call sites that read an element's own text is inconsistent
-with itself before it is inconsistent with the other syntax.
+Both readers read an **empty element** (`<cbc:BuyerReference/>`) as an absent
+term.
 
-## What is next
+## See also
 
 - **[ZUGFeRD / Factur-X](@/docs/zugferd.md)** — the hybrid PDF container.
 - **[Conformance](@/docs/conformance.md)** — the corpora all of this runs against.

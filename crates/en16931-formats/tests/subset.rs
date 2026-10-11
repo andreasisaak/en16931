@@ -1,28 +1,16 @@
 #![cfg(any(feature = "ubl", feature = "cii"))]
 
-//! The writer cannot emit an element EN 16931 forbids — in **either** syntax.
+//! Neither writer emits an element EN 16931 forbids: everything each writer
+//! emits is walked against the prohibitions extracted from CEN's artefacts.
 //!
-//! 1 218 of the 1 339 syntax rules say some element or attribute "shall not be
-//! used". The claim is that a writer driven from the semantic model cannot
-//! violate them: it has no way to express `cbc:UUID`, because the model has no
-//! term for it.
-//!
-//! That is a claim, and claims with no test are how this project's sibling
-//! accumulated seven classes of the same bug. So: walk everything each writer
-//! emits, against the prohibitions extracted from CEN's own artefacts.
-//!
-//! **These tests report their own coverage.** Some prohibitions have a
-//! conditional context — a predicate, `ends-with(…)`, a wildcard — and
-//! selecting what they match needs an XPath engine this crate does not have.
-//! Those are counted and printed, so the result reads as "1 045 of 1 268
-//! checked" rather than as a clean sweep it has not earned.
+//! Prohibitions with a conditional context (a predicate, `ends-with(…)`, a
+//! wildcard) need an XPath engine; they are counted and printed as unchecked.
 
 mod common;
 
 /// The prefix CEN's artefacts use for a namespace URI.
 ///
-/// Recovered from the namespace rather than the source text, so a document
-/// using different prefixes for the same namespaces is still checked.
+/// Recovered from the namespace, so other prefixes are still checked.
 fn prefix_for(ns: &str) -> &'static str {
     match ns {
         u if u.ends_with("CommonAggregateComponents-2") => "cac",
@@ -62,14 +50,17 @@ fn paths(xml: &str) -> Vec<(String, Vec<String>)> {
 }
 
 macro_rules! syntaxes {
-    ($($feature:literal => $module:ident),* $(,)?) => {$(
+    ($($feature:literal => $module:ident, $syntax:ident),* $(,)?) => {$(
         #[cfg(feature = $feature)]
         mod $module {
             use super::{common, paths};
-            use en16931_formats::$module::{self as syntax, prohibitions};
+            use en16931_formats::$module::prohibitions;
+            use en16931_formats::Syntax;
 
             fn check(inv: &en16931::Invoice) -> usize {
-                let all = paths(&syntax::to_string(inv));
+                let written = en16931_formats::write_unchecked(inv, Syntax::$syntax)
+                    .expect("the fixture carries everything the schema requires");
+                let all = paths(&written.xml);
                 for (path, attrs) in &all {
                     assert_eq!(
                         prohibitions::forbidden_path(path),
@@ -107,8 +98,7 @@ macro_rules! syntaxes {
                 );
             }
 
-            /// The tables must contain something, or the test above passes by
-            /// checking nothing at all.
+            /// The tables are not empty.
             #[test]
             fn the_prohibition_tables_are_populated() {
                 assert!(
@@ -121,9 +111,6 @@ macro_rules! syntaxes {
             }
 
             /// A path the artefacts forbid must be caught when it appears.
-            ///
-            /// Without this, a bug in `forbidden_path` would make the suite
-            /// green for the worst possible reason.
             #[test]
             fn the_checker_actually_catches_a_violation() {
                 let (rule, ctx, rel) = prohibitions::FORBIDDEN_PATHS[0];
@@ -139,23 +126,15 @@ macro_rules! syntaxes {
 }
 
 syntaxes! {
-    "ubl" => ubl,
-    "cii" => cii,
+    "ubl" => ubl, Ubl,
+    "cii" => cii, Cii,
 }
 
-// ── The numbers the documentation quotes ─────────────────────────────────────
+// ── The documented figures ───────────────────────────────────────────────────
 
-/// *"1 218 of the 1 339 syntax rules say some element shall not be used"* is
-/// repeated in seven files. This is where it is true.
-///
-/// Both figures come from the generated tables, which `cargo xtask check`
-/// re-derives from the artefacts on every CI run — so pinning them here pins
-/// them to the artefacts without this test needing `spec/`.
-///
-/// The coverage figure is the one that moves. It was 1 045 of 1 208 until the
-/// extractor learned to read `(cac:InvoiceLine|cac:CreditNoteLine)/x`, which is
-/// one rule about two spellings of the same thing and was four fifths of
-/// everything the tables were missing.
+/// The prohibition and coverage figures the documentation quotes. Both come
+/// from the generated tables, which `cargo xtask check` re-derives from the
+/// artefacts, so no corpus is needed here.
 #[cfg(all(feature = "ubl", feature = "cii"))]
 #[test]
 fn the_prohibition_counts_are_the_ones_the_docs_quote() {
@@ -170,33 +149,43 @@ fn the_prohibition_counts_are_the_ones_the_docs_quote() {
         checked, 1_111,
         "the documented coverage of those prohibitions"
     );
-    // 91 % of the 1 339 syntax rules are prohibitions, and 91 % of those are
-    // represented. The two 91 %s are a coincidence and both are quoted, so both
-    // are checked.
+    // Both quoted 91 % figures are checked.
     assert_eq!(total * 100 / 1_339, 90, "…of 1 339 syntax rules");
     assert_eq!(
         checked * 100 / total,
         91,
         "…of which this many are represented"
     );
+    let (ubl_checked, ubl_total) = (
+        ubl::prohibitions::TOTAL_PARAMS - ubl::prohibitions::UNEXTRACTED,
+        ubl::prohibitions::TOTAL_PARAMS,
+    );
+    let (cii_checked, cii_total) = (
+        cii::prohibitions::TOTAL_PARAMS - cii::prohibitions::UNEXTRACTED,
+        cii::prohibitions::TOTAL_PARAMS,
+    );
+    common::assert_page_states(
+        "syntaxes.md",
+        &[
+            ("**<N> of them (91 %)**", total),
+            ("**<N> of the 1 218 are represented**", checked),
+            ("of the <N> are represented", total),
+            ("<N> of UBL's", ubl_checked),
+            ("of UBL's <N>", ubl_total),
+            ("<N> of CII's", cii_checked),
+            ("of CII's <N>", cii_total),
+            ("\"<N> of 1 218 checked\"", checked),
+            ("\"1 111 of <N> checked\"", total),
+        ],
+    );
 }
 
-/// **Sub invoice lines are refused in CII because XRechnung refuses them.**
+/// Sub invoice lines are refused in CII because XRechnung refuses them.
 ///
-/// `BR-DEX-15` asserts `not(exists(//ram:ParentLineID))` and states the reason
-/// in words: *"This CII file might use the concept of Sub Invoice Lines. However
-/// XRechnung does not support this."* So a CII binding that omits BG-DEX-01 is
-/// **correct**, not unfinished — and the note it leaves has to say which, or the
-/// reader goes looking for a feature to enable.
-///
-/// This is the model rule `en16931` cannot hold: `BR-DEX-15` is a check on the
-/// shape of a *CII document*, and the semantic model has one line structure
-/// regardless of syntax. It is declared in `en16931`'s `CII_ONLY_SYNTAX_RULES`
-/// as out-of-model, and honoured **here**, which is where the CII binding lives.
-///
-/// UBL is the contrast, and it is the whole reason the note can offer a way out:
-/// `cac:SubInvoiceLine` is written there, so the same invoice is expressible in
-/// one mandatory syntax and not the other.
+/// `BR-DEX-15` forbids `//ram:ParentLineID` ("XRechnung does not support
+/// this"). The model cannot hold that rule (it is listed as syntax-only in
+/// `en16931`'s `KOSIT_SYNTAX_ONLY_RULES` test table), so the CII binding honours
+/// it, and its note points at UBL, where `cac:SubInvoiceLine` is written.
 #[test]
 #[cfg(all(feature = "cii", feature = "ubl"))]
 fn cii_omits_sub_invoice_lines_and_says_which_rule_forbids_them() {
@@ -211,45 +200,65 @@ fn cii_omits_sub_invoice_lines_and_says_which_rule_forbids_them() {
         }],
     )];
 
-    let out = en16931_formats::cii::write(&invoice);
+    use en16931_formats::{Syntax, report::Kind, write_unchecked};
+
+    // The fixture declares XRechnung (core), which defines no extension groups.
+    let out = write_unchecked(&invoice, Syntax::Cii).expect("CII has a form for the fixture");
     assert!(
         !out.xml.contains("ParentLineID"),
         "BR-DEX-15 forbids ram:ParentLineID in a CII XRechnung"
     );
     let note = out
-        .dropped
+        .entries
         .iter()
-        .find(|d| d.contains("BG-DEX-01"))
-        .expect("dropping a group the caller supplied is never silent");
+        .find(|e| e.term.as_deref() == Some("BG-DEX-01"))
+        .unwrap_or_else(|| {
+            panic!(
+                "dropping a group the caller supplied is never silent: {:?}",
+                out.entries
+            )
+        });
+    assert_eq!(note.kind, Kind::Dropped, "{note}");
     assert!(
-        note.contains("BR-DEX-15"),
-        "the note must cite the rule, or omitting the group reads as a missing \\
+        note.rule.as_deref() == Some("BR-DEX-15") || note.message.contains("BR-DEX-15"),
+        "the note must cite the rule, or omitting the group reads as a missing \
          feature rather than as conformance: {note}"
     );
 
-    // …and UBL does carry them, which is what makes the note's advice real —
-    // but only under the Extension profile. For a **core** document
-    // `UBL-CR-646` forbids `cac:SubInvoiceLine` just as firmly, so plain
-    // `write` drops it too. Two syntaxes, two rules, one group: the difference
-    // is that UBL has a profile in which it is lawful and CII has none.
-    let core = en16931_formats::ubl::write(&invoice);
+    // …and UBL carries them, but only under the Extension profile: for core,
+    // `UBL-CR-646` forbids `cac:SubInvoiceLine` too.
+    let core = write_unchecked(&invoice, Syntax::Ubl).expect("UBL has a form for the fixture");
     assert!(
         !core.xml.contains("cac:SubInvoiceLine"),
         "UBL-CR-646 forbids it in a core document"
     );
+    assert!(
+        core.entries
+            .iter()
+            .any(|e| e.kind == Kind::Prohibited && e.rule.as_deref() == Some("UBL-CR-646")),
+        "removing it is reported, citing the rule: {:?}",
+        core.entries
+    );
+    // `write_unchecked` waives the prohibitions for the extension groups the
+    // declared BT-24 profile defines; no validation proof is needed.
+    let mut declared = invoice.clone();
+    declared.specification_id = Some(
+        en16931::profiles::XRECHNUNG_EXTENSION
+            .specification_id
+            .to_owned(),
+    );
     let extension =
-        en16931_formats::ubl::write_for(&invoice, &en16931::profiles::XRECHNUNG_EXTENSION);
-    match extension {
-        Ok(written) => assert!(
-            written.xml.contains("cac:SubInvoiceLine"),
-            "the Extension profile is where UBL carries BG-DEX-01"
-        ),
-        // The fixture need not satisfy every BR-DE-* rule; what matters is that
-        // the group is lawful *somewhere*, and the core path above proves the
-        // prohibition is what removes it rather than a missing writer.
-        Err(not_valid) => assert!(
-            !not_valid.report().has("UBL-CR-646"),
-            "the Extension must not forbid the group it defines"
-        ),
-    }
+        write_unchecked(&declared, Syntax::Ubl).expect("UBL has a form for the fixture");
+    assert!(
+        extension.xml.contains("cac:SubInvoiceLine"),
+        "the Extension profile is where UBL carries BG-DEX-01"
+    );
+    assert!(
+        !extension
+            .entries
+            .iter()
+            .any(|e| e.rule.as_deref() == Some("UBL-CR-646")),
+        "the Extension must not forbid the group it defines: {:?}",
+        extension.entries
+    );
 }

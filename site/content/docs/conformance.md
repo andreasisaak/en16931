@@ -1,21 +1,20 @@
 +++
 title = "Conformance and performance"
 weight = 9
-description = "What is measured rather than claimed: CEN's unit tests, KoSIT's mutation suite, 58 published invoices, 486 documents round-tripped and crossed, and the benchmarks."
+description = "What is measured rather than claimed: CEN's unit tests, KoSIT's mutation suite, 59 published invoices, 500 documents round-tripped and crossed, and the benchmarks."
 +++
 
-The rule logic here is hand-written, so — unlike a Schematron-driven tool, which
-is by construction exactly as correct as the artefact — it can be wrong in ways
-theirs cannot. That is why the conformance corpora gate every release, and why
-this page exists at all.
-
-Every other test in this project was written by the same person as the code it
-checks, from the same reading of the same documents. The ones below were not.
+The rule logic here is hand-written, so it is checked against the authorities'
+own test suites, at pinned releases, on every change. Every suite summary on
+this page is pasted from the suite's output and checked against it, and every
+count in the prose is asserted by the suite that measures it; the benchmark
+timings are measured, not asserted.
 
 ## CEN's unit tests
 
-277 files, roughly 1 129 assertions, each a minimal UBL fragment with an explicit
-expectation:
+277 files and 1 131 assertions, each a minimal UBL fragment with an explicit
+expectation. 1 025 CEN unit-test assertions run; the rest test rules the types
+retire, undecidable rules or syntax rules:
 
 ```xml
 <test>
@@ -26,36 +25,45 @@ expectation:
 
 ```text
 CEN conformance suite
-  assertions:            1129
-  run:                   1024
-  agreed:                1013  (98.9% of run)
+  files:                  277
+  assertions:            1131
+  run:                   1025
+  agreed:                1014  (98.9% of run)
   disagreed:                0
   diverged, declared:      11
+     6 × an empty <cac:PostalAddress/> is an absent address here
+     2 × a <cac:BillingReference/> with no child is an absent BG-3 here
+     1 × a <cac:InvoicePeriod/> with no dates is an absent BG-14 here
+     2 × two cac:TaxTotal elements cannot both be BT-110
   skipped, unevaluated:    66  (type-retired or undecidable)
   skipped, syntax rules:   32  (UBL-*/CII-*, the formats crate's job)
-  skipped, malformed:       7  (a value the model refuses at the boundary)
+  skipped, malformed:       8  (a value the model refuses)
+  skipped, unreadable:      0
+  run, no indicator:        8  (absent cbc:ChargeIndicator, read as an allowance)
+  core rules with no CEN expectation: 35 of 227
 ```
 
-**Zero disagreements.** The eleven divergences are declared by file and rule with
-a written reason, and the list is asserted *exactly* — so it can only shrink, and
-a divergence that starts agreeing fails the build just as loudly as a new one.
+Every expectation a test states is checked against the report of the **full**
+rule set — a test may state several (`BR-29` and `BR-30` must both stay silent).
+CEN's files say nothing about 35 of the 227 core rules, most of them the
+`BR-DEC-*` decimal checks the model's amount types retire. CEN's fragments are
+minimal by design, so what *other* rules do on them is not an expectation.
 
-They come from two causes, both of them the same kind of thing:
+**Zero disagreements.** Each divergence is declared by file and rule with a
+reason, and the list is asserted exactly: a divergence that starts agreeing
+fails the build as a new one would. They have two causes:
 
-- **Nine cases**: UBL can carry a group that is present and empty —
-  `<cac:PostalAddress/>`, `<cac:BillingReference/>`, `<cac:InvoicePeriod/>` — and
-  this model cannot. An address with no fields *is* an absent address; there is
-  no third state. Adding one would put a syntax artefact in every consumer's way
-  to satisfy nine test cases.
-- **Two cases**: UBL permits two `cac:TaxTotal` elements in the same currency
-  with different amounts. BT-110 is one field, so the contradiction cannot be
-  written down — and `BR-CO-15` is then satisfied by whichever value was read.
-  Peppol's `R053` is the rule that catches this, and it is a syntax rule about
-  element counts.
+- UBL can carry a group that is present and empty — `<cac:PostalAddress/>`,
+  `<cac:BillingReference/>`, `<cac:InvoicePeriod/>` — and this model cannot. An
+  address with no fields *is* an absent address; there is no third state.
+- UBL permits two `cac:TaxTotal` elements in the same currency with different
+  amounts. BT-110 is one field, so the contradiction cannot be written down —
+  and `BR-CO-15` is then satisfied by whichever value was read. Peppol's `R053`
+  is the rule that catches this, and it is a syntax rule about element counts.
 
 ## KoSIT's mutation suite
 
-224 *complete, valid* XRechnung invoices with mutations embedded as processing
+226 *complete, valid* XRechnung invoices with mutations embedded as processing
 instructions:
 
 ```xml
@@ -69,67 +77,56 @@ failure mode a corpus of deliberately-broken documents structurally cannot see.
 
 ```text
 XRechnung mutation suite
-  runnable mutations:    449
-  run:                   381
-  agreed:                381  (100.0% of run)
-  disagreed:               0
+  instances:              226
+  runnable mutations:     471
+  run:                    381
+  agreed:                 381  (100.0% of run)
+  disagreed:                0
+  skipped:                 90  (type-retired, not in the profile, or a value the model refuses)
 ```
 
 ## Published example invoices
 
-The 58 complete invoices CEN and OpenPeppol ship as examples of correct usage. No
+The 59 complete invoices CEN and OpenPeppol ship as examples of correct usage. No
 per-rule expectation, just a blunt one: *the authority publishes this as valid*,
 so **nothing fatal may fire**.
 
 ```text
 published example invoices
-  checked:  58
-  valid:    58
+  checked:                 59
+  valid:                   59
+  skipped:                  2  (each named with its reason)
 ```
 
-Two are skipped by name and reason — one is a bug-report reproduction rather than
-an example, and one fails CEN's own `BR-06`.
+The skipped ones are named with their reason: one is a bug-report reproduction
+rather than an example, and one fails CEN's own `BR-06`.
 
-## Eight bugs the first run found
-
-None of which any other test in this project could have found:
-
-| | |
-|---|---|
-| `BR-CL-15` | checked BT-80; its artefact context is `cac:OriginCountry` — **BT-159**. It had been duplicating `BR-CL-14` and leaving BT-159 unchecked. |
-| `BR-CO-09` | checked seller and buyer, **not BT-63** — which the rule text names. |
-| `BR-CO-25` | fired on credit notes. CEN has six cases titled *"Verify that rule does not fire on Credit Notes"*. |
-| `BR-CL-07` | covered BT-128 and not BT-18 — its context is a union of the two. |
-| `BR-DE-18` | missed the second half of the rule: the Skonto block must **end with a newline**. |
-| `PEPPOL-EN16931-R003` | modelled as "BT-10 is mandatory". It is a **disjunction** — BT-10 *or* BT-13 — and rejected eight of CEN's own published invoices. |
-| `PEPPOL-EN16931-R004` | modelled as "BT-24 is present". It constrains BT-24's **value** with `starts-with`, so any string passed. |
-| `BR-CL-22` | compared BT-121 case-sensitively. The **released** artefact wraps it in `upper-case()`; only the source file does not. |
-
-`BR-CO-25` forced a model change. CEN's credit-note cases carry **no BT-3 at
-all**, so inferring the document kind from the type code cannot answer the
-question they ask. The document kind is an explicit field now — which is also
-what both syntaxes carry, and it makes `BR-CL-01` exact rather than permissive.
+One excuse is narrower than a skip: CEN's 2017 Swedish Peppol samples carry
+placeholder organisation numbers and GLNs whose check digits do not hold, so
+Peppol's own `PEPPOL-COMMON-R049` and `R040` reject them, here as in Peppol's
+validator. Those two findings are excused for those files by name; everything
+else in them is still checked.
 
 ## The syntax corpora
 
-The formats crate runs three properties over **486 published documents** — every
+The formats crate runs three properties over **500 published documents** — every
 UBL and CII instance in the CEN, KoSIT and OpenPeppol trees.
 
-**486, and elsewhere on this site 487.** Both are measured and they count
-different things: the tree holds **320 UBL and 167 CII files**, and the reader
-rejects one UBL file as not well-formed — correctly, it is a deliberately
-malformed instance. The properties below run over the **486 that parse**; the
-[depth guard](@/docs/syntaxes.md#the-document-is-hostile-until-it-parses) scans
-all **487 files**, including the one that never becomes a document.
+The tree holds 326 UBL and 175 CII files; one UBL file is deliberately not
+well-formed and is correctly refused. The properties run over the 500 that parse;
+the [depth guard](@/docs/syntaxes.md#the-document-is-hostile-until-it-parses)
+scans all 501 files.
 
 | Suite | What it establishes |
 |---|---|
 | `roundtrip` | `Invoice → syntax → Invoice` is the identity in both syntaxes, reported per field |
-| `fidelity` | the same property over all 486, where a difference is a failure *unless the writer named it in `dropped`* |
-| `cross_syntax` | read in one syntax, write in the **other**, read back — over the same 486, both directions |
+| `fidelity` | the same property over all 500, where a difference is a failure *unless the writer reported it as an entry* |
+| `cross_syntax` | read in one syntax, write in the **other**, read back — over the same 500, both directions |
 | `order` | every element either writer emits is in schema sequence |
 | `subset` | neither writer emits a forbidden element or attribute |
-| `corpus` | all 319 UBL and 167 CII instances read; every unmapped element named |
+| `corpus` | every published UBL and CII instance read; every unmapped element named |
+| `schema_gate` | every document the suites write — fixtures, profile-scoped writes, every published document rewritten or converted — validates with `xmllint`: CII against CEN's D16B schema, UBL against the OASIS UBL 2.1 `Invoice` or `CreditNote` schema; skipped with a printed line without it, a failure in CI |
+| `zugferd_embed` | every PDF `zugferd::embed` writes — both profiles, into blank PDF/A-3b files of four shapes and into the ZUGFeRD corpus's PDF/A-3 samples with their own invoice removed — passes veraPDF PDF/A-3b and reads back with no divergence; skipped with a printed line without Docker, a failure in CI |
 
 Each finds a class the one before it cannot: `roundtrip` works on a fixture this
 crate wrote, `fidelity` on documents it did not, and `cross_syntax` on a binding
@@ -139,9 +136,14 @@ that class produces a schema-valid document the reader reads without complaint,
 which is why the property is asserted over a corpus rather than argued from the
 code.
 
+`schema_gate` closes the gap those leave: the round trips read back by local
+name, so a permitted element with the wrong child type or namespace survives
+all of them. Written UBL is validated against the OASIS UBL 2.1 schemas, pinned
+by the SHA-256 of OASIS's archive.
+
 ## The readers, over documents somebody else's tooling mangled
 
-The 486 published documents are all *well-formed by construction* — the
+The 500 published documents are all *well-formed by construction* — the
 authorities publish invalid **documents**, not broken **files**. A truncated
 stream, a duplicated element, a value no producer would emit: none of that is in
 any corpus, and all of it arrives from a real counterparty.
@@ -153,37 +155,50 @@ back:
 | | Covers |
 |---|---|
 | random single and triple mutations | truncation, dropped characters, duplicated elements, renamed tags, deep nesting, an injected doctype — **structural** corruption |
-| a dense deterministic sweep | **every** value replaced with each of sixteen adversarial strings |
+| a dense deterministic sweep | **every** value replaced with each of 16 adversarial strings |
 
 The dense sweep does the work. A complete invoice has around a hundred value
 nodes, so random targeting reaches any given converter a few per cent of the
 time; replacing every value guarantees each converter meets each input.
 
-Two numbers are asserted, because a fuzz suite that passes for the wrong reason
-looks exactly like one that passes: how many mutations **reach** the reader, and
-whether the reader **recorded** what it refused — which is what `unmapped` and
-`malformed` are for.
+Two numbers are asserted: how many mutations **reach** the reader, and whether
+the reader **recorded** what it refused, as `Unmapped` and `Malformed` entries.
+
+Coverage-guided fuzzing runs beside it in CI: 4 `cargo-fuzz` targets, 60
+seconds each on every change — any bytes through `read`; a PDF through
+`extract` under small limits, asserting what comes back stays within them; a
+generated invoice written as UBL and as CII and read back, which must be
+**unchanged unless the writer or the reader reported something**; and a fuzzed
+PDF/A through `embed`. Every defect they find becomes a named regression test.
+
+## The ZUGFeRD corpus
+
+The 151 PDFs of the public ZUGFeRD corpus are extracted one by one, and the
+outcome is asserted **per file**: 148 come back with an invoice, and each one
+that does not is named with its reason — a PDF with nothing attached,
+Mustang's deliberately misnamed `factur-y.xml`, and Mustang's sample declaring
+the encoding `UTF-8-W/O-BOM`, which is refused by name rather than decoded on a
+guess. A change that loses one file, or makes a refused one extract, fails naming it.
 
 ## Every source is pinned to a release
 
 | | Pinned at |
 |---|---|
 | `ConnectingEurope/eInvoicing-EN16931` | `validation-1.3.16` |
-| `itplr-kosit/xrechnung-schematron` | `v2.5.0` — its changelog says *"compatible with XRechnung 3.0.x"* |
-| `itplr-kosit/validator-configuration-xrechnung` | `v2026-01-31` |
-| `OpenPEPPOL/peppol-bis-invoice-3` | `v3.0.20` |
+| `itplr-kosit/xrechnung-schematron` | `v2.6.0` — its changelog says *"compatible with XRechnung 3.0"* |
+| `itplr-kosit/validator-configuration-xrechnung` | `v2026-08-31` |
+| `OpenPEPPOL/peppol-bis-invoice-3` | BIS Billing 3.0.21, commit `806866bd2bd91d7e9623b68f08164e8fbe9e67a0` |
+| `ZUGFeRD/corpus` | commit `d891458e9822e34271a5438497bf924e89955979` (Apache-2.0) |
+| OASIS UBL 2.1 (`docs.oasis-open.org`) | archive SHA-256 `60b80d76394a8a2add90723ecb8e0e2e9d826775de9749df37a72d60703f86ed` — the schemas the UBL schema gate validates against |
 
-Tags, not branches, for a reason sharper than reproducibility: **an authority's
-`master` is its next release.** KoSIT's validator-configuration branch has
-carried `customLevel` overrides — `CII-SR-465`, `CII-SR-466` — that appear in no
-published release, and a project whose central claim is that it reports rules at
-the severities the authorities *publish* must not read severities nobody has
-published yet.
-
-The pins name a version, not just a commit, because KoSIT states the
-correspondence in its own changelog. Bumping one is a decision: a KoSIT release
-that moves to XRechnung 4.0 is a new profile here, not a newer pin on the old
-one.
+A release is an authority's normative publication, tagged or not: the tag where
+there is one, the commit otherwise — Peppol published 3.0.21 untagged, and the
+pinned commit's Schematron is byte-identical to the one docs.peppol.eu
+publishes. OASIS publishes UBL 2.1 as a download, so its pin is the archive's
+SHA-256. Never a branch: **an authority's `master` is its next release**, and
+this project reports rules at the severities the authorities *publish*. The
+fetch fails unless a commit-pinned checkout is that commit. A
+KoSIT release that moves to XRechnung 4.0 is a new profile, not a newer pin.
 
 Each profile declares which of these its rules were checked against, and that
 list travels in every report — including the JSON one you store. A test asserts
@@ -197,16 +212,11 @@ tree is what keeps every crate here `MIT OR Apache-2.0`. The suites that need
 them skip without them, and CI sets `EN16931_REQUIRE_SPEC=1` so a skip *there* is
 a **failure**.
 
-That flag matters more than it looks. A skipped conformance run and a passing one
-are the same summary line, which is exactly how 486 unread documents stay green.
-
 ## The documentation is tested too
 
-The numbers on this page are not typed in. A test walks every README, every
-`lib.rs` and every page of this site, finds each figure in its sentence, and
-compares it against the value the code produces — so a rule added tomorrow
-fails the build in six files at once rather than making six documents quietly
-wrong. See [contributing](@/docs/contributing.md#the-documentation-is-tested).
+A test walks every README, every source file and every page of this site, finds
+each measured figure in its sentence, and compares it against the value the code
+produces. See [contributing](@/docs/contributing.md#the-documentation-is-tested).
 
 ## Measured, not asserted
 
@@ -218,26 +228,12 @@ profile/XRechnung 3.0/5              6.30 µs
 profile/XRechnung 3.0 Extension/5    5.05 µs
 ```
 
-`cargo bench`, on the maintainer's machine — the useful information is the *order
-of magnitude*, not the digits. Microseconds rather than the tens of milliseconds
-a JVM plus an XSLT engine takes, and no process to start.
+`cargo bench`, on the maintainer's machine — the order of magnitude matters, not
+the digits.
 
-The Extension being *faster* than the CIUS it extends is not a mistake: it runs
-fourteen more rules and its documents trip fewer of them, and at this scale the
-findings cost more than the predicates.
-
-Writing the benchmark immediately found a defect it existed to catch. Profile
-validation was **35 µs** on the same document the core rules took 1.5 µs on, for
-a profile that adds no rules at all: comparing two rule ids built up to three
-`String`s, once per rule per document. Making the comparison allocation-free took
-it to 2.3 µs — 15×, and 35× for the Extension profile. A performance claim is
-worth exactly as much as the benchmark behind it, and this one had none until it
-had a bug.
-
-The number that matters for architecture is that validation is fast enough to run
-on every keystroke of a form, and small enough to run in the browser: `en16931`
-builds for `wasm32-unknown-unknown`, so an invoice never has to leave the client
-to find out whether it is valid.
+The Extension is faster than the CIUS it extends because its documents trip
+fewer rules, and at this scale findings cost more than predicates. `en16931`
+builds for `wasm32-unknown-unknown`, so validation can run in the browser.
 
 ## Measured, not asserted — the syntax layer
 
@@ -252,25 +248,16 @@ convert/ubl-to-cii     158 µs          convert/cii-to-ubl     213 µs
 ```
 
 `cargo bench -p en16931-formats --all-features`, on the maintainer's machine —
-the useful information is the order of magnitude, not the digits. Reading is
-linear in line count, which is the property that matters: a reader that goes
-quadratic is fine on examples and dies on a telecoms bill with 5 000 call
-records.
-
-Writing runs the prohibition tables, which are indexed by the last segment of
-each path — a linear scan of the 1 548 UBL entries, once per element emitted, is
-what a document's write cost is otherwise made of. The old scan is kept as a
-reference implementation and a test compares the two over every path the tables
-describe: the prohibitions are what make *"the writer cannot emit a forbidden
-element"* a property, so an optimisation there needs a proof rather than a
-benchmark.
+the order of magnitude matters, not the digits. Reading is linear in line count.
+The prohibition tables are indexed by the last segment of each path, and a test
+compares the index against a linear scan over every path the tables describe.
 
 ## The generated tables
 
-Five files are generated from the artefacts and none is written by hand: the code
-lists for `en16931`, and the element-order and prohibition tables for each syntax
-in `en16931-formats`. `cargo xtask check` re-derives all five and fails if a
-committed one differs, so a table cannot drift from the artefact it came from.
+The workspace has 7 generated files, none written by hand: the code lists for
+`en16931`, and the element-order, prohibition and single-occurrence tables for
+each syntax in `en16931-formats`. `cargo xtask check` re-derives all 7 and
+fails if a committed one differs, so a table cannot drift from its artefact.
 
 The generators refuse to guess. `BR-CL-01`'s test is a *disjunction* carrying two
 different lists, so the table declares which branch it wants and the generator
@@ -279,6 +266,6 @@ CEN's three syntaxes — EDIFACT 381 codes ⊂ UBL 383 ⊂ CII 401, three frozen
 directory revisions — so the generator checks that they still form a chain, takes
 the union, and stops outright if one binding ever gains a code another dropped.
 
-## What is next
+## See also
 
 - **[Contributing](@/docs/contributing.md)** — running all of this locally.

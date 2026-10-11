@@ -21,3 +21,9 @@ license.workspace      = true
 # the binding tables with a *different* parser than the one that will read the
 # documents would make the tables agree with something nothing else uses.
 roxmltree.workspace = true
+# The OASIS UBL 2.1 schemas are published as an archive, pinned by its
+# SHA-256. Already in the lockfile through `lopdf`; no new crate.
+sha2 = "0.11"
+# `cargo xtask watch` reads the Docker Hub tags API and writes its report as
+# JSON. Already in the lockfile through the workspace crates; no new crate.
+serde_json = "1"

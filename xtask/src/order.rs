@@ -1,26 +1,18 @@
-//! Deriving element order from the authorities' own instances.
+//! Deriving element order: from the D16B schema for CII, from the authorities'
+//! own instances for UBL.
 //!
-//! # The method, and why it is not "read the XSD"
+//! CII: each parent's observed children, sorted by their position in the parent
+//! type's `xsd:sequence` in CEN's D16B subset schema. Fails if a parent's type
+//! cannot be resolved, if one element name has two different sequences, or if an
+//! observed child is not in its parent's sequence. (The instances alone get CII
+//! wrong: KoSIT's mutation instances outvote valid ones, and mutually exclusive
+//! elements never co-occur.)
 //!
-//! This crate ships no schema, and adding one would mean shipping OASIS's and
-//! UN/CEFACT's schema sets to answer a question with a much smaller answer:
-//! *in what order may these forty-odd elements appear?* The published instances
-//! answer it directly, and they are already fetched.
-//!
-//! For each parent element, every pair of children is counted in the order it
-//! was observed. The children are then topologically sorted using the
-//! **majority** direction of each pair — majority rather than first-seen,
-//! because a large part of the corpus is *deliberately invalid* (KoSIT's
-//! mutation instances exist to be rejected) and a single bad document must not
-//! reorder the table.
-//!
-//! Ties are broken by mean relative position, which matters only for elements
-//! that never co-occur — where any order is as good as any other and stability
-//! across runs is what counts.
-//!
-//! The generator **fails** rather than emitting a table it could not derive
-//! cleanly: an unresolved cycle or a tied pair means the corpus disagrees with
-//! itself, and a guess written to disk looks exactly like a fact.
+//! UBL: every pair of sibling children is counted in observed order and the
+//! children are topologically sorted by the majority direction, so a single
+//! deliberately invalid instance cannot reorder the table. Ties are broken by
+//! mean relative position, then by name. Fails on a cycle or a pair seen equally
+//! often in both directions.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,9 +29,7 @@ impl Syntax {
     /// The document elements that start a document in this syntax.
     fn roots(self) -> &'static [&'static str] {
         match self {
-            // UBL has two, and they disagree about where `cbc:TaxPointDate`
-            // goes — which is why deriving per-root rather than per-syntax is
-            // not optional.
+            // Invoice and CreditNote disagree on where `cbc:TaxPointDate` goes.
             Self::Ubl => &["Invoice", "CreditNote"],
             Self::Cii => &["CrossIndustryInvoice"],
         }
@@ -118,14 +108,21 @@ impl Observations {
     }
 }
 
-/// Derive the order table for `syntax` from `files`.
+/// Derive the order table for `syntax` from `files` (and, for CII, the D16B
+/// schema under `spec`).
 ///
 /// # Errors
 ///
-/// Fails if no instance of this syntax was found, or if the corpus does not
-/// agree on a total order for some parent — a cycle, or a pair seen equally
-/// often in both directions.
-pub fn derive(syntax: Syntax, files: &[PathBuf], root: &Path) -> Result<Generated, String> {
+/// Fails if no instance of this syntax was found; for UBL, if the corpus does
+/// not agree on a total order for some parent — a cycle, or a pair seen equally
+/// often in both directions; for CII, if the schema cannot order an observed
+/// parent's children.
+pub fn derive(
+    syntax: Syntax,
+    files: &[PathBuf],
+    spec: &Path,
+    root: &Path,
+) -> Result<Generated, String> {
     let mut obs = Observations::default();
     let mut instances = 0usize;
 
@@ -145,7 +142,10 @@ pub fn derive(syntax: Syntax, files: &[PathBuf], root: &Path) -> Result<Generate
     }
 
     if instances == 0 {
-        return Err(format!("no {} instances found under spec/", syntax.label()));
+        return Err(format!(
+            "no {} instances found under the reference corpus",
+            syntax.label()
+        ));
     }
 
     let mut table: Vec<(String, Vec<String>)> = Vec::new();
@@ -212,6 +212,25 @@ pub fn derive(syntax: Syntax, files: &[PathBuf], root: &Path) -> Result<Generate
         }
     }
 
+    if syntax == Syntax::Cii {
+        // The schema orders CII; the instances only say which parents and
+        // children occur. Their disagreements are moot.
+        conflicts.clear();
+        let sequences = d16b_sequences(&spec.join(D16B))?;
+        for (parent, kids) in &mut table {
+            let seq = sequences.get(parent.as_str()).ok_or_else(|| {
+                format!("CII: <{parent}> has no element sequence in the D16B schema")
+            })?;
+            if let Some(stray) = kids.iter().find(|k| !seq.contains(k)) {
+                return Err(format!(
+                    "CII: <{stray}> observed under <{parent}>, whose D16B sequence does \
+                     not contain it"
+                ));
+            }
+            kids.sort_by_key(|k| seq.iter().position(|s| s == k));
+        }
+    }
+
     if !conflicts.is_empty() {
         return Err(format!(
             "{} could not be derived — the corpus disagrees with itself:\n  {}",
@@ -222,6 +241,80 @@ pub fn derive(syntax: Syntax, files: &[PathBuf], root: &Path) -> Result<Generate
 
     table.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(render(syntax, instances, &table, root))
+}
+
+/// The uncoupled D16B subset schema directory, relative to the reference corpus.
+const D16B: &str =
+    "eInvoicing-EN16931/cii/schema/D16B SCRDM (Subset)/uncoupled clm/CII/uncefact/data/standard";
+
+/// `element name -> child element names in sequence order`, for every element
+/// with element content reachable from `rsm:CrossIndustryInvoice`.
+fn d16b_sequences(dir: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
+    const XS: &str = "http://www.w3.org/2001/XMLSchema";
+    let mut types: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut root_type = None;
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "xsd") {
+            continue;
+        }
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let doc =
+            roxmltree::Document::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let unprefixed = |t: &str| t.rsplit(':').next().unwrap_or(t).to_owned();
+        for n in doc
+            .root_element()
+            .children()
+            .filter(roxmltree::Node::is_element)
+        {
+            match (n.tag_name().namespace(), n.tag_name().name()) {
+                (Some(XS), "complexType") => {
+                    let Some(name) = n.attribute("name") else {
+                        continue;
+                    };
+                    let kids = n
+                        .descendants()
+                        .filter(|d| {
+                            d.tag_name().namespace() == Some(XS) && d.tag_name().name() == "element"
+                        })
+                        .filter_map(|d| {
+                            Some((
+                                d.attribute("name")?.to_owned(),
+                                unprefixed(d.attribute("type")?),
+                            ))
+                        })
+                        .collect();
+                    types.insert(name.to_owned(), kids);
+                }
+                (Some(XS), "element") if n.attribute("name") == Some("CrossIndustryInvoice") => {
+                    root_type = n.attribute("type").map(unprefixed);
+                }
+                _ => {}
+            }
+        }
+    }
+    let root_type = root_type.ok_or("D16B: no CrossIndustryInvoice element declaration")?;
+
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut stack = vec![("CrossIndustryInvoice".to_owned(), root_type)];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some((name, ty)) = stack.pop() {
+        let Some(kids) = types.get(&ty) else { continue };
+        if kids.is_empty() || !seen.insert((name.clone(), ty.clone())) {
+            continue;
+        }
+        let seq: Vec<String> = kids.iter().map(|(k, _)| k.clone()).collect();
+        if let Some(prev) = out.get(&name)
+            && *prev != seq
+        {
+            return Err(format!("D16B: <{name}> has two different content models"));
+        }
+        out.insert(name, seq);
+        stack.extend(kids.iter().cloned());
+    }
+    Ok(out)
 }
 
 fn render(
@@ -242,27 +335,36 @@ fn render(
         body.push_str(&format!("    (\"{}\", &[{list}]),\n", escape(parent)));
     }
 
+    let method = match syntax {
+        Syntax::Cii => {
+            "//! For each parent, the children are those observed, in the order of the\n\
+             //! parent type's `xsd:sequence` in CEN's uncoupled D16B subset schema.\n\
+             //! `cargo xtask codegen` fails if the schema cannot order an observed\n\
+             //! parent's children.\n"
+        }
+        Syntax::Ubl => {
+            "//! For each parent, the child order is the topological sort of the pairwise\n\
+             //! precedences observed, taking the majority direction where instances\n\
+             //! disagree. `cargo xtask codegen` fails on a cycle or a tied pair.\n"
+        }
+    };
+    let title = match syntax {
+        Syntax::Cii => format!("The {label} element order, from the D16B schema."),
+        Syntax::Ubl => {
+            format!("The {label} element order, derived from the authorities' own instances.")
+        }
+    };
     let doc = header(
-        &format!("The {label} element order, derived from the authorities' own instances."),
+        &title,
         &format!(
-            "//! Derived from **{instances}** published `{roots}` documents under\n\
-             //! `spec/` — CEN unit tests, KoSIT mutation instances, OpenPeppol examples —\n\
-             //! covering {parents} parent elements.\n\
+            "//! Parents and children observed in **{instances}** published `{roots}`\n\
+             //! documents of the reference corpus, covering {parents} parent elements.\n\
+             //! {label} content models are XSD `sequence`s, and no Schematron rule\n\
+             //! checks order.\n\
              //!\n\
-             //! {label} content models are XSD `sequence`s: a document carrying the right\n\
-             //! elements in the wrong order is invalid, and **no Schematron rule reports\n\
-             //! it**, because ordering is the schema's job and this crate ships no schema.\n\
+             {method}\
              //!\n\
-             //! For each parent, the child order is the topological sort of the pairwise\n\
-             //! precedences observed across all of them, taking the **majority** direction\n\
-             //! where instances disagree — and they do, because much of that corpus is\n\
-             //! deliberately invalid. `cargo xtask codegen` exits non-zero rather than\n\
-             //! emitting a table it could not derive cleanly, so a cycle or a tied pair\n\
-             //! fails the build instead of becoming a guess written to disk.\n\
-             //!\n\
-             //! [`mod@super::write`] does not consult this table directly — the shared serialiser\n\
-             //! sorts by it, so the writer emits in whatever order reads best and cannot\n\
-             //! produce a misordered document at all.\n",
+             //! The shared serialiser sorts every written element by this table.\n",
             roots = syntax.roots().join("` / `"),
             parents = table.len(),
         ),
@@ -291,8 +393,7 @@ fn render(
          }}\n"
     );
 
-    // `local` is used by the prohibitions generator; referenced here so a
-    // future refactor that drops it fails loudly rather than silently.
+    // `crate::local` has no other caller; this keeps it referenced.
     let _ = local;
 
     Generated {

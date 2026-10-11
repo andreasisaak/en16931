@@ -1,0 +1,10 @@
+# Mutants that survive the test suite, and why each one is allowed to.
+#
+# No full sweep has been run against this baseline yet. Mutation testing is
+# local and optional (not in CI): `just mutants-diff` for a change's lines,
+# `just mutants` or the manual `mutants.yml` workflow for the full sweep.
+#
+# One entry per line: `survivor  # reason` (two spaces, `#`, the reason). Every
+# entry must carry a reason; the check fails on one that does not. Survivors are
+# killed by a test where one can be written, and recorded only when equivalent.
+# `:LINE:COL` is stripped before comparison, so ordinary edits do not churn this file.

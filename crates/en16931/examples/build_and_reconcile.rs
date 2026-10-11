@@ -4,23 +4,11 @@
 //! cargo run --example build_and_reconcile
 //! ```
 //!
-//! The counterpart to `validate_an_invoice`, which states every total by hand.
-//! Here the engine has produced positions — an amount, a VAT category, a rate —
-//! and nothing else. BG-23 and BG-22 are a *function* of those, and this shows
-//! what computing that function does and does not include.
-//!
-//! Three things worth watching for:
-//!
-//! * **The grouping.** Two rates in category `S` become two BG-23 entries; the
-//!   reverse-charge line becomes a third, and the two `AE` positions at
-//!   `Some(0)` and `None` stay **one** group because `BR-AE-01` says exactly one.
-//! * **The rounding.** VAT is computed once on the group's taxable amount, not
-//!   per line and summed — which is where three `0.05` lines come out a cent
-//!   wrong and `BR-S-09` notices.
-//! * **What it refuses to invent.** `BR-AE-10` needs an exemption reason, and no
-//!   arithmetic can produce one. It is configured, not guessed.
+//! The [`Reconciler`] derives BG-23 and BG-22 from the lines: two `S` rates
+//! give two groups, both `AE` lines share one (`BR-AE-01`), and VAT is computed
+//! per group rather than summed per line. The `BR-AE-10` exemption reason
+//! cannot be derived, so it is configured.
 
-use en16931::codes::guard;
 use en16931::invoice::{Party, PartyRole, PostalAddress};
 use en16931::reconcile::Reconciler;
 use en16931::{
@@ -32,52 +20,43 @@ fn amount(s: &str) -> InvoiceAmount {
     InvoiceAmount::parse(s).expect("a two-decimal amount")
 }
 
-fn party(name: &str, eas: &str, address: &str, city: &str, post_code: &str) -> Party {
-    Party {
-        name: Some(name.into()),
-        // The scheme is checked here, at the map, rather than reported later
-        // against an assembled document.
-        electronic_address: Some(
-            Identifier::eas(address, eas).unwrap_or_else(|e| panic!("{name}: {e}")),
-        ),
-        address: PostalAddress {
-            city: Some(city.into()),
-            post_code: Some(post_code.into()),
-            country: Some(guard::country("DE").expect("DE is a country")),
-            ..PostalAddress::default()
-        },
-        ..Party::default()
-    }
+fn party(name: &str, eas: &str, address: &str, street: &str, city: &str, post_code: &str) -> Party {
+    Party::new(
+        name,
+        PostalAddress::new(street, city, post_code, "DE").expect("DE is a country"),
+    )
+    // The EAS scheme is checked here, not later by validation.
+    .with_electronic_address(
+        Identifier::eas(address, eas).unwrap_or_else(|e| panic!("{name}: {e}")),
+    )
 }
 
 fn main() {
-    // ── What a profile will ask for, before anything is fetched ──────────────
-    //
-    // A pre-flight, not a verdict: this is answerable on an empty party, so the
-    // fields can be fetched from a contract service in one round trip instead
-    // of a build-validate-fetch loop.
+    // ── What a profile will ask for, before anything is built ────────────────
     println!("XRechnung wants these of a buyer, before we build anything:");
     for gap in Party::default().missing_for(&profiles::XRECHNUNG, PartyRole::Buyer) {
         println!("  {gap}");
     }
 
-    // ── The lines, which is all the engine produced ──────────────────────────
-    let mut seller = party(
+    // ── The lines ────────────────────────────────────────────────────────────
+    let seller = party(
         "Stadtwerke Musterstadt GmbH",
-        "0088", // GLN. `9958` — the Leitweg scheme — was withdrawn in 2023.
+        "0088", // GLN
         "4012345000009",
+        "Hauptstraße 1",
         "Musterstadt",
         "12345",
-    );
-    seller.vat_identifier = Some("DE123456789".into());
-    let mut buyer = party(
+    )
+    .with_vat_identifier("DE123456789");
+    let buyer = party(
         "Beispiel AG",
-        "0204", // DE:LWID, the successor to 9958
+        "0204", // DE:LWID (Leitweg-ID)
         "991-01234-56",
+        "Marktplatz 2",
         "Beispielstadt",
         "54321",
-    );
-    buyer.vat_identifier = Some("DE987654321".into());
+    )
+    .with_vat_identifier("DE987654321");
 
     let invoice = Invoice::builder(
         "urn:cen.eu:en16931:2017",
@@ -88,8 +67,7 @@ fn main() {
     )
     .seller(seller)
     .buyer(buyer)
-    // BR-CO-25 wants a due date **or** payment terms once something is owed.
-    // Both are offered; neither is computed from the amount.
+    // BR-CO-25: a due date or payment terms once something is owed.
     .due_in_days(14)
     .payment_terms("Zahlbar innerhalb 14 Tagen ohne Abzug")
     .line(InvoiceLine::new(
@@ -126,18 +104,11 @@ fn main() {
         "C62",
         amount("250.00"),
         "AE",
-        // `BR-AE-05` says the line rate "shall be 0" — absent is NOT zero here,
-        // and a rate of `None` would be reported. Both `AE` lines still land in
-        // ONE BG-23 group, because `BR-AE-01` says exactly one and the grouping
-        // therefore ignores the rate for this category. That matters most on a
-        // *parsed* document: one carrying `None` gets a `BR-AE-05` finding about
-        // the line, and not a spurious `BR-AE-01` about a group that split.
+        // `BR-AE-05`: the line rate must be 0, not absent. All `AE` lines form
+        // one group regardless of rate (`BR-AE-01`).
         Some(Percentage::ZERO),
     ))
-    .build_reconciled_with(
-        // The one thing the arithmetic cannot supply.
-        &Reconciler::new().exemption("AE", None, Some("VATEX-EU-AE")),
-    )
+    .build_reconciled_with(&Reconciler::new().exemption("AE", None, Some("VATEX-EU-AE")))
     .expect("the lines reconcile");
 
     // ── What came out ────────────────────────────────────────────────────────
@@ -171,13 +142,12 @@ fn main() {
         t.charge_total.map_or("absent".into(), |v| v.to_string()),
     );
 
-    // ── And the verdict, which is still a separate question ──────────────────
+    // ── Validation ───────────────────────────────────────────────────────────
     let report = validate(&invoice);
     println!("\n{report}");
     assert!(report.is_valid(), "a reconciled invoice still gets checked");
 
-    // The profile is a stricter question, and its findings are the ones a
-    // pre-flight predicted.
+    // XRechnung's findings are the ones the pre-flight listed.
     let xr = profiles::XRECHNUNG.validate(&invoice);
     println!(
         "\nAgainst XRechnung 3.0: {} rule(s) checked, {} still owed",

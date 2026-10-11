@@ -1,44 +1,28 @@
 +++
 title = "en16931"
-description = "The EN 16931 European e-invoice as Rust types: 317 business rules, UBL 2.1 and UN/CEFACT CII in both directions, XRechnung, Peppol BIS Billing 3.0 and ZUGFeRD / Factur-X. No XML in the model, no I/O, wasm32."
+description = "The EN 16931 European e-invoice as Rust types: 334 business rules, UBL 2.1 and UN/CEFACT CII in both directions, XRechnung, Peppol BIS Billing 3.0 and ZUGFeRD / Factur-X. No XML in the model, no I/O, wasm32."
 template = "index.html"
 
 [extra]
 lede = "Validate the invoice, not the document. Findings point at BT-151 on line 3 — never at an XPath — because the rules run against the semantic model instead of a serialised file. Two libraries and a single static binary."
-
-[[extra.stats]]
-n = "317"
-k = "business rules, all exercised"
-
-[[extra.stats]]
-n = "100 %"
-k = "agreement with CEN's and KoSIT's own suites"
-
-[[extra.stats]]
-n = "486"
-k = "published documents read, written and crossed"
-
-[[extra.stats]]
-n = "2 µs"
-k = "to validate a five-line invoice"
+stats = [
+  { n = "334", k = "rules registered" },
+  { n = "277", k = "rules exercised by a failing fixture" },
+  { n = "1 025", k = "CEN unit-test assertions run, none disagreeing" },
+  { n = "500", k = "published documents read, written and crossed" },
+]
 +++
 
 ## What this is
 
-From 2025 onwards a German business must be able to *receive* a structured
-e-invoice, and from 2027–2028 it must send one. The rest of the EU is arriving at
-the same place through ViDA. The format is **EN 16931** — a semantic data model
-of 164 business terms, a few hundred business rules, and two mandatory XML
-syntaxes that say the same thing in different words.
+**EN 16931** is the European e-invoice: a semantic data model of business terms
+and groups, business rules on it, and two mandatory XML syntaxes, UBL 2.1 and
+UN/CEFACT CII. National usage specifications such as XRechnung and Peppol BIS
+Billing 3.0 restrict it further.
 
-Almost every implementation of it is *XML in, Schematron out*. That works, and it
-means your development loop is: build the document, serialise it, validate it,
-parse the error, and guess which field the XPath meant.
-
-These crates invert that. The **model** is the primary artefact and the rules run
-against it, so a finding says `BG-25[2]/BT-151` — the language the standard, the
-rules and you already speak. You can validate an invoice you are still
-assembling, before a single byte of XML exists.
+These crates make the **model** the primary artefact and run the rules against
+it, so a finding says `BG-25[2]/BT-151` and an invoice can be validated while it
+is still being assembled, before any XML exists.
 
 ```rust
 let report = en16931::validate(&invoice);
@@ -52,37 +36,30 @@ assert_eq!(report.fatal().next().unwrap().path.to_string(), "BT-1");
 | | |
 |---|---|
 | **`en16931`** | the semantic model, the rules, the typed proof of validity. Two dependencies, no XML, no I/O, builds for `wasm32`. |
-| **`en16931-formats`** | UBL 2.1 and UN/CEFACT CII in both directions, XRechnung, ZUGFeRD / Factur-X. Re-implements none of the 317 rules. |
-| **`en16931-cli`** | the same thing as a command, with exit codes a CI job can branch on. |
-
-Most people need only the first. Reach for the second when a document has to
-cross a wire, and the third when what you have is a file and a question.
+| **`en16931-formats`** | UBL 2.1 and UN/CEFACT CII in both directions, ZUGFeRD / Factur-X extraction and embedding. Re-implements none of the 334 rules. |
+| **`en16931-cli`** | the same as a command, with exit codes a CI job can branch on. |
 
 ## What makes it different
 
-**The type system retires rules.** `InvoiceAmount` is `i64` minor units, so a
-third decimal is not representable — and the 21 `BR-DEC-*` rules that forbid one
-cannot fire. `PaymentMeans` is an enum over BG-17/18/19, so the three XRechnung
-rules forbidding two at once have nothing left to check. Fifty-three rules are
-retired this way: encoded as *types*, not as runtime checks.
+**Types retire rules.** `InvoiceAmount` holds exactly two decimals, so the 21
+`BR-DEC-*` rules cannot fire; `PaymentMeans` is an enum, so the rules forbidding
+two payment groups at once have nothing left to check. Of the 334 rules
+registered, 53 are retired this way and 4 are undecidable at the semantic layer,
+with the remaining 277 exercised by their own failing fixtures.
 
-**Nothing is claimed that is not measured.** The rule coverage, the code lists,
-the element order, the prohibition tables and the severity levels are all
-generated or checked against CEN's, KoSIT's and OpenPeppol's own artefacts, and
-CI fails if a committed table drifts. The conformance suites run the
-authorities' own test corpora — 1 013 CEN unit-test assertions, 381 KoSIT
-mutations, 58 published invoices — and agreement is asserted **exactly**.
+**Measured against the authorities.** Code lists, element order, prohibitions
+and severities are generated from or checked against CEN's, KoSIT's and
+OpenPeppol's artefacts at pinned releases. 1 025 CEN unit-test assertions run
+with no disagreement (11 divergences declared), 381 KoSIT mutations agree, and
+59 published invoices validate. See [conformance](@/docs/conformance.md).
 
-**Severity comes from the authority, not from us.** KoSIT's validator
-configuration re-levels nine CEN rules; `BR-CL-23` is a *warning* for every
-XRechnung scenario because CEN's unit-code table lags UN/ECE's. A validator that
-reports it as fatal rejects invoices Germany accepts.
+**Severity from the authority.** KoSIT re-levels nine CEN rules for XRechnung;
+`BR-CL-23` is a warning there. A validator that reports it as fatal rejects
+invoices Germany accepts.
 
-**Two documents can be compared as invoices.** `en16931 diff a.xml b.cii.xml`
-reads both into the model first, so a UBL invoice and its CII translation come
-out *identical* — where a textual diff of the same pair shares almost nothing.
-No XML-first tool can answer that question, because it never has the invoice.
+**A proof you cannot forge.** `Validated<XRechnung>` is a type. A serialiser
+that demands one cannot be handed an unchecked invoice, or one checked against a
+different profile.
 
-**A proof you cannot forge.** `Validated<XRechnung>` is a type. A serialiser can
-demand one and then physically cannot be handed an unchecked invoice, or one
-checked against a different profile.
+**Two documents compared as invoices.** `en16931 diff a.xml b.cii.xml` reads
+both into the model, so a UBL invoice and its CII translation compare equal.

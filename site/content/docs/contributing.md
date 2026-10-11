@@ -11,21 +11,34 @@ task runner; `just` alone lists every recipe.
 git clone https://github.com/hupe1980/en16931
 cd en16931
 
-just spec            # fetch the CEN / KoSIT / Peppol artefacts into ./spec/ — once
+just references      # fetch the CEN / KoSIT / Peppol artefacts into the reference corpus — once
 just ci              # everything CI runs, locally
 ```
 
 ## The artefacts
 
-`spec/` is **not committed**. The CEN artefacts are EUPL-1.2, a reciprocal
+The reference corpus is **not committed**. The CEN artefacts are EUPL-1.2, a reciprocal
 licence, and keeping them out of the tree is what keeps every crate here
 `MIT OR Apache-2.0`.
 
-The suites that need it skip without it, so `just spec` is the first thing to
+The suites that need it skip without it, so `just references` is the first thing to
 run. CI sets `EN16931_REQUIRE_SPEC=1`, which turns a skip into a **failure**;
-`just test-artefacts` holds you to the same standard locally. A skipped
-conformance run and a passing one produce the same summary line, which is exactly
-how 486 unread documents stay green.
+`just test-artefacts` does the same locally.
+
+Every source is pinned in `xtask/src/fetch.rs`. `cargo xtask watch` reports, as
+JSON, every pin its source has moved past, tagged or not; the weekly *Upstream
+watch* workflow keeps one issue open per moved source.
+
+## Test-time tools
+
+Two suites drive an external validator. Neither is a dependency of any crate;
+each skips with a printed line when its tool is missing, and fails under
+`EN16931_REQUIRE_SPEC=1`, as in CI.
+
+| Tool | Suite | What it checks |
+|---|---|---|
+| `xmllint` (libxml2) | `schema_gate` | every CII and UBL document the suites write against its schema |
+| Docker, with a running daemon | `zugferd_embed` | every PDF `zugferd::embed` writes, with veraPDF (PDF/A-3b) — the pinned `verapdf/rest` image, started once per run through `testcontainers` and pulled on first use (linux/amd64; emulated on Apple silicon) |
 
 ## The recipes worth knowing
 
@@ -33,7 +46,7 @@ how 486 unread documents stay green.
 |---|---|
 | `just test` | unit and doc tests, default features — the fast loop |
 | `just test-all` | every crate, every feature |
-| `just test-artefacts` | as above, but a missing `spec/` fails |
+| `just test-artefacts` | as above, but a missing reference corpus fails |
 | `just lint` | Clippy over every target and feature, warnings as errors |
 | `just doc` | rustdoc with `-D warnings`, which is what catches a broken intra-doc link |
 | `just wasm` | `en16931` still builds for `wasm32` |
@@ -43,85 +56,55 @@ how 486 unread documents stay green.
 | `just site` | build this site with [Zola](https://www.getzola.org) |
 | `just features` | Clippy over every feature combination a consumer can select |
 | `just tracked` | fail if a source file is gitignored, or missing from git |
-| `just audit` | security advisories, and a re-check of every one set aside |
+| `just audit` | security advisories over `Cargo.lock`; nothing is ignored |
 | `just ci` | all of the above that CI runs |
+| `just fuzz <target> [seconds]` | one cargo-fuzz target (`read`, `extract`, `roundtrip`, `embed`); needs nightly and `cargo-fuzz` |
+| `just mutants-diff` | mutate the lines your change touches; fails on a survivor the baseline does not record |
+| `just mutants` | the full mutation sweep of the rules — optional and slow |
 
-Four of those are less obvious than they look.
+A few notes:
 
-**`just deps`** measures the dependency-graph sizes the documentation quotes. A
-number repeated in five files is a number nobody rechecks, so it is checked
-here instead. Raising a limit is a decision, not a chore: the small graph is why
-`en16931` reaches `wasm32`, and why the PDF parser is behind a non-default
-feature.
-
-**`just features`** exists because `just lint` runs `--all-features`, which is
-the one combination where nothing is `cfg`-ed out. It cannot see code that is
-dead without a feature, or code that fails to compile without one — and both
-have reached CI. The waiver the UBL writer uses for the Extension prohibitions
-is dead code under `--features cii` alone, because the CII binding does not
-write those groups at all.
-
-**`just tracked`** is the one CI cannot run. `.gitignore` once carried a bare
-filename for a local working note, and a bare pattern matches at *any depth* —
-on a case-insensitive filesystem, which is the default on macOS, in any case
-too. It matched a documentation page whose name happened to collide, and that
-page was silently untracked: it existed locally, the site built locally, and CI
-failed on a broken link to a page that had never been pushed.
-
-`git status` does not list an ignored file, so nothing pointed at the cause; the
-working tree looked clean because the file was invisible, not because it was
-committed. CI cannot catch it either — a checkout only ever has the tracked
-files, so the missing one is not there to notice. The check has to run where the
-file exists.
-
-The fix is to anchor an ignore pattern (`/NOTES.md`, not `NOTES.md`) and to have
-something assert it.
-
-**`just wasm`** builds `-p en16931`, never `--workspace`. The formats crate pulls
-a PDF parser that does not build for that target and is not meant to; a
-workspace-wide wasm build would fail for a reason that says nothing about the
-model crate. Running it per crate is not tidiness, it *is* the assertion.
+- **`just deps`** measures the dependency-graph sizes the documentation quotes.
+  Raising one is a decision: the small graph is why `en16931` builds for
+  `wasm32`.
+- **`just features`** lints every feature combination, because `--all-features`
+  cannot see code that is dead or does not compile without a feature.
+- **`just tracked`** runs locally only: a checkout has only the tracked files,
+  so a needed file that `.gitignore` hides is invisible to CI. Anchor ignore
+  patterns (`/NOTES.md`, not `NOTES.md`).
+- **`just wasm`** builds `-p en16931` only; the formats crate's PDF parser does
+  not build for that target.
+- **Mutation testing** is local and optional: `just mutants-diff` mutates the
+  lines your change touches; `just mutants` is the full, slow sweep of the rules.
+  It is not run in CI.
+- **Fuzzing** runs in CI for 60 seconds per target; `just fuzz <target> 3600`
+  is a long local run.
 
 ## The documentation is tested
 
-Every figure in this project is measured — and then written down, in as many as
-six places: three crate READMEs, two `lib.rs` headers and this site. Measuring
-once and copying six times is how a project ends up asserting, in prose, things
-that stopped being true: a rule is added, a pin moves, a category is renamed,
-and five of the six copies stay as they were.
-
-So the prose stays — it is what makes a number mean something — and the numbers
-in it are read back and compared against the code that produces them. The
-scanner walks every README, every `lib.rs` and every page of this site, so a
-*new* mention of a figure is checked the day it is written.
-
-If you reword a sentence containing one of these numbers, the test tells you it
-stopped matching rather than silently checking nothing. And a documentation page
-never quotes a superseded figure: prose describing a past state belongs in the
+Measured figures — rule counts, the coverage split, profile check counts,
+code-list totals, conformance counts — are read back out of every README, every
+source file and every page of this site, and compared against the code that
+produces them (`crates/en16931/tests/documented_numbers.rs`). Reword a sentence
+holding one and the test says its pattern stopped matching. Documentation
+describes the current state only; history belongs in the
 [changelog](https://github.com/hupe1980/en16931/blob/main/CHANGELOG.md).
 
-## An ignored advisory is asserted, not trusted
+## No advisory is set aside
 
-`cargo audit` reads `Cargo.lock`, and a lockfile is feature-independent: it
-records the optional dependencies of every package whether or not anything
-enables them. So it can flag a crate that is never compiled — `cargo deny`,
-which reads the resolved build graph, disagrees.
-
-One advisory is set aside on exactly that basis, with the reasoning written out
-in `.cargo/audit.toml`. It is paired with a check that the crate really is
-absent from the build graph, across the whole workspace with every feature on,
-because an ignore nobody rechecks is how a live exposure ends up filed under a
-resolved one. If the crate ever appears, `just audit` fails and the ignore has
-to go.
+`just audit` runs `cargo audit --deny warnings` over `Cargo.lock`, and nothing
+is ignored: there is no `.cargo/audit.toml`. A security advisory or a yanked
+crate anywhere in the lockfile fails it, and CI runs the same command. The fix
+is a dependency update, not an ignore entry.
 
 ## Generated code
 
-Five files are derived from the artefacts and none is written by hand: the code
-lists for `en16931`, and the element-order and prohibition tables for each syntax
-in `en16931-formats`.
+The workspace has 7 generated files, derived from the artefacts and none written
+by hand: the code lists for `en16931`, and the element-order, prohibition and single-occurrence
+tables for each syntax in `en16931-formats`.
 
 ```sh
-cargo xtask codegen     # regenerate all five
+cargo xtask codegen     # regenerate every generated file
 cargo xtask check       # fail if a committed one differs
 ```
 
@@ -131,11 +114,12 @@ by the next `codegen` run and caught by CI in between.
 
 ## Adding a rule
 
-Every registered rule must either have a fixture that makes it **fire**, or be a
-rule the type system retires so that no document can trigger it. There is no
-third category, and the coverage gate enforces all three directions: it fails if
-a rule is uncovered and undeclared, if a declared rule has since become covered,
-and if anything is declared for a reason other than being type-retired.
+Every registered rule must have a fixture that makes it **fire**, or be declared
+in `tests/corpus.rs` as `Why::Retired` (the type system makes the failure
+unrepresentable) or `Why::Undecidable` (CEN's own Schematron binds it to
+`true()` — exactly `BR-CO-05` … `BR-CO-08`). The coverage gate fails if a rule
+is uncovered and undeclared, if a declared rule has since become covered, and if
+anything else is declared undecidable.
 
 A rule nobody has seen fire may be inverted, unreachable, or checking the wrong
 field, and a suite of valid documents would be green either way.
@@ -153,24 +137,17 @@ carries one entry for the three:
 ```sh
 # 1. move the Unreleased section of CHANGELOG.md under the new version
 # 2. bump `[workspace.package] version` and the two dependency requirements
-git tag v0.4.0 && git push --tags
+git tag "v$(cargo pkgid -p en16931 | sed 's/.*#//')" && git push --tags
 ```
 
-They publish in dependency order, and that order is not a convention to remember:
-each crate requires the one below it by version as well as by path, so crates.io
-rejects a publish until the model crate is up.
-
-Changelog entries say **why**, not only what — a line reading *"fixed rule
-count"* tells a reader upgrading nothing about whether it affected them. The
-changelog is also the one document the [documented-number
-suite](#the-documentation-is-tested) does not scan: recording what was true at
-each release means holding superseded figures on purpose, and that is the one
-thing a drift scanner cannot tell from drift.
+They publish in dependency order: `en16931`, then `en16931-formats`, then
+`en16931-cli`. The changelog is the one document the [documented-number
+suite](#the-documentation-is-tested) does not scan, because it records
+superseded figures on purpose.
 
 ## This site
 
-[Zola](https://www.getzola.org), in `site/`. One stylesheet, no framework, no
-webfont, no external request.
+[Zola](https://www.getzola.org), in `site/`.
 
 ```sh
 just site-serve      # localhost with live reload

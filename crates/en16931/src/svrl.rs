@@ -1,26 +1,7 @@
-//! SVRL output — the format every other validator in this field speaks.
+//! SVRL output for a [`Report`]. Behind `features = ["svrl"]`.
 //!
-//! Behind `features = ["svrl"]`.
-//!
-//! # Doesn't this break "no XML"?
-//!
-//! [§2](https://docs.rs/en16931) says no UBL, no CII, no namespaces, no XML
-//! parser — and it still holds. The purpose of that invariant is that this crate
-//! never learns a *syntax binding*: it must not know that BT-1 is
-//! `cbc:ID`, because knowing that is `en16931-formats`' job and the reason they
-//! can exist separately.
-//!
-//! SVRL is not an invoice syntax. It is a **report** format, and emitting one
-//! requires no element names from UBL or CII, no schema, and — because writing
-//! XML is escaping and nothing else — **no dependency at all**. This module adds
-//! zero crates to the graph, builds on `wasm32`, and could not parse an invoice
-//! if it wanted to.
-//!
-//! The alternative considered was a separate `en16931-svrl` crate. For ~120
-//! lines of string building that is a lot of ceremony, a second version number
-//! to keep in step, and one more thing for a user to discover.
-//!
-//! # What a consumer gets
+//! SVRL is a report format, not an invoice syntax: writing it needs no syntax
+//! binding and no dependency, only escaping.
 //!
 //! ```xml
 //! <svrl:schematron-output title="EN 16931 — XRechnung 3.0" schemaVersion="EN 16931-1:2017+A1:2019">
@@ -31,19 +12,14 @@
 //! </svrl:schematron-output>
 //! ```
 //!
-//! Two attributes deserve a caveat, and get one in the output as a comment
-//! rather than being quietly wrong:
+//! Two attributes differ from Schematron output, as a comment in the output
+//! also says:
 //!
-//! * **`location`** is normally an XPath into the validated document. There is
-//!   no document here, so it carries the business-term path — `BG-25[2]/BT-151`.
-//!   A crate holding the XML can map BT → XPath; the reverse is lossy.
-//! * **`test`** is normally the XPath expression that failed. These rules are
-//!   Rust, so it carries `en16931:<rule-id>` rather than inventing an
-//!   expression that was never evaluated.
+//! * `location` is a business-term path (`BG-25[2]/BT-151`), not an XPath.
+//! * `test` is `en16931:<rule-id>`, since the rules are code, not XPath.
 //!
-//! A finding carrying a [`crate::Finding::hint`] adds Schematron's own
-//! supplementary-text element, ahead of `svrl:text` as the content model
-//! requires:
+//! A finding's [`crate::Finding::hint`] becomes an `svrl:diagnostic-reference`
+//! ahead of `svrl:text`:
 //!
 //! ```xml
 //! <svrl:failed-assert id="BR-CL-25" flag="fatal" location="BG-7/BT-49" test="en16931:BR-CL-25">
@@ -52,36 +28,24 @@
 //! </svrl:failed-assert>
 //! ```
 //!
-//! `svrl:text` stays **byte-identical to the authority's wording**, which is
-//! what makes a finding look up in CEN's or KoSIT's index. See
-//! [`HINT_DIAGNOSTIC`] for the one caveat on `@diagnostic`.
-//!
-//! Anything reading SVRL for *which rules failed and why* works unchanged.
-//! Anything that tries to resolve `location` as an XPath will not, and that is a
-//! property of validating a model rather than a document.
+//! `svrl:text` stays the authority's exact wording. See [`HINT_DIAGNOSTIC`].
 
 use core::fmt::Write as _;
 
-use crate::validation::{Severity, ValidationReport};
+use crate::report::{Layer, Report};
 
 /// The SVRL namespace, as every Schematron implementation writes it.
 pub const SVRL_NS: &str = "http://purl.oclc.org/dsdl/svrl";
 
 /// The `@diagnostic` value on the element carrying a [`Finding::hint`].
 ///
-/// In ISO Schematron `@diagnostic` is an `IDREF` into the *schema*, and this
-/// crate ships no schema — there is nothing for it to point at. It is
-/// namespaced so it cannot collide with a real diagnostic id if a consumer
-/// merges this output with a Schematron tool's, and a reader looking for hints
-/// can select on it.
+/// In ISO Schematron `@diagnostic` is an `IDREF` into the schema; there is no
+/// schema here, so the value is namespaced to avoid colliding with real ids.
 ///
 /// [`Finding::hint`]: crate::Finding::hint
 pub const HINT_DIAGNOSTIC: &str = "en16931-hint";
 
-/// Escape the five XML metacharacters.
-///
-/// The whole of this module's XML knowledge. Rule text is CEN's and contains
-/// `&`, `<` and quotes often enough that this is not theoretical.
+/// Escape the five XML metacharacters and drop characters XML 1.0 forbids.
 fn escape(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {
@@ -90,8 +54,7 @@ fn escape(s: &str, out: &mut String) {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            // XML 1.0 forbids most control characters outright; dropping them is
-            // the only option that yields a well-formed document.
+            // XML 1.0 forbids most control characters.
             c if (c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r') => {}
             c => out.push(c),
         }
@@ -100,21 +63,15 @@ fn escape(s: &str, out: &mut String) {
 
 /// Write `<!-- body -->`, safely.
 ///
-/// XML forbids `--` **anywhere inside** a comment and forbids a comment ending
-/// in `-`. Both are reachable from outside this crate: [`ValidationReport::suppressed`]
-/// carries rule ids a caller chose, and `Check::without("BR--CO-26")` produced a
-/// document no parser would accept.
-///
-/// Entities are *not* escaped here, and that is deliberate: a comment's content
-/// is not parsed, so writing `&amp;` inside one puts the five literal characters
-/// `&amp;` in front of the reader rather than an ampersand.
+/// XML forbids `--` inside a comment and a comment ending in `-`; the body may
+/// be caller input (suppressed rule ids). Entities are not escaped, since
+/// comment content is not parsed.
 fn comment(body: &str, out: &mut String) {
     out.push_str("<!-- ");
     let mut last_was_dash = false;
     for c in body.chars() {
         match c {
-            // Collapse a run of hyphens to one. Replacing rather than dropping
-            // keeps `BR--CO-26` legible as `BR-CO-26` instead of `BRCO-26`.
+            // Collapse a run of hyphens to one.
             '-' if last_was_dash => {}
             '-' => {
                 last_was_dash = true;
@@ -132,100 +89,133 @@ fn comment(body: &str, out: &mut String) {
     out.push_str(" -->");
 }
 
-const fn flag(s: Severity) -> &'static str {
-    match s {
-        Severity::Fatal => "fatal",
-        Severity::Warning => "warning",
-        Severity::Info => "information",
-    }
-}
-
-/// Render a report as SVRL.
+/// Render an interchange [`Report`] as SVRL.
 ///
-/// Infallible: the only failure mode of writing to a `String` is allocation.
+/// Every layer is rendered, then the findings, in order:
+///
+/// * a layer entry at `fatal` or `warning` is an `svrl:failed-assert` with an
+///   `@id` like `en16931:schema:duplicate` and the entry's level as `@flag`;
+/// * an entry at `information` is an `svrl:successful-report`;
+/// * a skipped layer is a comment saying why.
+///
+/// An entry's term, value and cited rule are `svrl:property-reference`
+/// elements, its hint a `svrl:diagnostic-reference`.
+/// [`Report::required`] is not rendered; call this again for it.
+///
+/// ```
+/// use en16931::{Invoice, profiles, report::Report};
+///
+/// let report = Report::of(&profiles::XRECHNUNG.validate(&Invoice::default()));
+/// let xml = en16931::svrl::to_svrl(&report);
+/// assert!(xml.contains(r#"<svrl:failed-assert id="BR-02" flag="fatal""#));
+/// ```
 #[must_use]
-pub fn to_svrl(report: &ValidationReport) -> String {
-    let mut out = String::with_capacity(256 + report.findings().len() * 160);
+pub fn to_svrl(report: &Report) -> String {
+    let mut out = String::with_capacity(256 + report.findings.len() * 160);
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     out.push_str("<svrl:schematron-output xmlns:svrl=\"");
     out.push_str(SVRL_NS);
     out.push_str("\" title=\"EN 16931");
-    if let Some(p) = report.profile() {
+    if let Some(p) = &report.profile {
         out.push_str(" — ");
         escape(p, &mut out);
     }
     out.push_str("\" schemaVersion=\"");
-    escape(report.edition().designation(), &mut out);
+    escape(&report.edition, &mut out);
     out.push_str("\">\n");
 
-    // The caveats, in the document rather than only in the docs — whoever reads
-    // this file is exactly the person who needs them.
-    out.push_str("  ");
-    comment(
-        "Produced by en16931 from the semantic model. `location` is a \
-         business-term path, not an XPath: there is no source document. `test` \
-         names the rule; these rules are code, not XPath.",
+    line_comment(
+        "Produced by en16931. Findings are judged on the semantic model: their \
+         `location` is a business-term path, not an XPath, and `test` names the \
+         rule; these rules are code, not XPath. Layer entries carry the \
+         document's own syntax path.",
         &mut out,
     );
-    out.push('\n');
-    out.push_str("  ");
-    comment(crate::ATTRIBUTION, &mut out);
-    out.push('\n');
+    line_comment(&report.attribution, &mut out);
 
-    // Which authority releases these verdicts were checked against. SVRL has no
-    // element for provenance — `schemaVersion` names the *standard*, not the
-    // artefact revision — so it goes in a comment, where a consumer that does
-    // not care ignores it and one debugging a disagreement between two
-    // validators finds the first thing worth comparing.
-    if !report.artefacts().is_empty() {
+    // SVRL has no element for artefact provenance, so it is a comment.
+    if !report.artefacts.is_empty() {
         let refs: Vec<String> = report
-            .artefacts()
+            .artefacts
             .iter()
             .map(|a| format!("{} {} {}", a.authority, a.repo, a.git_ref))
             .collect();
-        out.push_str("  ");
-        comment(&format!("verified against: {}", refs.join("; ")), &mut out);
-        out.push('\n');
+        line_comment(&format!("verified against: {}", refs.join("; ")), &mut out);
+    }
+    if let Some(source) = &report.source {
+        line_comment(&format!("source: {source}"), &mut out);
+    }
+    if let Some(id) = &report.identity {
+        let or = |v: &Option<String>| v.clone().unwrap_or_else(|| "(absent)".to_owned());
+        line_comment(
+            &format!(
+                "document: {} / invoice {} of {}",
+                or(&id.seller),
+                or(&id.number),
+                or(&id.issue_date)
+            ),
+            &mut out,
+        );
+    }
+    if let Some(d) = &report.declaration {
+        line_comment(&format!("declared: {d}"), &mut out);
+    }
+    if let Some(r) = &report.recommendation {
+        line_comment(&format!("recommendation: {r}"), &mut out);
+        for why in &report.reasons {
+            line_comment(&format!("because: {why}"), &mut out);
+        }
     }
 
     out.push_str("  <svrl:active-pattern name=\"");
-    escape(report.profile().unwrap_or("EN 16931"), &mut out);
+    escape(report.profile.as_deref().unwrap_or("EN 16931"), &mut out);
     out.push_str("\"/>\n");
 
-    for id in report.suppressed() {
-        out.push_str("  ");
-        comment(&format!("suppressed, NOT checked: {id}"), &mut out);
-        out.push('\n');
+    for id in &report.suppressed {
+        line_comment(&format!("suppressed, NOT checked: {id}"), &mut out);
+    }
+    for r in &report.relevelled {
+        line_comment(
+            &format!("relevelled to {}: {}", r.severity, r.rule),
+            &mut out,
+        );
+    }
+    if !report.left_out.is_empty() {
+        line_comment(
+            &format!(
+                "totals only; {} core rule(s) NOT checked: {}",
+                report.left_out.len(),
+                report.left_out.join(", ")
+            ),
+            &mut out,
+        );
     }
 
-    for f in report.findings() {
+    for layer in &report.layers {
+        layer_svrl(layer, &mut out);
+    }
+
+    for f in &report.findings {
         out.push_str("  <svrl:failed-assert id=\"");
         escape(&f.rule, &mut out);
         out.push_str("\" flag=\"");
-        out.push_str(flag(f.severity));
+        escape(&f.severity, &mut out);
         out.push_str("\" location=\"");
-        escape(&f.path.to_string(), &mut out);
+        escape(&f.location, &mut out);
         out.push_str("\" test=\"en16931:");
         escape(&f.rule, &mut out);
         out.push_str("\">\n");
-        // Schematron's own slot for supplementary text, and it comes *before*
-        // `text` in SVRL's content model. Putting the hint here rather than
-        // appending it to `svrl:text` is what keeps `svrl:text` byte-identical
-        // to the authority's wording — see `Finding::hint`.
+        // Must precede `svrl:text` in SVRL's content model.
         if let Some(h) = &f.hint {
-            out.push_str("    <svrl:diagnostic-reference diagnostic=\"");
-            out.push_str(HINT_DIAGNOSTIC);
-            out.push_str("\">");
-            escape(h, &mut out);
-            out.push_str("</svrl:diagnostic-reference>\n");
+            reference("diagnostic", HINT_DIAGNOSTIC, h, &mut out);
         }
         out.push_str("    <svrl:text>");
-        escape(&f.message, &mut out);
-        if let Some(d) = &f.detail {
+        escape(&f.text, &mut out);
+        if let (Some(expected), Some(actual)) = (&f.expected, &f.actual) {
             let _ = write!(out, " (expected ");
-            escape(&d.expected, &mut out);
+            escape(expected, &mut out);
             let _ = write!(out, ", found ");
-            escape(&d.actual, &mut out);
+            escape(actual, &mut out);
             out.push(')');
         }
         out.push_str("</svrl:text>\n  </svrl:failed-assert>\n");
@@ -233,6 +223,75 @@ pub fn to_svrl(report: &ValidationReport) -> String {
     out.push_str("</svrl:schematron-output>\n");
     out
 }
+
+/// `  <!-- body -->\n`.
+fn line_comment(body: &str, out: &mut String) {
+    out.push_str("  ");
+    comment(body, out);
+    out.push('\n');
+}
+
+/// `<svrl:{kind}-reference {kind}="{name}">{text}</…>`.
+fn reference(kind: &str, name: &str, text: &str, out: &mut String) {
+    let _ = write!(out, "    <svrl:{kind}-reference {kind}=\"{name}\">");
+    escape(text, out);
+    let _ = writeln!(out, "</svrl:{kind}-reference>");
+}
+
+/// One layer's entries.
+fn layer_svrl(layer: &Layer, out: &mut String) {
+    if layer.validity == "skipped" {
+        line_comment(
+            &format!(
+                "{} layer skipped: {}",
+                layer.name,
+                layer.reason.as_deref().unwrap_or("not run")
+            ),
+            out,
+        );
+        return;
+    }
+    for e in &layer.entries {
+        let element = if e.level == "information" {
+            "successful-report"
+        } else {
+            "failed-assert"
+        };
+        let _ = write!(out, "  <svrl:{element} id=\"en16931:");
+        escape(&layer.name, out);
+        out.push(':');
+        escape(&e.kind, out);
+        out.push_str("\" flag=\"");
+        escape(&e.level, out);
+        out.push_str("\" location=\"");
+        escape(&e.path, out);
+        out.push_str("\" test=\"en16931:");
+        escape(&e.kind, out);
+        out.push_str("\">\n");
+        if let Some(h) = &e.hint {
+            reference("diagnostic", HINT_DIAGNOSTIC, h, out);
+        }
+        for (name, value) in [
+            (TERM_PROPERTY, &e.term),
+            (VALUE_PROPERTY, &e.value),
+            (RULE_PROPERTY, &e.rule),
+        ] {
+            if let Some(v) = value {
+                reference("property", name, v, out);
+            }
+        }
+        out.push_str("    <svrl:text>");
+        escape(&e.message, out);
+        let _ = writeln!(out, "</svrl:text>\n  </svrl:{element}>");
+    }
+}
+
+/// The `@property` of the element carrying a layer entry's business term.
+pub const TERM_PROPERTY: &str = "en16931-term";
+/// The `@property` of the element carrying a layer entry's value.
+pub const VALUE_PROPERTY: &str = "en16931-value";
+/// The `@property` of the element carrying the artefact rule an entry cites.
+pub const RULE_PROPERTY: &str = "en16931-rule";
 
 #[cfg(test)]
 mod tests {
@@ -242,7 +301,7 @@ mod tests {
     #[test]
     fn it_is_well_formed_and_carries_the_findings() {
         let report = profiles::XRECHNUNG.validate(&Invoice::default());
-        let xml = to_svrl(&report);
+        let xml = to_svrl(&Report::of(&report));
 
         assert!(xml.starts_with("<?xml version=\"1.0\""));
         assert!(xml.contains("xmlns:svrl=\"http://purl.oclc.org/dsdl/svrl\""));
@@ -258,36 +317,30 @@ mod tests {
         );
     }
 
-    /// The licence notice travels with the report, in every form of it.
+    /// The licence notice is in the output.
     #[test]
     fn the_attribution_is_present() {
-        let xml = to_svrl(&validate(&Invoice::default()));
-        // `--` is illegal inside an XML comment, so the notice is written with
-        // the en dash reduced; the substantive words must survive.
+        let xml = to_svrl(&Report::of(&validate(&Invoice::default())));
+        // Inside a comment, so hyphen runs are collapsed; check the wording.
         assert!(xml.contains("implementation of the EN 16931-1 semantic data model"));
         assert!(xml.contains("© CEN"));
     }
 
-    /// Suppressions are visible here too, or the output would overstate.
+    /// Suppressions are recorded.
     #[test]
     fn suppressions_are_recorded() {
         let report = crate::validation::Check::new(&profiles::EN16931)
             .without("BR-CO-26")
             .run(&Invoice::default());
-        let xml = to_svrl(&report);
+        let xml = to_svrl(&Report::of(&report));
         assert!(xml.contains("suppressed, NOT checked: BR-CO-26"));
     }
 
-    /// **Parse** the output, rather than looking for substrings in it.
-    ///
-    /// Every other test here used `contains`, and an unbalanced tag, a bad
-    /// escape or an illegal comment would have satisfied all of them. It did:
-    /// a suppressed rule id containing `--` produced a document no parser
-    /// accepts, and nothing noticed until someone ran it.
+    /// The output parses, and each finding's attributes and text match.
     #[test]
     fn the_output_is_well_formed_xml() {
         let report = profiles::XRECHNUNG.validate(&Invoice::default());
-        let xml = to_svrl(&report);
+        let xml = to_svrl(&Report::of(&report));
         let doc = roxmltree::Document::parse(&xml).expect("well-formed SVRL");
 
         let root = doc.root_element();
@@ -309,8 +362,6 @@ mod tests {
         assert_eq!(asserts.len(), report.findings().len());
 
         for (node, finding) in asserts.iter().zip(report.findings()) {
-            // SVRL requires all three; a consumer keying on any of them must
-            // not meet an absent attribute.
             assert_eq!(node.attribute("id"), Some(finding.rule.as_str()));
             assert_eq!(
                 node.attribute("location"),
@@ -333,10 +384,7 @@ mod tests {
         }
     }
 
-    /// Comment content that a caller can choose must not break the document.
-    ///
-    /// `Check::without` takes a `&str`, so the suppressed list is user input
-    /// that lands inside an XML comment — where `--` is illegal outright.
+    /// Caller-chosen suppressed ids, written into comments, stay well-formed.
     #[test]
     fn hostile_suppressions_stay_well_formed() {
         for id in [
@@ -350,14 +398,125 @@ mod tests {
             let report = crate::validation::Check::new(&profiles::EN16931)
                 .without(id)
                 .run(&Invoice::default());
-            let xml = to_svrl(&report);
+            let xml = to_svrl(&Report::of(&report));
             roxmltree::Document::parse(&xml)
                 .unwrap_or_else(|e| panic!("suppressing {id:?} produced invalid XML: {e}\n{xml}"));
         }
     }
 
-    /// A comment does not interpret entities, so escaping inside one is wrong:
-    /// it puts the five characters `&amp;` in front of the reader.
+    fn layered(text: &str) -> Report {
+        use crate::report::{DocumentEntry, Layer};
+        let entry = |kind: &str, level: &'static str| DocumentEntry {
+            kind: kind.to_owned(),
+            level: level.into(),
+            path: format!("Invoice/{text}"),
+            term: Some(format!("BT-1 {text}")),
+            value: Some(text.to_owned()),
+            rule: Some(format!("UBL-{text}")),
+            message: format!("said {text}"),
+            hint: Some(format!("do {text}")),
+        };
+        let mut r = Report::of(&profiles::XRECHNUNG.validate(&Invoice::default()));
+        r.source = Some(format!("{text}.xml"));
+        r.declaration = Some(text.to_owned());
+        r.recommendation = Some("reject".into());
+        r.reasons = vec![text.to_owned()];
+        r.layers = vec![
+            Layer {
+                name: "container".into(),
+                validity: "skipped".into(),
+                reason: Some(text.to_owned()),
+                entries: Vec::new(),
+            },
+            Layer {
+                name: "syntax".into(),
+                validity: "valid".into(),
+                reason: None,
+                entries: vec![entry("unmapped", "information")],
+            },
+            Layer {
+                name: "schema".into(),
+                validity: "invalid".into(),
+                reason: None,
+                entries: vec![entry("duplicate", "fatal"), entry("repeated", "warning")],
+            },
+        ];
+        r
+    }
+
+    /// Every layer is rendered: fatal and warning entries as failed asserts in
+    /// this crate's namespace, information as successful reports; the findings
+    /// follow unchanged and in order.
+    #[test]
+    fn every_layer_is_rendered() {
+        let report = layered("x");
+        let xml = to_svrl(&report);
+        let doc = roxmltree::Document::parse(&xml).expect("well-formed SVRL");
+        let root = doc.root_element();
+        let kids: Vec<_> = root
+            .children()
+            .filter(roxmltree::Node::is_element)
+            .collect();
+        let reports: Vec<_> = kids
+            .iter()
+            .filter(|n| n.has_tag_name((SVRL_NS, "successful-report")))
+            .collect();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].attribute("id"), Some("en16931:syntax:unmapped"));
+        assert_eq!(reports[0].attribute("flag"), Some("information"));
+        let asserts: Vec<_> = kids
+            .iter()
+            .filter(|n| n.has_tag_name((SVRL_NS, "failed-assert")))
+            .collect();
+        assert_eq!(asserts.len(), 2 + report.findings.len());
+        assert_eq!(asserts[0].attribute("id"), Some("en16931:schema:duplicate"));
+        assert_eq!(asserts[0].attribute("flag"), Some("fatal"));
+        assert_eq!(asserts[0].attribute("location"), Some("Invoice/x"));
+        assert_eq!(asserts[1].attribute("flag"), Some("warning"));
+        for (node, f) in asserts[2..].iter().zip(&report.findings) {
+            assert_eq!(node.attribute("id"), Some(f.rule.as_str()));
+        }
+        let props: Vec<_> = asserts[0]
+            .children()
+            .filter(|n| n.has_tag_name((SVRL_NS, "property-reference")))
+            .map(|n| {
+                (
+                    n.attribute("property").unwrap_or(""),
+                    n.text().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            props,
+            [
+                (TERM_PROPERTY, "BT-1 x"),
+                (VALUE_PROPERTY, "x"),
+                (RULE_PROPERTY, "UBL-x")
+            ]
+        );
+        assert!(xml.contains("container layer skipped: x"));
+        assert!(xml.contains("recommendation: reject"));
+    }
+
+    /// Adversarial strings in every layer field stay well-formed.
+    #[test]
+    fn hostile_layer_content_stays_well_formed() {
+        for text in [
+            "a<b&c>d\"e'f",
+            "--",
+            "x-",
+            "]]>",
+            "\u{7}\u{0}",
+            "<!-- -->",
+            "\u{202e}rtl",
+        ] {
+            let xml = to_svrl(&layered(text));
+            roxmltree::Document::parse(&xml)
+                .unwrap_or_else(|e| panic!("{text:?} produced invalid XML: {e}\n{xml}"));
+        }
+    }
+
+    /// Comment content is not entity-escaped.
     #[test]
     fn comments_are_not_entity_escaped() {
         let mut s = String::new();
@@ -365,13 +524,11 @@ mod tests {
         assert_eq!(s, "<!-- a & b < c -->");
     }
 
-    /// Rule text is CEN's and contains characters XML cares about.
     #[test]
     fn text_is_escaped() {
         let mut s = String::new();
         escape("a & b < c > d \" e ' f", &mut s);
         assert_eq!(s, "a &amp; b &lt; c &gt; d &quot; e &apos; f");
-        // A control character cannot appear in XML 1.0 at all.
         let mut s = String::new();
         escape("a\u{7}b", &mut s);
         assert_eq!(s, "ab");

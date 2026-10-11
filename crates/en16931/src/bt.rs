@@ -1,20 +1,11 @@
-//! [`BtId`], [`BgId`] and [`Path`] — how a finding says *where*.
-//!
-//! Every other implementation in this space validates a serialised document, so
-//! its findings are located by XPath. That is precise for a machine and useless
-//! for a person: `/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal[2]/cbc:TaxAmount`
-//! requires you to know the syntax binding before you can tell which *business*
-//! field is wrong.
-//!
-//! A [`Path`] says `BG-23[1]/BT-117` instead, which is the language the standard,
-//! the rules and the reader all already speak.
+//! [`BtId`], [`BgId`] and [`Path`] — where a finding is, in business terms
+//! (`BG-23[1]/BT-117`) rather than XPath.
 
 use core::fmt;
 
 /// A business term identifier — `BT-117`.
 ///
-/// A newtype over `u16` rather than a string, so a typo is a compile error and a
-/// finding can be filtered by term without parsing.
+/// A `u16` newtype, so findings filter by term without parsing.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,11 +67,6 @@ pub enum Group {
 
 impl Group {
     /// Every group, in BG order.
-    ///
-    /// Exists so a property of "all groups" can be *tested over all groups*
-    /// rather than over a list someone remembered to extend — which is how
-    /// [`Group::Attachment`] came to disagree with [`repeats`](Self::repeats)
-    /// unnoticed. `every_group_is_in_all` keeps this in step with the enum.
     pub const ALL: &'static [Self] = &[
         Self::Document,
         Self::Seller,
@@ -118,12 +104,7 @@ impl Group {
     }
 
     /// Whether this group may occur more than once, so a [`Path`] into it needs
-    /// an index to be unambiguous.
-    ///
-    /// [`Group::Attachment`] is here because BG-24 is `0..n` and four rules —
-    /// `BR-DE-22`, `BR-DEX-01`, `PEPPOL-EN16931-CL001` and `BR-TMP-2` — emit
-    /// `BG-24[i]`. The test below checks both directions, so a group that emits
-    /// an index and answers `false` fails the build.
+    /// an index.
     #[must_use]
     pub const fn repeats(self) -> bool {
         matches!(
@@ -266,11 +247,8 @@ mod tests {
         );
     }
 
-    /// `Group::ALL` must list every variant, or every property asserted over it
-    /// is asserted over a subset.
-    ///
-    /// The `match` is what does the work: adding a variant without adding it to
-    /// `ALL` is then a compile error, not a test that keeps passing.
+    /// `Group::ALL` lists every variant; the exhaustive `match` breaks the
+    /// build when a variant is added.
     #[test]
     fn every_group_is_in_all() {
         for g in Group::ALL {
@@ -291,8 +269,7 @@ mod tests {
             }
         }
         assert_eq!(Group::ALL.len(), 13);
-        // BG numbers ascend, which is what makes the derived `Ord` on `Path`
-        // sort a report the way the standard reads.
+        // BG numbers ascend, so the derived `Ord` on `Path` follows the standard.
         let bgs: Vec<_> = Group::ALL.iter().filter_map(|g| g.bg()).collect();
         assert!(bgs.windows(2).all(|w| w[0] < w[1]), "{bgs:?}");
     }
@@ -306,8 +283,6 @@ mod tests {
             Group::Attachment,
             Group::Line,
         ];
-        // Over *every* group, so a new one has to be classified rather than
-        // silently defaulting to "does not repeat".
         for g in Group::ALL {
             assert_eq!(g.repeats(), REPEATING.contains(g), "{g:?}");
         }

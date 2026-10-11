@@ -1,38 +1,14 @@
-//! **Questions answerable before the document exists.**
-//!
-//! `validate` answers *"is this document acceptable?"*, which on a half-built
-//! invoice is a hundred findings about lines and totals that are not there yet.
-//! Two questions have exact answers *earlier* than that, and both are here:
-//!
-//! | | |
-//! |---|---|
-//! | `Profile::missing_terms` | which extra fields will this profile ask me for? |
-//! | `VatCategory::can_share_document` | may these categories appear on one invoice? |
-//!
-//! # The property that makes a pre-flight worth having
-//!
-//! **It has to agree with the validator.** A pre-flight that refuses what
-//! `validate` accepts costs its caller invoices they could have sent; one that
-//! accepts what `validate` refuses is a pre-flight nobody can act on, which is
-//! worse than none at all. So the agreement is asserted over **every subset of
-//! the ten VAT categories** rather than over the handful anybody thought to
-//! write down.
+//! `VatCategory::can_share_document` agrees with the validator's exclusivity
+//! rules over every subset of the ten VAT categories.
 
 use en16931::invoice::{Code, PriceDetails, VatBreakdown};
 use en16931::{Invoice, InvoiceAmount, InvoiceLine, Percentage, Quantity, VatCategory, validate};
 use rust_decimal::Decimal;
 
-/// The rules `can_share_document` claims to stand for — and no others.
-///
-/// If a future artefact release adds an exclusivity rule, this list is what has
-/// to grow with it, and the sweep below is what notices.
+/// The exclusivity rules `can_share_document` stands for.
 const EXCLUSIVITY_RULES: [&str; 5] = ["BR-O-11", "BR-O-12", "BR-O-13", "BR-O-14", "BR-B-02"];
 
-/// A document carrying exactly `categories`, and nothing else worth reporting.
-///
-/// One line and one breakdown group per category, with a rate each category
-/// will accept — the point is to make the exclusivity rules fire or not fire,
-/// so every other finding is noise this test ignores.
+/// One line and one breakdown group per category; other findings are ignored.
 fn invoice_using(categories: &[VatCategory]) -> Invoice {
     let mut inv = Invoice::default();
     for (i, cat) in categories.iter().enumerate() {
@@ -64,10 +40,7 @@ fn invoice_using(categories: &[VatCategory]) -> Invoice {
     inv
 }
 
-/// **Every subset of the ten categories**: the pre-flight and the rules agree.
-///
-/// 1 024 subsets, which is small enough to be exhaustive and therefore not to
-/// need a generator or an argument about coverage.
+/// All 1 024 category subsets: the pre-flight and the rules agree.
 #[test]
 fn the_preflight_refuses_exactly_what_the_rules_report() {
     let all = VatCategory::ALL;
@@ -96,12 +69,8 @@ fn the_preflight_refuses_exactly_what_the_rules_report() {
             if rules_fire { "a conflict" } else { "none" },
         );
 
-        // A refusal cites the family that governs the exclusivity, and at
-        // least one member must have reported *this* document — else the caller
-        // is handed a clause they cannot find in their own report. Not *every*
-        // member: `BR-O-11` covers a second breakdown group, `-12` a line,
-        // `-13` an allowance and `-14` a charge, so a document with no
-        // allowances cannot trip `-13`.
+        // A refusal cites rules of the family, at least one of which fired
+        // (not all: e.g. `BR-O-13` needs an allowance).
         if let Err(conflict) = &preflight {
             assert!(
                 conflict.rules.iter().any(|r| report.has(r)),
@@ -123,10 +92,6 @@ fn the_preflight_refuses_exactly_what_the_rules_report() {
 }
 
 /// One category on its own is always fine, and so is none.
-///
-/// The degenerate cases, named because an exclusivity check that refuses `[O]`
-/// alone would refuse every out-of-scope invoice — including the ones that are
-/// perfectly valid, which is the whole point of the category existing.
 #[test]
 fn a_single_category_never_conflicts_with_itself() {
     assert!(VatCategory::can_share_document(&[]).is_ok());
@@ -141,12 +106,8 @@ fn a_single_category_never_conflicts_with_itself() {
     }
 }
 
-/// The German municipal case, by name.
-///
-/// A *hoheitliche Abwassergebühr* is `O`; drinking water is `S`. Over 90 % of
-/// German municipalities bill them together, and the combined document has no
-/// valid EN 16931 rendering. The refusal must name the reason and the rules —
-/// that is the difference between "we cannot bill this" and a wall of findings.
+/// `S` and `O` together (e.g. drinking water with a sovereign sewage fee) are
+/// refused with the category and the rules named.
 #[test]
 fn the_municipal_invoice_is_refused_with_its_reason() {
     let err = VatCategory::can_share_document(&[VatCategory::Standard, VatCategory::OutOfScope])

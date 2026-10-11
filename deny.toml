@@ -12,7 +12,7 @@ ignore  = []
 # ── Licence policy ───────────────────────────────────────────────────────────
 #
 # Note what is *not* here: EUPL-1.2. The CEN validation artefacts carry it, which
-# is why `spec/` is fetched rather than committed and why the generated tables
+# is why the reference corpus is fetched rather than committed and why the generated tables
 # hold facts about element placement rather than copied expressions. This list
 # is what keeps that true.
 #

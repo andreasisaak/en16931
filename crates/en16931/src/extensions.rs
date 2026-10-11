@@ -1,50 +1,16 @@
-//! Data that has **no core business term** — EN 16931's second extension
-//! mechanism.
+//! Data with no core business term — an Extension in the sense of EN 16931-1
+//! §4.3 (a CIUS restricts, an Extension adds). Nothing here shadows a core term.
 //!
-//! # CIUS restricts; an Extension adds
-//!
-//! §4.3 draws the line, and the two are constantly confused:
-//!
-//! > There are however circumstances where the trading partners may wish to:
-//! > Either **1. restrict** the information elements to be used in an e-invoice
-//! > or **2. provide additional** information elements. The first requirement is
-//! > satisfied using a **Core Invoice Usage Specification (CIUS)**. The second
-//! > requirement is satisfied using an **extension** specified in an Extension
-//! > Specification.
-//!
-//! [`crate::validation::profile::Restriction`] is mechanism 1. This module is
-//! mechanism 2, governed by CEN/TR 16931-5 and bound by §4.3's constraint:
-//!
-//! > Any such extension shall not infringe or contradict the semantic
-//! > definitions in the core invoice model.
-//!
-//! Enforced literally: nothing here may shadow a core business term. Everything
-//! in this module carries data the core model has no term for.
-//!
-//! # Why this is a correctness feature, not a convenience
-//!
-//! A final invoice that deducts advance payments must, in Germany, state *"die
-//! auf sie entfallenden Steuerbeträge"* — the tax contained in each advance
-//! (§14 Abs. 5 Satz 2 UStG). Omit it and, per UStAE 14.8 Abs. 10, the issuer
-//! owes the tax shown **plus** the advance-related portion again under §14c
-//! Abs. 1: the same tax, billed twice.
-//!
-//! Core EN 16931 has **nowhere to put it**. BT-113 is a single flat figure. The
-//! only standardised home is ZUGFeRD / Factur-X EXTENDED's
-//! `SpecifiedAdvancePayment` (BG-X-45).
-//!
-//! So an adapter that quietly maps itemised advances to BT-113 and drops the
-//! rest produces a document that validates perfectly and is a tax liability.
-//! This module carries the data, and [`crate::validation::rules`]' `EN-EXT-01`
-//! **warns** whenever a target profile cannot represent it.
+//! `EN-EXT-01` warns when the target profile cannot carry what is populated,
+//! e.g. itemised advance payments with their tax (§14 Abs. 5 Satz 2 UStG),
+//! which core BT-113 cannot express.
 
 use crate::invoice::{InvoiceLine, LineVat, VatBreakdown};
 use crate::{Date, DocumentReference, InvoiceAmount};
 
 /// One previously invoiced and received advance payment, with its tax.
 ///
-/// Mirrors ZUGFeRD / Factur-X EXTENDED `BG-X-45`, the one standardised place
-/// this data has a home.
+/// Mirrors ZUGFeRD / Factur-X EXTENDED `BG-X-45`.
 ///
 /// | Here | ZUGFeRD EXTENDED | Meaning |
 /// |---|---|---|
@@ -60,15 +26,11 @@ pub struct AdvancePayment {
     pub gross: InvoiceAmount,
     /// `BT-X-292` — when it was received.
     pub received_on: Option<Date>,
-    /// `BG-X-46` — the tax it contains, per `(category, rate)`.
-    ///
-    /// This is the figure §14 Abs. 5 Satz 2 UStG requires a final invoice to
-    /// state, and the reason this whole module exists.
+    /// `BG-X-46` — the tax it contains, per `(category, rate)`, as §14 Abs. 5
+    /// Satz 2 UStG requires a final invoice to state.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub tax: Vec<VatBreakdown>,
     /// `BT-X-558` — the advance invoice's number.
-    ///
-    /// Worth setting: §14 Abs. 5 Satz 2 only obliges deduction where invoices
-    /// *were issued*, so the reference is what evidences the obligation.
     pub reference: Option<DocumentReference>,
     /// `BT-X-560` — the advance invoice's issue date.
     pub reference_date: Option<Date>,
@@ -86,38 +48,30 @@ impl AdvancePayment {
 
 /// Data with no core business term, carried alongside the invoice.
 ///
-/// A format crate reads what its own profile can represent and ignores the rest.
-/// `en16931-formats` consumes [`advance_payments`](Self::advance_payments) when
-/// emitting ZUGFeRD EXTENDED; the XRechnung CIUS cannot represent them, and
-/// `EN-EXT-01` says so rather than letting them vanish.
+/// A format writes what its profile can represent; `EN-EXT-01` warns about the
+/// rest. Only the XRechnung Extension profile declares any (`BG-DEX-01`,
+/// `BG-DEX-09`).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct Extensions {
-    /// ZUGFeRD / Factur-X EXTENDED `BG-X-45`.
-    ///
-    /// Non-empty makes this a **final invoice**: the totals and the VAT
-    /// breakdown still describe the whole supply, and the advances plus their
-    /// tax are deducted to reach BT-115.
+    /// ZUGFeRD / Factur-X EXTENDED `BG-X-45`. Non-empty makes this a final
+    /// invoice: totals and VAT breakdown describe the whole supply.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub advance_payments: Vec<AdvancePayment>,
-    /// XRechnung Extension `BG-DEX-01`, indexed by the BG-25 line they hang
-    /// beneath — the line's zero-based position in [`crate::Invoice::lines`].
-    ///
-    /// Kept out of [`crate::InvoiceLine`] on purpose: a core line has no child,
-    /// and putting one there would make every consumer of the core model carry
-    /// a field only one Extension can populate.
+    /// XRechnung Extension `BG-DEX-01`, keyed by the zero-based index of the
+    /// parent line in [`crate::Invoice::lines`].
+    #[cfg_attr(feature = "serde", serde(default))]
     pub sub_invoice_lines: Vec<(usize, Vec<SubInvoiceLine>)>,
-    /// XRechnung Extension `BG-DEX-09`.
-    ///
-    /// Non-empty changes the totals equation: `BR-DEX-09` replaces `BR-CO-16`,
-    /// adding these amounts back into BT-115.
+    /// XRechnung Extension `BG-DEX-09`. `BR-DEX-09` replaces `BR-CO-16`,
+    /// adding these amounts into BT-115.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub third_party_payments: Vec<ThirdPartyPayment>,
 }
 
 impl Extensions {
-    /// The extension group names this value actually populates.
-    ///
-    /// Compared against [`crate::Profile::extensions`] by `EN-EXT-01`.
+    /// The extension group names populated here; `EN-EXT-01` compares them
+    /// with [`crate::Profile::extensions`].
     #[must_use]
     pub fn populated(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
@@ -170,14 +124,7 @@ pub const THIRD_PARTY_PAYMENTS: &str = "BG-DEX-09";
 
 /// `BG-DEX-01` SUB INVOICE LINE — a line beneath a line.
 ///
-/// The XRechnung Extension's answer to invoices whose lines have internal
-/// structure: a telecoms bill where one subscription line decomposes into calls,
-/// or a construction invoice where one position decomposes into trades. Core
-/// EN 16931 is deliberately flat — BG-25 has no child — so this cannot be a
-/// CIUS and is not one.
-///
-/// Sub-lines nest: `BR-DEX-02` sums a line's BT-131 over its immediate
-/// children, and a child may itself have children.
+/// Sub-lines nest; `BR-DEX-02` sums a line's BT-131 over its children.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubInvoiceLine {
@@ -186,6 +133,7 @@ pub struct SubInvoiceLine {
     /// `BG-DEX-06` — its VAT information. Exactly one (`BR-DEX-03`).
     pub vat: Option<LineVat>,
     /// Its own sub-lines, if it decomposes further.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub children: Vec<SubInvoiceLine>,
 }
 
@@ -210,9 +158,8 @@ impl SubInvoiceLine {
 /// `BG-DEX-09` THIRD PARTY PAYMENT — an amount settled by someone who is not
 /// the buyer.
 ///
-/// Introduced for German digital health applications (DiGA), where a statutory
-/// health insurer settles part of an invoice addressed to the insured. All three
-/// terms are mandatory when the group is present (`BR-DEX-10`, `-11`, `-12`).
+/// Used for German digital health applications (DiGA). All three terms are
+/// mandatory when the group is present (`BR-DEX-10`, `-11`, `-12`).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThirdPartyPayment {
@@ -251,7 +198,7 @@ mod tests {
             reference_date: None,
         };
         assert_eq!(a.tax_total().unwrap(), amount("71.25"));
-        // gross = net + tax, which is what makes BT-113 derivable from it.
+        // gross = net + tax.
         assert_eq!(
             a.tax[0]
                 .taxable_amount

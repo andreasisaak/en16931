@@ -18,7 +18,7 @@
       The European e-invoice, as Rust types.
     </text>
     <text x="80" y="404" fill="#9aa4b2" font-size="28">
-      317 business rules. UBL 2.1 and UN/CEFACT CII, both directions.
+      334 business rules. UBL 2.1 and UN/CEFACT CII, both directions.
     </text>
     <text x="80" y="446" fill="#9aa4b2" font-size="28">
       Findings point at BT-151, never at an XPath.

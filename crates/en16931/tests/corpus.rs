@@ -1,27 +1,8 @@
-//! The per-rule conformance corpus — the gate on every release.
+//! Per-rule conformance corpus: every registered rule has a mutation of a valid
+//! base document (in the semantic model) that makes it fire.
 //!
-//! # The bar
-//!
-//! **Every rule in the registry has a fixture that makes it fire, and a base
-//! document that does not.** A rule with no failing fixture is a rule nobody has
-//! ever seen work: it may be inverted, unreachable, or checking the wrong field,
-//! and the suite would be just as green either way.
-//!
-//! The CEN artefacts ship 207 such files, one per rule, as UBL. This crate does
-//! not parse XML , so the corpus is written against the
-//! semantic model directly — which turns out to be an advantage: a mutation here
-//! says *"BT-37 goes missing"* rather than *"delete this element"*, and reads as
-//! the rule does.
-//!
-//! # No silent gaps
-//!
-//! [`UNCOVERED`] lists every registered rule with no case yet, **by name and
-//! with a reason**. The meta-test fails if a rule is uncovered and not on the
-//! list, and *also* if a rule is on the list but has since been covered. So the
-//! list can only shrink, and it can never quietly grow.
-//!
-//! That is the same discipline the code-list generator applies to the artefacts:
-//! declare the expectation, and fail when reality diverges.
+//! Rules with no fixture are listed in [`UNCOVERED`] with a reason; the gate
+//! fails on an unlisted gap and on a listed rule that has since been covered.
 
 mod common;
 
@@ -43,10 +24,7 @@ fn pct(v: i64) -> Percentage {
     Percentage::new(rust_decimal::Decimal::from(v))
 }
 
-/// A document that satisfies **every** implemented rule, under every profile.
-///
-/// Every case below mutates a clone of this, so a case can only ever prove that
-/// its own mutation causes its own rule to fire.
+/// A document that satisfies every implemented rule, under every profile.
 fn base() -> Invoice {
     let party = |name: &str, country: &str| Party {
         name: Some(name.to_owned()),
@@ -63,7 +41,12 @@ fn base() -> Invoice {
             email: Some("rechnung@example.de".to_owned()),
         },
         electronic_address: Some(Identifier::schemed("DE123456789", "0204")),
-        vat_identifier: Some(format!("{country}123456789")),
+        // Dutch shape for NL, so `PEPPOL-COMMON-R056-2` stays quiet.
+        vat_identifier: Some(if country == "NL" {
+            "NL123456789B01".to_owned()
+        } else {
+            format!("{country}123456789")
+        }),
         ..Default::default()
     };
 
@@ -77,10 +60,9 @@ fn base() -> Invoice {
     .seller(party("Seller GmbH", "DE"))
     .buyer(party("Buyer BV", "NL"))
     .buyer_reference("04011000-12345-34")
-    // BT-23 — Peppol's `R001` requires it, `R007` fixes its shape.
+    // BT-23: Peppol `R001` / `R007`.
     .business_process("urn:fdc:peppol.eu:2017:poacc:billing:01:1.0")
-    // BT-72 — XRechnung's `BR-DE-TMP-32` wants a delivery date, a period, or a
-    // period on every line. This is the cheapest of the three.
+    // BT-72: satisfies XRechnung's `BR-DE-TMP-32`.
     .delivery(Delivery {
         date: Some(Date::parse("2026-06-30").unwrap()),
         ..Default::default()
@@ -160,8 +142,7 @@ fn allowance() -> DocumentAllowanceCharge {
     }
 }
 
-/// Attach an allowance and keep the totals chain closed, so only the rule under
-/// test can fire.
+/// Attach an allowance and keep the totals chain closed.
 fn with_allowance(inv: &mut Invoice, a: DocumentAllowanceCharge) {
     let amt = a.amount;
     inv.allowances.push(a);
@@ -174,12 +155,10 @@ fn with_allowance(inv: &mut Invoice, a: DocumentAllowanceCharge) {
     inv.totals.due = amount("107.10");
 }
 
-/// One mutation that must make exactly one named rule fire.
+/// One mutation that must make a named rule fire.
 ///
-/// `profile` names which rule set the mutated document is validated against.
-/// Core rules fire under every profile; `PEPPOL-EN16931-*` and `BR-DE-*` only
-/// fire under the profile that ships them, so a case for one of those has to
-/// say so or it would silently prove nothing.
+/// `profile` is the rule set to validate against (`None`: the core); profile
+/// rules only fire under the profile that ships them.
 struct Case {
     rule: &'static str,
     mutate: fn(&mut Invoice),
@@ -237,11 +216,7 @@ impl Case {
             .map_or_else(|| validate(inv), |p| p.validate(inv))
     }
 
-    /// The document this case mutates.
-    ///
-    /// CVD requires terms no other profile does, so its cases start from a
-    /// document that already has them — otherwise every CVD case would fire
-    /// `BR-DE-CVD-01` and prove nothing.
+    /// The document this case mutates: [`cvd_base`], [`dex_base`] or [`base`].
     fn start(&self) -> Invoice {
         match self.profile.map(|p| p.id) {
             Some(id) if id == profiles::XRECHNUNG_CVD.id => cvd_base(),
@@ -252,9 +227,6 @@ impl Case {
 }
 
 /// [`base`] declared as an XRechnung Extension document.
-///
-/// The Extension requires nothing extra — it only *permits* more — so this is
-/// `base()` with the identifier changed. Each case then adds the group it needs.
 fn dex_base() -> Invoice {
     let mut inv = base();
     inv.specification_id = Some(profiles::XRECHNUNG_EXTENSION.specification_id.to_owned());
@@ -275,7 +247,7 @@ fn cvd_base() -> Invoice {
     inv
 }
 
-/// Every case. One line per rule, in registry order where practical.
+/// Every case.
 #[rustfmt::skip]
 fn cases() -> Vec<Case> {
     vec![
@@ -318,7 +290,6 @@ fn cases() -> Vec<Case> {
     case("BR-CO-11", |i| { with_allowance(i, allowance()); i.totals.allowance_total = None }),
     case("BR-CO-12", |i| {
         i.charges.push(DocumentAllowanceCharge { reason: Some("Fracht".into()), ..allowance() });
-        // charge_total left absent, which BR-CO-12 requires when a charge exists
     }),
     case("BR-CO-13", |i| i.totals.taxable_total = amount("99.00")),
     case("BR-CO-14", |i| i.totals.vat_total = Some(amount("19.01"))),
@@ -416,9 +387,7 @@ fn cases() -> Vec<Case> {
         reference: None,
         reference_date: None,
     })),
-    // A sub-line group keyed to a line index the invoice does not have. Every
-    // consumer iterates the lines and asks for *their* sub-lines, so this group
-    // is invisible to `BR-DEX-02`, invisible to `BR-DEX-03`, and never written.
+    // A sub-line group keyed to a line index the invoice does not have.
     case("EN-EXT-02", |i| {
         let sub = en16931::SubInvoiceLine {
             line: i.lines[0].clone(),
@@ -435,10 +404,8 @@ fn cases() -> Vec<Case> {
     case("BR-S-09", |i| i.vat_breakdown[0].tax_amount = amount("17.50")),
     case("BR-S-10", |i| i.vat_breakdown[0].exemption_reason = Some("nope".to_owned())),
 
-    // `B` — split payment. Only `-01` and `-02` exist in the artefacts, and
-    // both are about the document as a whole rather than one group.
+    // `B`: split payment, Italy-only (the base's parties are DE and NL).
     case("BR-B-01", |i| {
-        // The base's parties are DE and NL; split payment is Italy-only.
         i.lines[0].vat = LineVat { category: Code::new("B"), rate: Some(pct(22)) };
         i.vat_breakdown[0] = VatBreakdown {
             taxable_amount: amount("100.00"), tax_amount: amount("22.00"),
@@ -532,8 +499,7 @@ fn cases() -> Vec<Case> {
         i.totals.vat_total = Some(amount("0.00"));
         i.totals.gross_total = amount("100.00");
         i.totals.due = amount("100.00");
-        // BR-IC-11 wants a delivery date; `base()` carries one for
-        // `BR-DE-TMP-32`, so this case has to take it away again.
+        // BR-IC-11 wants a delivery date or period; remove the base's.
         i.delivery = None;
         i.invoicing_period = None;
     }),
@@ -564,9 +530,7 @@ fn cases() -> Vec<Case> {
     case("BR-CL-11", |i| i.seller.legal_registration = Some(Identifier::schemed("X", "NOPE"))),
     case("BR-CL-13", |i| i.lines[0].item.classification_identifiers =
         vec![Identifier::schemed("X", "NOPE")]),
-    // BR-CL-15's artefact context is `cac:OriginCountry` — **BT-159**, the
-    // item's country of origin. BT-80 (deliver-to) is `cac:Country`, which is
-    // BR-CL-14's. The two rules share a message and check different terms.
+    // BR-CL-15 checks BT-159 (item origin country), not BT-80.
     case("BR-CL-15", |i| i.lines[0].item.origin_country = Some(Code::new("XX"))),
     case("BR-CL-21", |i| i.lines[0].item.standard_identifier =
         Some(Identifier::schemed("X", "NOPE"))),
@@ -582,8 +546,8 @@ fn cases() -> Vec<Case> {
         ..Default::default()
     })),
 
-    // `O` excludes everything else — BR-O-12 for lines, `-13` for allowances,
-    // `-14` for charges. All three turn on an `O` breakdown being present.
+    // An `O` breakdown excludes other categories: BR-O-12 lines, -13
+    // allowances, -14 charges.
     case("BR-O-13", |i| {
         i.seller.vat_identifier = None;
         i.buyer.vat_identifier = None;
@@ -620,7 +584,6 @@ fn cases() -> Vec<Case> {
         i.totals.gross_total = amount("110.00");
         i.totals.due = amount("110.00");
     }),
-    // BR-O-12 is the line variant.
     case("BR-O-12", |i| {
         i.seller.vat_identifier = None;
         i.buyer.vat_identifier = None;
@@ -636,8 +599,7 @@ fn cases() -> Vec<Case> {
         i.totals.due = amount("100.00");
     }),
 
-    // `O` is the awkward category: it forbids the LINE rate outright (BR-O-05,
-    // "shall not contain", not "shall be 0") and excludes every other group.
+    // BR-O-05: an `O` line "shall not contain" a rate, not even 0.
     case("BR-O-05", |i| {
         i.lines[0].vat = LineVat { category: Code::new("O"), rate: Some(Percentage::ZERO) };
         i.vat_breakdown[0] = VatBreakdown {
@@ -660,7 +622,7 @@ fn cases() -> Vec<Case> {
     }),
     case("BR-CL-20", |i| {
         i.charges.push(DocumentAllowanceCharge {
-            // `ZZZ` would NOT work: it is a real UNCL 7161 code, "mutually defined".
+            // Not `ZZZ`: that is a real UNCL 7161 code.
             reason_code: Some(Code::new("999")), reason: Some("Fracht".into()), ..allowance()
         });
         i.totals.charge_total = Some(amount("10.00"));
@@ -675,17 +637,25 @@ fn cases() -> Vec<Case> {
     // ── Peppol BIS 3.0 — only fire under that profile ─────────────────────
     peppol("PEPPOL-EN16931-R001", |i| i.business_process = None),
     peppol("PEPPOL-EN16931-R007", |i| i.business_process = Some("urn:nope".to_owned())),
+    // Well-formed, but not a process Peppol defines.
+    peppol("PEPPOL-EN16931-R007", |i| {
+        i.business_process = Some("urn:fdc:peppol.eu:2017:poacc:billing:05:1.0".to_owned());
+    }),
     peppol("PEPPOL-EN16931-R002", |i| {
         // Two notes, and the buyer is Dutch — the DE-DE carve-out does not apply.
         i.notes = vec![InvoiceNote::new("one"), InvoiceNote::new("two")];
     }),
-    // A disjunction: BT-10 *or* BT-13. Clearing only one must not fire.
+    // BT-10 or BT-13: both must go.
     peppol("PEPPOL-EN16931-R003", |i| {
         i.buyer_reference = None;
         i.purchase_order_reference = None;
     }),
     peppol("PEPPOL-EN16931-R004", |i| {
         i.specification_id = Some("urn:cen.eu:en16931:2017".to_owned());
+    }),
+    // The right prefix, and an empty segment after it.
+    peppol("PEPPOL-EN16931-R004", |i| {
+        i.specification_id = Some(format!("{}::x", profiles::PEPPOL_BIS_3.specification_id));
     }),
     peppol("PEPPOL-EN16931-R005", |i| i.vat_accounting_currency = Some(Code::new("EUR"))),
     peppol("PEPPOL-EN16931-R010", |i| i.buyer.electronic_address = None),
@@ -727,13 +697,53 @@ fn cases() -> Vec<Case> {
         }];
     }),
     peppol("PEPPOL-EN16931-CL008", |i| {
-        // `0219` is in CEN's EAS list and not in Peppol's 94-code subset.
+        // `0219` is in CEN's EAS list and not in Peppol's 83-code subset.
         i.seller.electronic_address = Some(Identifier::schemed("x", "0219"));
     }),
     peppol("PEPPOL-EN16931-P0100", |i| i.type_code = Some(Code::new("389"))),
-    // `261` is a CEN credit-note code (`BR-CL-01` accepts it) that Peppol's
-    // five-code credit-note list does not — which is what `P0101` is for.
+    // `261`: a CEN credit-note code outside Peppol's list.
     peppol("PEPPOL-EN16931-P0101", |i| i.type_code = Some(Code::new("261"))),
+    // Billing with response and the French processes take the same lists.
+    peppol("PEPPOL-EN16931-P0100", |i| {
+        i.business_process = Some("urn:peppol:bis:billing_with_response".to_owned());
+        i.type_code = Some(Code::new("389"));
+    }),
+    peppol("PEPPOL-EN16931-P0101", |i| {
+        i.business_process = Some("urn:peppol:france:billing:regulated".to_owned());
+        i.type_code = Some(Code::new("261"));
+    }),
+
+    // ── PEPPOL-COMMON-*: an identifier failing its scheme's check ─────────
+    peppol("PEPPOL-COMMON-R040", |i| i.seller.identifiers = vec![Identifier::schemed("124", "0088")]),
+    peppol("PEPPOL-COMMON-R041", |i| {
+        i.buyer.legal_registration = Some(Identifier::schemed("923609017", "0192"));
+    }),
+    peppol("PEPPOL-COMMON-R042", |i| i.seller.identifiers = vec![Identifier::schemed("DK1234567", "0184")]),
+    peppol("PEPPOL-COMMON-R043", |i| {
+        i.seller.legal_registration = Some(Identifier::schemed("0403170702", "0208"));
+    }),
+    peppol("PEPPOL-COMMON-R044", |i| i.buyer.identifiers = vec![Identifier::schemed("UFY9M-", "0201")]),
+    peppol("PEPPOL-COMMON-R045", |i| {
+        i.seller.identifiers = vec![Identifier::schemed("RSSMRA85T10A562", "0210")];
+    }),
+    // `R046` reads electronic addresses only.
+    peppol("PEPPOL-COMMON-R046", |i| i.buyer.electronic_address = Some(Identifier::schemed("XYZ", "9907"))),
+    peppol("PEPPOL-COMMON-R047", |i| {
+        i.payee = Some(Payee {
+            name: Some("Payee".to_owned()),
+            identifier: Some(Identifier::schemed("IT00743110158", "0211")),
+            ..Default::default()
+        });
+    }),
+    peppol("PEPPOL-COMMON-R049", |i| i.seller.identifiers = vec![Identifier::schemed("5560360794", "0007")]),
+    peppol("PEPPOL-COMMON-R050", |i| i.seller.identifiers = vec![Identifier::schemed("51824753557", "0151")]),
+    peppol("PEPPOL-COMMON-R052", |i| i.seller.identifiers = vec![Identifier::schemed("12345", "0096")]),
+    peppol("PEPPOL-COMMON-R053", |i| i.seller.identifiers = vec![Identifier::schemed("1234567890", "0198")]),
+    peppol("PEPPOL-COMMON-R054", |i| i.buyer.identifiers = vec![Identifier::schemed("1234", "0106")]),
+    peppol("PEPPOL-COMMON-R055", |i| i.buyer.identifiers = vec![Identifier::schemed("1234", "0190")]),
+    peppol("PEPPOL-COMMON-R056-1", |i| i.buyer.identifiers = vec![Identifier::schemed("NL1", "9944")]),
+    peppol("PEPPOL-COMMON-R056-2", |i| i.buyer.vat_identifier = Some("NL12345".to_owned())),
+    peppol("PEPPOL-COMMON-R057", |i| i.buyer.identifiers = vec![Identifier::schemed("1", "0217")]),
     peppol("PEPPOL-EN16931-CL002", |i| {
         i.allowances = vec![DocumentAllowanceCharge {
             amount: amount("10.00"),
@@ -754,7 +764,6 @@ fn cases() -> Vec<Case> {
             reason: Some("Fracht".to_owned()),
             reason_code: Some(Code::new("ZZ9")),
         }];
-        // A charge raises BT-108 and everything below it.
         i.totals.charge_total = Some(amount("10.00"));
         i.totals.taxable_total = amount("110.00");
         i.totals.vat_total = Some(amount("20.90"));
@@ -806,7 +815,7 @@ fn cases() -> Vec<Case> {
         rebalance_with_allowance(i, "10.00");
     }),
     peppol("PEPPOL-EN16931-R046", |i| {
-        // R046 is exact: gross − discount must land on the net price.
+        // Exact: gross − discount must equal the net price.
         i.lines[0].price.gross_price = Some(UnitPriceAmount::new(dec!(100)));
         i.lines[0].price.price_discount = Some(UnitPriceAmount::new(dec!(1)));
     }),
@@ -904,7 +913,7 @@ fn cases() -> Vec<Case> {
             ..Default::default()
         });
     }),
-    // `PROZENT=3` is not `PROZENT=3.00`: the two decimals are exact.
+    // `PROZENT` needs exactly two decimals.
     xr("BR-DE-18", |i| {
         i.payment_terms = Some("#SKONTO#TAGE=14#PROZENT=3#".to_owned());
     }),
@@ -925,6 +934,15 @@ fn cases() -> Vec<Case> {
             attachment: None,
         }];
     }),
+    // KoSIT's regex wants a scheme of at least two characters.
+    xr("BR-TMP-2", |i| {
+        i.attachments = vec![SupportingDocument {
+            reference: DocumentReference::new("DOC"),
+            description: None,
+            uri: Some("a:b".to_owned()),
+            attachment: None,
+        }];
+    }),
     xr("BR-DE-TMP-32", |i| {
         i.delivery = None;
         i.invoicing_period = None;
@@ -932,8 +950,7 @@ fn cases() -> Vec<Case> {
     }),
 
     // ── XRechnung Extension — mutations of `dex_base()` ───────────────────
-    // `application/xml` is what the Extension *adds*; `application/zip` is
-    // outside both lists.
+    // `application/zip` is outside both MIME lists.
     dex("BR-DEX-01", |i| {
         i.attachments = vec![SupportingDocument {
             reference: DocumentReference::new("DOC-1"),
@@ -970,8 +987,7 @@ fn cases() -> Vec<Case> {
             ..Default::default()
         });
     }),
-    // A third-party payment changes BT-115, and BR-DEX-09 is the equation that
-    // knows it. Leaving BT-115 alone is what makes it fire.
+    // A third-party payment with BT-115 left unadjusted.
     dex("BR-DEX-09", |i| {
         i.extensions.third_party_payments = vec![third_party("10.00")];
     }),
@@ -1011,8 +1027,7 @@ fn cases() -> Vec<Case> {
     cvd("BR-DE-CVD-06-b", |i| {
         i.lines[0].item.classification_identifiers.clear();
     }),
-    // `ZZZ` *is* in UNTDID 7143 ("mutually defined") — the third time that has
-    // caught a fixture in this suite. `XX9` is genuinely absent.
+    // Not `ZZZ`: that is in UNTDID 7143.
     cvd("BR-TMP-CVD-01", |i| {
         i.lines[0]
             .item
@@ -1078,15 +1093,11 @@ fn third_party(a: &str) -> en16931::ThirdPartyPayment {
     }
 }
 
-/// A document-level allowance changes BT-107 and every total below it.
-///
-/// Without this the `R04x` cases would fire `BR-CO-11` and the totals chain too,
-/// and prove nothing about the rule they name.
+/// Recompute BT-107 and every total below it for a document-level allowance.
 fn rebalance_with_allowance(i: &mut Invoice, allowance: &str) {
     let a = amount(allowance);
     i.totals.allowance_total = Some(a);
     i.totals.taxable_total = i.totals.line_total.checked_sub(a).unwrap();
-    // 19 % of the new taxable total, rounded half-up like every other figure here.
     let vat = InvoiceAmount::from_decimal_exact(
         (i.totals.taxable_total.into_decimal() * dec!(0.19)).round_dp(2),
     )
@@ -1104,9 +1115,7 @@ fn rebalance_with_allowance(i: &mut Invoice, allowance: &str) {
     }];
 }
 
-/// The eight `P010x` rules pin a VATEX code to one category. One case each,
-/// generated from the same table the rules use, so a new pairing cannot be added
-/// without a fixture appearing for it.
+/// The `P010x` rules: each pins a VATEX code to one category.
 const VATEX_CASES: &[(&str, &str, &str)] = &[
     ("PEPPOL-EN16931-P0104", "VATEX-EU-G", "G"),
     ("PEPPOL-EN16931-P0105", "VATEX-EU-O", "O"),
@@ -1118,19 +1127,13 @@ const VATEX_CASES: &[(&str, &str, &str)] = &[
     ("PEPPOL-EN16931-P0111", "VATEX-EU-J", "E"),
 ];
 
-/// One invoice per `P010x`: a document that is *otherwise valid* in some
-/// exempt category, carrying the VATEX code that implies a **different** one.
-///
-/// Built from [`FAMILIES`] rather than by hand, so the document satisfies the
-/// nine category families and the only thing wrong with it is the pairing the
-/// rule exists to catch.
+/// One invoice per `P010x`: valid in one exempt category (from [`FAMILIES`]),
+/// carrying the VATEX code that implies a different one.
 fn vatex_cases() -> Vec<(&'static str, Invoice)> {
     VATEX_CASES
         .iter()
         .map(|(rule, vatex, implied)| {
-            // Any exempt category other than the one the code implies. `E` and
-            // `G` are both reason-requiring and zero-rated, so one of the two is
-            // always available as the wrong answer.
+            // `E` or `G`, whichever the code does not imply.
             let wrong = if *implied == "E" { "G" } else { "E" };
             let fam = FAMILIES
                 .iter()
@@ -1144,19 +1147,13 @@ fn vatex_cases() -> Vec<(&'static str, Invoice)> {
 }
 
 const _: () = {
-    // Keep the two tables in step: the rules' own table is the source of truth.
     assert!(VATEX_CASES.len() == 8);
 };
-/// One of §6.4.3's nine tables, as a fixture.
-///
-/// The rules are table-driven, so the corpus is too: nine categories × five rows
-/// from one description each, rather than forty-five hand-written mutations that
-/// would drift apart.
+/// One VAT category family (EN 16931-1 §6.4.3), as a fixture.
 struct Family {
     /// The UNCL 5305 code.
     code: &'static str,
-    /// The rule-id prefix, which is **not** always the code — `K` is `BR-IC`,
-    /// `L` is `BR-AF`, `M` is `BR-AG`.
+    /// The rule-id prefix (`K` is `BR-IC`, `L` is `BR-AF`, `M` is `BR-AG`).
     prefix: &'static str,
     /// A rate this category accepts.
     rate: Option<Percentage>,
@@ -1176,8 +1173,7 @@ const FAMILIES: &[Family] = &[
     Family { code: "AE", prefix: "BR-AE", rate: Some(Percentage::ZERO),          needs_reason: true,  taxed: false },
     Family { code: "K",  prefix: "BR-IC", rate: Some(Percentage::ZERO),          needs_reason: true,  taxed: false },
     Family { code: "G",  prefix: "BR-G",  rate: Some(Percentage::ZERO),          needs_reason: true,  taxed: false },
-    // `O` states no rate at all: BR-O-05 says "shall not contain", where every
-    // other zero-tax category says "shall be 0".
+    // `O` states no rate (BR-O-05: "shall not contain").
     Family { code: "O",  prefix: "BR-O",  rate: None,                            needs_reason: true,  taxed: false },
 ];
 
@@ -1192,7 +1188,7 @@ impl Family {
         }
     }
 
-    /// BT-117 and BT-112 for a 110.00 base, used by the `-04` fixtures.
+    /// BT-117 for a 110.00 base, used by the `-04` fixtures.
     fn tax_on_110(&self) -> &'static str {
         match self.code {
             "S" => "20.90",
@@ -1222,8 +1218,7 @@ impl Family {
     fn valid(&self) -> Invoice {
         let mut inv = base();
         if self.code == "K" {
-            // BR-IC-11 / -12: an intra-community supply must evidence where and
-            // when the goods went, or the zero-rating cannot be substantiated.
+            // BR-IC-11 / -12: delivery date and deliver-to country.
             inv.delivery = Some(Delivery {
                 date: Some(Date::parse("2026-06-15").unwrap()),
                 address: Some(PostalAddress {
@@ -1234,9 +1229,8 @@ impl Family {
             });
         }
         if self.code == "O" {
-            // BR-O-02/03/04 forbid BT-31, BT-63 and BT-48 outright, while
-            // BR-CO-26 still requires one of BT-29 / BT-30 / BT-31 — so an
-            // out-of-scope seller identifies itself by registration.
+            // BR-O-02/03/04 forbid BT-31, BT-63 and BT-48, so BT-30 satisfies
+            // BR-CO-26.
             inv.seller.vat_identifier = None;
             inv.buyer.vat_identifier = None;
             inv.seller.legal_registration = Some(Identifier::schemed("HRB 12345", "0198"));
@@ -1288,11 +1282,10 @@ fn family_cases() -> Vec<(String, Invoice)> {
         };
         out.push((id("05"), inv));
 
-        // `-02` / `-03` / `-04`: the tax identifiers the category requires.
-        // `O` is the inverse — it forbids them — so its mutation adds one.
+        // `-02` / `-03` / `-04` (line / allowance / charge): the tax identifiers
+        // the category requires; `O` forbids them, so its mutation adds one.
         for (row, ctx) in [("02", 0usize), ("03", 1), ("04", 2)] {
             let mut inv = fam.valid();
-            // Put the category in the context the row is about.
             match ctx {
                 1 => {
                     let mut a = allowance();
@@ -1335,7 +1328,6 @@ fn family_cases() -> Vec<(String, Invoice)> {
                 _ => {}
             }
             if fam.code == "O" {
-                // The prohibition: stating BT-31 breaks it.
                 inv.seller.vat_identifier = Some("DE123456789".to_owned());
             } else {
                 inv.seller.vat_identifier = None;
@@ -1391,37 +1383,21 @@ fn family_cases() -> Vec<(String, Invoice)> {
     out
 }
 
-/// Rules with no case, each with the reason.
-///
-/// **Every entry is a rule the type system retires** — there is no document
-/// state that can make it fire, so a fixture is not merely missing but
-/// impossible. Every rule that *can* fire has one.
-///
-/// The meta-test fails if a rule is uncovered and absent here, **and** if a rule
-/// is listed here but has since been covered. So this can only shrink — and it
-/// has reached its floor.
 /// Why a registered rule has no fixture.
-///
-/// An explicit tag rather than a substring of the prose: classifying a
-/// disposition by grepping its own justification is how "no state can make this
-/// fire" and "we did not get to it" end up in the same bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Why {
-    /// The model's types make the failure unrepresentable. Nothing to test.
+    /// The model's types make the failure unrepresentable.
     Retired,
-    /// Nobody can check it — CEN's own Schematron binds it to `true()`.
-    /// See `undecidable!` in `src/validation/rules/structural.rs`.
+    /// CEN's own Schematron binds it to `true()` (`undecidable!` in
+    /// `structural.rs`).
     Undecidable,
 }
 
 /// Registered rules with no fixture, each with its disposition and a reason.
 ///
-/// Only [`Why::Retired`] and [`Why::Undecidable`] exist, and both mean *no
-/// validator could do better*. There is deliberately no `Todo` variant: an
-/// unimplemented rule must be absent from the registry, where the artefact-gap
-/// count sees it, not parked here where it looks handled.
+/// There is no `Todo` variant: an unimplemented rule stays out of the registry.
 const UNCOVERED: &[(&str, Why, &str)] = &[
-    // Retired by the type system — there is no state that makes them fire.
+    // Retired by the type system.
     ("BR-12", Why::Retired, "BT-106 is non-Option"),
     ("BR-13", Why::Retired, "BT-109 is non-Option"),
     ("BR-14", Why::Retired, "BT-112 is non-Option"),
@@ -1548,18 +1524,18 @@ const UNCOVERED: &[(&str, Why, &str)] = &[
         Why::Retired,
         "one currency per document; amounts carry no @currencyID",
     ),
-    // XRechnung: the `PaymentMeans` enum makes "the other two groups shall not
-    // be present" unrepresentable. The `-a` halves are real rules and covered.
     (
         "BR-DEX-13",
         Why::Retired,
         "InvoiceAmount is i64 minor units",
     ),
     ("BR-DEX-14", Why::Retired, "one currency per document"),
+    // The `PaymentMeans` enum makes "the other two groups shall not be
+    // present" unrepresentable; the `-a` halves are covered.
     ("BR-DE-23-b", Why::Retired, "PaymentMeans is an enum"),
     ("BR-DE-24-b", Why::Retired, "PaymentMeans is an enum"),
     ("BR-DE-25-b", Why::Retired, "PaymentMeans is an enum"),
-    // Peppol rules the model retires — each one's reason is on the rule itself.
+    // Peppol rules the model retires.
     (
         "PEPPOL-EN16931-F001",
         Why::Retired,
@@ -1615,9 +1591,7 @@ const UNCOVERED: &[(&str, Why, &str)] = &[
         Why::Retired,
         "the line's only reference is BT-128",
     ),
-    // Undecidable — and CEN's own UBL binding is `value="true()"` for all four,
-    // so registering them without a check *matches* the artefacts rather than
-    // falling short of them. See `structural::undecidable!`.
+    // Undecidable: CEN's UBL binding is `value="true()"` for all four.
     (
         "BR-CO-05",
         Why::Undecidable,
@@ -1638,8 +1612,6 @@ const UNCOVERED: &[(&str, Why, &str)] = &[
         Why::Undecidable,
         "CEN binds it to true(): code-vs-free-text equivalence",
     ),
-    // The remaining eight category families follow BR-S-* exactly; the shared
-    // checkers are exercised by the BR-S-* and zero-tax cases below.
 ];
 
 /// Every case makes its rule fire, and the base document makes none fire.
@@ -1650,13 +1622,7 @@ fn every_case_isolates_its_rule() {
         clean.is_valid() && clean.warnings().count() == 0,
         "the base document must satisfy every rule, or a case proves nothing:\n{clean}"
     );
-    // …and under every shipped profile, since cases are checked against core.
-    //
-    // Each profile gets a base declaring **its own** BT-24. A document names one
-    // specification identifier and one only, so "the same bytes are valid under
-    // every profile" was never a coherent requirement — `PEPPOL-EN16931-R004`
-    // makes that explicit by rejecting a Peppol document that declares
-    // XRechnung's identifier, which is exactly right.
+    // And under every shipped profile, each base declaring that profile's BT-24.
     for p in profiles::ALL {
         let mut doc = if p.id == profiles::XRECHNUNG_CVD.id {
             cvd_base()
@@ -1680,7 +1646,7 @@ fn every_case_isolates_its_rule() {
     }
 }
 
-/// Every family, every row. Nine categories × five rows, from one table.
+/// Every VAT category family fires every row, and every `P010x` pairing fires.
 #[test]
 fn every_vat_category_family_fires_every_row() {
     for fam in FAMILIES {
@@ -1695,14 +1661,13 @@ fn every_vat_category_family_fires_every_row() {
         let report = validate(&inv);
         assert!(report.has(&rule), "{rule} did not fire:\n{report}");
     }
-    // The `P010x` pairings are Peppol's, so they are checked under Peppol.
     for (rule, inv) in vatex_cases() {
         let report = profiles::PEPPOL_BIS_3.validate(&inv);
         assert!(report.has(rule), "{rule} did not fire:\n{report}");
     }
 }
 
-/// **The gate.** Every registered rule is either covered or explicitly listed.
+/// Every registered rule is either covered or listed in [`UNCOVERED`].
 #[test]
 fn coverage_is_complete_or_explicitly_declared() {
     let covered: BTreeSet<String> = cases()
@@ -1725,9 +1690,7 @@ fn coverage_is_complete_or_explicitly_declared() {
         .map(|(id, _, _)| (*id).to_ascii_uppercase())
         .collect();
 
-    // Every rule this crate can ever report, not just the core set: a profile's
-    // `extra_rules` are rules too, and leaving them out of the gate is how 38
-    // Peppol rules got written without a single fixture between them.
+    // The core set plus every profile's `extra_rules`.
     let mut registry: Vec<&'static Rule> = en16931::validation::rules::CORE.to_vec();
     for p in profiles::ALL {
         for r in p.extra_rules {
@@ -1767,13 +1730,7 @@ fn coverage_is_complete_or_explicitly_declared() {
         stale.join("\n  ")
     );
 
-    // The floor: every remaining entry must be a type-retired rule. If a new
-    // rule is ever added to UNCOVERED for any other reason, this fails — so
-    // "100 % of checkable" cannot quietly become "100 % of what we felt like
-    // checking".
-    // The floor. `Why` has exactly two variants and both mean "no validator
-    // could do better", so this holds by construction — it is spelled out so
-    // that adding a third, softer variant fails here first.
+    // Holds by construction today; fails first if a softer `Why` variant appears.
     for (id, why, reason) in UNCOVERED {
         assert!(
             matches!(why, Why::Retired | Why::Undecidable),
@@ -1792,9 +1749,7 @@ fn coverage_is_complete_or_explicitly_declared() {
          anything else needs its own justification"
     );
 
-    // Report the real numbers, separating the three populations, so coverage
-    // cannot be quietly overstated. "148 rules implemented" is true and says
-    // much less than it sounds like.
+    // Report registered, retired, undecidable and checkable separately.
     let by_type = UNCOVERED
         .iter()
         .filter(|(_, why, _)| *why == Why::Retired)
@@ -1818,10 +1773,7 @@ fn coverage_is_complete_or_explicitly_declared() {
         checkable - exercised
     );
 
-    // These four are the split the prose quotes, and three of them were wrong
-    // in the README for several releases — it said 149 registered, 36 retired,
-    // 113 checkable, from a revision when that was true. They are computed
-    // here, so they are compared here.
+    // The figures the prose quotes must match.
     common::docs::check(&[
         common::docs::Claim {
             what: "rules retired by the type system",
@@ -1868,12 +1820,16 @@ fn coverage_is_complete_or_explicitly_declared() {
             pattern: "remaining <N> exercised",
             expected: exercised,
         },
+        common::docs::Claim {
+            what: "rules exercised by a failing fixture, as the landing page's figure",
+            pattern: "{ n = \"<N>\", k = \"rules exercised by a failing fixture\" }",
+            expected: exercised,
+        },
     ]);
 }
 
-/// A case must not fire *other* rules than its own, or it proves less than it
-/// claims. Reported rather than asserted: some mutations legitimately cascade
-/// (breaking BT-109 breaks the chain below it).
+/// Reports (does not assert) cases that also fire other rules; some mutations
+/// legitimately cascade down the totals chain.
 #[test]
 fn cases_are_reported_when_they_cascade() {
     let mut noisy = Vec::new();
@@ -1891,8 +1847,6 @@ fn cases_are_reported_when_they_cascade() {
             noisy.push(format!("{} also fires {:?}", c.rule, extra));
         }
     }
-    // Not a failure — the totals chain is genuinely a chain — but visible, so a
-    // case that accidentally breaks half the document is noticed.
     for line in &noisy {
         eprintln!("cascade: {line}");
     }

@@ -1,21 +1,10 @@
 #![cfg(any(feature = "ubl", feature = "cii"))]
 
-//! Reading the authorities' own documents.
+//! Reading the reference corpus: CEN's, KoSIT's and OpenPeppol's documents,
+//! including several hundred deliberately invalid ones.
 //!
-//! The fixtures in `tests/common` are this crate's idea of an invoice. These
-//! are CEN's, KoSIT's and OpenPeppol's — including several hundred deliberately
-//! *invalid* ones, which is the point: a reader that only survives well-formed
-//! input has not been tested, it has been demonstrated.
-//!
-//! # Skipped when the artefacts are absent — and not in CI
-//!
-//! `spec/` is not committed: the CEN artefacts are EUPL-1.2 and the vendor
-//! specifications carry their own terms. Run `cargo xtask fetch`.
-//!
-//! A skipped suite prints why. That is not enough on its own — nobody reads the
-//! stdout of a passing test, and this suite once reported four green tests
-//! having read zero of its 486 documents. So CI sets `EN16931_REQUIRE_SPEC=1`
-//! and the skip becomes a failure; see `tests/common/mod.rs`.
+//! The corpus is not committed (`cargo xtask fetch`). Absent, the suites skip
+//! with a message; CI sets `EN16931_REQUIRE_SPEC=1` to make that a failure.
 
 mod common;
 
@@ -23,8 +12,7 @@ use std::path::{Path, PathBuf};
 
 /// The workspace's artefacts, or a loud skip.
 ///
-/// One tree at the workspace root serves both crates, at one pinned revision —
-/// see `tests/common/mod.rs`.
+/// One tree at the workspace root serves both crates (see `tests/common/mod.rs`).
 fn spec_root() -> Option<PathBuf> {
     common::require("corpus")
 }
@@ -49,22 +37,24 @@ fn documents(syntax: en16931_formats::Syntax) -> Vec<(PathBuf, String)> {
         return Vec::new();
     };
     let mut paths = Vec::new();
-    collect(&root, &mut paths);
+    for source in common::AUTHORITY_SOURCES {
+        collect(&root.join(source), &mut paths);
+    }
     paths
         .into_iter()
         .filter_map(|p| {
             let text = std::fs::read_to_string(&p).ok()?;
-            (en16931_formats::sniff(&text) == Some(syntax)).then_some((p, text))
+            (common::sniff(&text) == Some(syntax)).then_some((p, text))
         })
         .collect()
 }
 
 macro_rules! syntaxes {
-    ($($feature:literal => ($module:ident, $syntax:ident, $min:literal, $allow:expr)),* $(,)?) => {$(
+    ($($feature:literal => ($module:ident, $syntax:ident, $min:literal, $allow:expr, $per_file:expr)),* $(,)?) => {$(
         #[cfg(feature = $feature)]
         mod $module {
             use super::{documents, spec_root};
-            use en16931_formats::{$module as syntax, Syntax};
+            use en16931_formats::{Error, Syntax, report::Kind};
 
             #[test]
             fn the_reader_survives_every_published_instance() {
@@ -76,15 +66,15 @@ macro_rules! syntaxes {
                 }
                 let (mut read, mut rejected, mut malformed) = (0usize, 0usize, 0usize);
                 for (path, text) in &docs {
-                    match syntax::from_str(text) {
+                    match en16931_formats::read(text.as_bytes()) {
                         Ok(r) => {
+                            assert_eq!(r.syntax, Syntax::$syntax, "{}", path.display());
                             read += 1;
-                            malformed += r.malformed.len();
+                            malformed += r.entries_of(Kind::Malformed).count();
                         }
-                        // Some instances are truncated on purpose — the
-                        // authorities test that a validator rejects a document
-                        // that is not well-formed. Refusing them *is* correct.
-                        Err(syntax::Error::Xml(_)) => rejected += 1,
+                        // Some instances are deliberately not well-formed;
+                        // refusing them is correct.
+                        Err(Error::Xml { .. }) => rejected += 1,
                         // Sniffing said this syntax and the reader disagreed.
                         Err(e) => panic!("{}: {e}", path.display()),
                     }
@@ -104,44 +94,69 @@ macro_rules! syntaxes {
                 );
             }
 
-            /// Every element in the corpus is either mapped or **named**.
-            ///
-            /// A reader that quietly ignores an amount reports a clean parse and
-            /// proves nothing. The allowlist is explicit so adding to it is a
-            /// deliberate act with a reason, not a silent widening.
+            /// Every element in the corpus is either mapped or named in an
+            /// explicit allowlist: by path, or by (file, path) where only some
+            /// documents may carry it. Both lists are exact: an entry nothing
+            /// needs any more fails.
             #[test]
             fn nothing_is_ignored_without_being_named() {
                 let docs = documents(Syntax::$syntax);
-                if docs.is_empty() {
+                let Some(root) = spec_root().filter(|_| !docs.is_empty()) else {
                     println!("SKIPPED: no artefacts — run `cargo xtask fetch`");
                     return;
-                }
-                let mut unmapped = std::collections::BTreeSet::new();
-                for (_, text) in &docs {
-                    if let Ok(r) = syntax::from_str(text) {
-                        unmapped.extend(r.unmapped);
+                };
+                let allowed: &[&str] = $allow;
+                let per_file: &[(&str, &str)] = $per_file;
+                // Unmapped path → the first file carrying it.
+                let mut unmapped = std::collections::BTreeMap::new();
+                let mut excused = std::collections::BTreeSet::new();
+                for (path, text) in &docs {
+                    let file = path
+                        .strip_prefix(&root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let Ok(r) = en16931_formats::read(text.as_bytes()) else {
+                        continue;
+                    };
+                    for e in r.entries_of(Kind::Unmapped) {
+                        match per_file.iter().find(|(f, p)| *f == file && *p == e.path) {
+                            Some(key) => {
+                                excused.insert(*key);
+                            }
+                            None => {
+                                unmapped.entry(e.path.clone()).or_insert_with(|| file.clone());
+                            }
+                        }
                     }
                 }
-                let expected: &[&str] = $allow;
-                let unexpected: Vec<&String> = unmapped
+                let unexpected: Vec<String> = unmapped
                     .iter()
-                    .filter(|u| !expected.contains(&u.as_str()))
+                    .filter(|(p, _)| !allowed.contains(&p.as_str()))
+                    .map(|(p, f)| format!("{p} (in {f})"))
                     .collect();
                 assert!(
                     unexpected.is_empty(),
                     "{} ignored {} element path(s) nobody has justified:\n  {}",
                     stringify!($module),
                     unexpected.len(),
-                    unexpected
-                        .iter()
-                        .map(|u| u.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n  ")
+                    unexpected.join("\n  ")
+                );
+                let stale: Vec<&&str> = allowed
+                    .iter()
+                    .filter(|p| !unmapped.contains_key(**p))
+                    .collect();
+                assert!(stale.is_empty(), "allowed paths nothing carries any more: {stale:?}");
+                assert_eq!(
+                    excused.into_iter().collect::<Vec<_>>(),
+                    per_file,
+                    "the excused (file, path) pairs and the table differ"
                 );
                 println!(
-                    "{}: {} unmapped element paths, all accounted for",
+                    "{}: {} unmapped element paths and {} (file, path) pairs, all accounted for",
                     stringify!($module),
-                    unmapped.len()
+                    unmapped.len(),
+                    per_file.len()
                 );
             }
         }
@@ -152,56 +167,53 @@ syntaxes! {
     // `UBLExtensions` is forbidden by UBL-CR-001 and appears only in negative
     // instances; `CreditAccount` is a UBL payment element EN 16931 does not use.
     //
-    // The two "(beside …)" entries are KoSIT's `BR-DE-23/24/25` mutation
-    // instances: BG-17 together with BG-18 or BG-19, a combination those rules
-    // exist to forbid and `en16931::invoice::PaymentMeans` — an enum — cannot
-    // hold. The first kind read wins, the later kind is recorded here, and the
-    // `-a` rule then fires on the mismatch, which is the verdict KoSIT's own
-    // validator reaches on these files.
+    // `PayeeFinancialAccount` and `PaymentMandate` come from KoSIT's
+    // `BR-DE-23/24/25` instances: BG-17 with BG-18 or BG-19, which the
+    // `PaymentMeans` enum cannot hold. The first kind read wins.
+    //
+    // `Invoice/PaymentMeans`: Peppol's stylesheet test document carries three
+    // kinds of payment means; the first is read.
+    //
+    // By (file, path), `TaxTotal/TaxAmount`: a second VAT total in a currency
+    // already read, in the negative instances for `BR-CO-15` (no multiple BT-110)
+    // and Peppol's `R053` / `R054`; the first is read. Anywhere else it would be
+    // a reader bug.
     "ubl" => (ubl, Ubl, 200, &[
         "Invoice/UBLExtensions",
+        "Invoice/PaymentMeans",
         "PaymentMeans/CreditAccount",
-        "PaymentMeans/PayeeFinancialAccount (beside a card or mandate)",
-        "PaymentMeans/PaymentMandate (beside another payment means)",
+        "PaymentMeans/PayeeFinancialAccount",
+        "PaymentMeans/PaymentMandate",
+    ], &[
+        ("validator-configuration-xrechnung/src/test/cen-unit-test/ubl-br-co-15-no-multiple-bt-110-allowed-test.xml", "Invoice/TaxTotal/TaxAmount"),
+        ("xrechnung-schematron/test/instances/ubl-cn/ubl-cn-peppol-en16931-r053-2.xml", "CreditNote/TaxTotal/TaxAmount"),
+        ("xrechnung-schematron/test/instances/ubl-cn/ubl-cn-peppol-en16931-r054-2.xml", "CreditNote/TaxTotal/TaxAmount"),
+        ("xrechnung-schematron/test/instances/ubl-inv/ubl-inv-peppol-en16931-r053-2.xml", "Invoice/TaxTotal/TaxAmount"),
+        ("xrechnung-schematron/test/instances/ubl-inv/ubl-inv-peppol-en16931-r054-2.xml", "Invoice/TaxTotal/TaxAmount"),
     ]),
-    // The *debtor's* bank. EN 16931 has BT-86 for the payee's BIC and no term
-    // for the payer's, so this is outside the subset rather than a reader gap.
-    // The "(beside …)" entry is the CII spelling of the same KoSIT mutation
-    // instances named in the UBL list above.
+    // The debtor's bank: EN 16931 has no term for the payer's BIC.
+    // `PayeePartyCreditorFinancialAccount`: the KoSIT instances named above.
     "cii" => (cii, Cii, 100, &[
         "SpecifiedTradeSettlementPaymentMeans/PayerSpecifiedDebtorFinancialInstitution",
-        "SpecifiedTradeSettlementPaymentMeans/PayeePartyCreditorFinancialAccount (beside a card or mandate)",
-    ]),
+        "SpecifiedTradeSettlementPaymentMeans/PayeePartyCreditorFinancialAccount",
+    ], &[]),
 }
 
-/// **The depth limit is measured against the authorities' own documents.**
+/// The depth limit leaves headroom over every published UBL and CII instance.
 ///
-/// `ubl::MAX_DEPTH` exists because `roxmltree::Document::parse` recurses once
-/// per level of nesting and aborts the process on a stack overflow — which Rust
-/// cannot catch, so it has to be refused before it happens. A limit chosen by
-/// intuition is the wrong way to protect against that in both directions: too
-/// low and it rejects an invoice somebody actually sent, too high and it does
-/// not protect anything.
-///
-/// So it is compared against every published UBL and CII instance in the
-/// artefact tree — several hundred documents from three authorities, including
-/// the deliberately malformed ones. The floor asserted here is the headroom, not
-/// the limit: if a future artefact release ships something deeper than a third
-/// of `MAX_DEPTH`, that is worth knowing before a user finds out.
+/// `MAX_DEPTH` guards `roxmltree`'s per-level recursion; the asserted floor is
+/// that no corpus document is deeper than a third of it.
 #[test]
 fn the_depth_limit_clears_every_published_document() {
-    // Whichever syntax this build carries. The limit is one constant shared by
-    // both readers, so either half measures it.
-    #[cfg(feature = "ubl")]
-    let (limit, syntaxes) = (
-        en16931_formats::ubl::MAX_DEPTH,
-        vec![en16931_formats::Syntax::Ubl, en16931_formats::Syntax::Cii],
-    );
-    #[cfg(all(not(feature = "ubl"), feature = "cii"))]
-    let (limit, syntaxes) = (
-        en16931_formats::cii::MAX_DEPTH,
-        vec![en16931_formats::Syntax::Cii],
-    );
+    // One limit, shared by both readers.
+    let limit = en16931_formats::MAX_DEPTH;
+    common::assert_page_states("cli.md", &[("nested more than <N> elements", limit)]);
+    let syntaxes = [
+        #[cfg(feature = "ubl")]
+        en16931_formats::Syntax::Ubl,
+        #[cfg(feature = "cii")]
+        en16931_formats::Syntax::Cii,
+    ];
 
     let mut deepest = 0usize;
     let mut worst = String::new();
@@ -209,8 +221,7 @@ fn the_depth_limit_clears_every_published_document() {
     for syntax in syntaxes {
         for (path, text) in documents(syntax) {
             seen += 1;
-            // Counted independently of the crate's own scanner: a guard checked
-            // against a copy of itself checks nothing.
+            // Counted independently of the crate's own scanner.
             let d = nesting(&text);
             assert!(
                 d <= limit,
@@ -233,10 +244,17 @@ fn the_depth_limit_clears_every_published_document() {
          limit is {limit}. That is less than three times the headroom — raise the \
          limit deliberately, or find out why a document grew."
     );
+    common::assert_page_states(
+        "syntaxes.md",
+        &[
+            ("The limit is <N>;", limit),
+            ("the deepest of the <N> published", seen),
+            ("instances is **<N>**", deepest),
+        ],
+    );
 }
 
-/// The corpus's own depth counter, kept separate from the crate's on purpose:
-/// a guard checked against a copy of itself checks nothing.
+/// The corpus's own depth counter, independent of the crate's.
 fn nesting(xml: &str) -> usize {
     let doc = match roxmltree::Document::parse(xml) {
         Ok(d) => d,
@@ -247,4 +265,23 @@ fn nesting(xml: &str) -> usize {
         .map(|n| n.ancestors().filter(roxmltree::Node::is_element).count())
         .max()
         .unwrap_or(0)
+}
+
+/// The syntaxes page states the single-occurrence tables' sizes.
+#[cfg(all(feature = "ubl", feature = "cii"))]
+#[test]
+fn the_single_occurrence_tables_have_the_documented_size() {
+    common::assert_page_states(
+        "syntaxes.md",
+        &[
+            (
+                "UBL 2.1 schemas and CEN's `count(…) <= 1` rules | <N> rows",
+                en16931_formats::ubl::once::ONCE.len(),
+            ),
+            (
+                "subset schema and CEN's `count(…) <= 1` rules | <N> rows",
+                en16931_formats::cii::once::ONCE.len(),
+            ),
+        ],
+    );
 }

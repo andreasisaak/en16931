@@ -1,23 +1,26 @@
-//! The command, exercised as a command.
-//!
-//! # Why the exit codes get their own tests
-//!
-//! The library is covered by the libraries' suites; what this crate adds is a
-//! *process contract*, and the part of it people build on is the exit code. A CI
-//! job that cannot tell "this invoice is invalid" (`1`) from "that path does not
-//! exist" (`2`) will eventually ship an invoice because a volume was not
-//! mounted, and no amount of library testing catches that.
+//! The command, exercised as a process: output, and the exit codes
+//! (`0` valid, `1` rejected, `2` could not run) pipelines build on.
 
 use std::io::Write as _;
 
 use assert_cmd::Command;
+use assert_cmd::assert::OutputAssertExt as _;
+
+/// The memory-and-time watchdog the hostile-input suites share.
+#[path = "../../en16931-formats/tests/common/watchdog.rs"]
+mod watchdog;
+
+/// Run the command on hostile input under the watchdog (512 MiB resident,
+/// 10 s), and hand back its output to assert on.
+fn watched(args: &[&str]) -> std::process::Output {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("en16931"));
+    cmd.args(args);
+    watchdog::watch(cmd, &format!("en16931 {}", args.join(" ")))
+}
 use predicates::prelude::PredicateBooleanExt as _;
 use predicates::str::contains;
 
 /// Run the command, expect success, and return its standard output.
-///
-/// Hoisted out of the four tests that each declared their own closure: a
-/// helper copied four times is four places to fix when the invocation changes.
 fn stdout(args: &[&str]) -> String {
     let out = cli()
         .args(args)
@@ -29,8 +32,7 @@ fn stdout(args: &[&str]) -> String {
     String::from_utf8(out).expect("the CLI writes UTF-8")
 }
 
-/// A minimal but *core-valid* UBL invoice, written from the model rather than
-/// pasted — a fixture that drifts out of validity tests nothing.
+/// A minimal core-valid UBL invoice, written from the model so it cannot drift.
 fn valid_ubl() -> String {
     use en16931::invoice::*;
     use en16931::{Date, Identifier, Invoice, InvoiceAmount, InvoiceLine, Percentage, Quantity};
@@ -68,17 +70,18 @@ fn valid_ubl() -> String {
     ))
     .build_reconciled()
     .expect("reconciles");
-    assert!(en16931::validate(&invoice).is_valid());
-    en16931_formats::ubl::to_string(&invoice)
+    let proof = en16931::Validated::<en16931::En16931>::new(invoice).expect("valid");
+    en16931_formats::write(&proof, en16931_formats::Syntax::Ubl).xml
 }
 
-/// Write a fixture to a path **no other test can be writing at the same time**.
-///
-/// `cargo test` runs these in parallel threads of one process, and the first
-/// version of this keyed the filename on `name` alone — so two tests both
-/// wanting `valid.xml` truncated the file under each other and one of them read
-/// an empty document. Intermittently, and only under load.
+/// Write a fixture to a path unique to this call, since tests run in parallel
+/// threads of one process.
 fn write_temp(name: &str, body: &str) -> std::path::PathBuf {
+    write_temp_bytes(name, body.as_bytes())
+}
+
+/// [`write_temp`] for a binary fixture.
+fn write_temp_bytes(name: &str, body: &[u8]) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(0);
 
@@ -88,7 +91,7 @@ fn write_temp(name: &str, body: &str) -> std::path::PathBuf {
         std::process::id()
     ));
     let mut f = std::fs::File::create(&path).expect("create fixture");
-    f.write_all(body.as_bytes()).expect("write fixture");
+    f.write_all(body).expect("write fixture");
     f.sync_all().expect("flush fixture");
     path
 }
@@ -121,9 +124,9 @@ fn an_invalid_invoice_exits_one_and_says_which_rules() {
         .stdout(contains("BR-16")); // no invoice line
 }
 
-/// The distinction the whole exit-code contract exists for.
+/// A missing file is `2`; bytes that are not an invoice are a rejection, `1`.
 #[test]
-fn an_unreadable_document_exits_two_not_one() {
+fn a_missing_file_exits_two_and_bytes_that_are_no_invoice_are_rejected() {
     cli()
         .args(["validate", "/definitely/not/here.xml"])
         .assert()
@@ -133,8 +136,9 @@ fn an_unreadable_document_exits_two_not_one() {
     cli()
         .args(["validate", path.to_str().unwrap()])
         .assert()
-        .code(2)
-        .stderr(contains("not an e-invoice"));
+        .code(1)
+        .stdout(contains("recommendation: REJECT"))
+        .stdout(contains("found <html>"));
 }
 
 #[test]
@@ -146,36 +150,42 @@ fn the_rule_set_comes_from_bt_24_by_default() {
         .assert()
         .success()
         .stdout(contains("EN 16931 validation"));
-    // …and naming a profile overrides it, which is how you ask "would this
-    // pass in Germany?" about a document that does not claim to.
+    // …and requiring a profile adds a second report beside it; the
+    // declaration is still the document's own.
     cli()
         .args([
             "validate",
             path.to_str().unwrap(),
-            "--profile",
+            "--require",
             "XRechnung 3.0",
         ])
         .assert()
         .code(1)
+        .stdout(contains("declared: EN 16931"))
+        .stdout(contains("as required (XRechnung 3.0)"))
         .stdout(contains("BR-DE-15"));
 }
 
 #[test]
 fn an_unknown_profile_is_refused_with_the_list() {
     cli()
-        .args(["validate", "-", "--profile", "XRechnung 9.9"])
+        .args(["validate", "-", "--require", "XRechnung 9.9"])
         .assert()
         .code(2)
         .stderr(contains("unknown profile"))
-        // The list offers the *slugs*, because those are what a person types.
+        // The list offers the slugs, which is what a person types.
         .stderr(contains("xrechnung-extension"))
-        .stderr(contains("peppol"));
+        .stderr(contains("peppol"))
+        // The library's message, unchanged.
+        .stderr(contains(
+            "XRechnung 9.9"
+                .parse::<&en16931::Profile>()
+                .unwrap_err()
+                .to_string(),
+        ));
 }
 
-/// A profile is selectable by the name that needs no quoting.
-///
-/// `--profile "XRechnung 3.0"` was the only spelling that worked, which is a
-/// selector every shell needs quoted and every person gets wrong once.
+/// A profile is selectable by a slug that needs no shell quoting.
 #[test]
 fn a_profile_is_selectable_by_slug_name_or_bt24() {
     let path = write_temp("slug.xml", &valid_ubl());
@@ -187,10 +197,15 @@ fn a_profile_is_selectable_by_slug_name_or_bt24() {
         en16931::profiles::XRECHNUNG.specification_id,
     ] {
         cli()
-            .args(["validate", file, "--profile", spelling, "--format", "json"])
+            .args(["validate", file, "--require", spelling, "--format", "json"])
             .assert()
             .stdout(contains("XRechnung 3.0"));
     }
+    // An alias is a spelling too.
+    cli()
+        .args(["validate", file, "--require", "bis3", "--format", "json"])
+        .assert()
+        .stdout(contains("Peppol BIS Billing 3.0"));
 }
 
 #[test]
@@ -206,9 +221,7 @@ fn a_conversion_round_trips_through_the_model() {
     let cii = String::from_utf8(cii).expect("UTF-8");
     assert!(cii.contains("CrossIndustryInvoice"));
 
-    // Reading it back gives a document that still validates — the conversion
-    // went through the semantic model, so this is a claim about meaning and not
-    // about element names.
+    // Reading it back gives a document that still validates.
     let back = write_temp("roundtrip.xml", &cii);
     cli()
         .args(["validate", back.to_str().unwrap()])
@@ -216,7 +229,44 @@ fn a_conversion_round_trips_through_the_model() {
         .success();
 }
 
-/// `--profile` on `convert` refuses to write a document that would be rejected.
+/// BT-8 crosses both ways in each syntax's own spelling: UBL's `35` (UNTDID
+/// 2005, actual delivery date) is CII's `29` (UNTDID 2475), and back.
+#[test]
+fn bt_8_converts_ubl_to_cii_to_ubl_in_each_syntaxs_code() {
+    let ubl = valid_ubl().replacen(
+        "<cac:AccountingSupplierParty>",
+        "<cac:InvoicePeriod><cbc:DescriptionCode>35</cbc:DescriptionCode></cac:InvoicePeriod>\
+         <cac:AccountingSupplierParty>",
+        1,
+    );
+    assert!(
+        ubl.contains("<cbc:DescriptionCode>35"),
+        "fixture changed shape"
+    );
+    let path = write_temp("bt8.xml", &ubl);
+    let cii = stdout(&["convert", path.to_str().unwrap(), "--to", "cii"]);
+    let codes = |xml: &str, tag: &str| -> Vec<String> {
+        xml.match_indices(&format!("<{tag}>"))
+            .map(|(i, m)| {
+                let rest = &xml[i + m.len()..];
+                rest[..rest.find('<').expect("closing tag")].to_owned()
+            })
+            .collect()
+    };
+    let in_cii = codes(&cii, "ram:DueDateTypeCode");
+    assert!(!in_cii.is_empty(), "BT-8 lost on the way to CII:\n{cii}");
+    assert!(in_cii.iter().all(|c| c == "29"), "{in_cii:?}"); // CEN CII list: 5 29 72
+
+    let cii_path = write_temp("bt8.cii.xml", &cii);
+    cli()
+        .args(["validate", cii_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let back = stdout(&["convert", cii_path.to_str().unwrap(), "--to", "ubl"]);
+    assert_eq!(codes(&back, "cbc:DescriptionCode"), ["35"]); // CEN UBL list: 3 35 432
+}
+
+/// `--require` on `convert` refuses to write a document that would be rejected.
 #[test]
 fn converting_for_a_profile_refuses_rather_than_writing_something_invalid() {
     let path = write_temp("valid.xml", &valid_ubl());
@@ -226,13 +276,175 @@ fn converting_for_a_profile_refuses_rather_than_writing_something_invalid() {
             path.to_str().unwrap(),
             "--to",
             "cii",
-            "--profile",
+            "--require",
             "XRechnung 3.0",
         ])
         .assert()
         .code(1)
         .stdout(predicates::str::is_empty()) // nothing half-written
         .stderr(contains("BR-DE-15"));
+}
+
+/// A conversion's writer entries are printed by kind: BT-110 summed from the
+/// breakdown is derived, not dropped, and the document is still written.
+#[test]
+fn a_derived_term_is_printed_as_derived() {
+    let mut inv = en16931_formats::read(valid_ubl().as_bytes())
+        .expect("readable")
+        .invoice;
+    inv.totals.vat_total = None;
+    let cii = en16931_formats::write_unchecked(&inv, en16931_formats::Syntax::Cii)
+        .expect("writable")
+        .xml;
+    let path = write_temp("no-bt110.xml", &cii);
+    cli()
+        .args(["convert", path.to_str().unwrap(), "--to", "ubl"])
+        .assert()
+        .success()
+        .stdout(contains("<Invoice"))
+        .stderr(contains("en16931: derived"))
+        .stderr(contains("BT-110"))
+        .stderr(contains("dropped").not());
+}
+
+/// A conversion that would lose a term is refused, naming it; `--allow-loss`
+/// converts and lists the same entries.
+#[test]
+fn a_lossy_conversion_is_refused_unless_allowed() {
+    let ubl = valid_ubl().replacen(
+        "<cac:AccountingSupplierParty>",
+        "<cac:BillingReference><cac:InvoiceDocumentReference><cbc:ID>A</cbc:ID>\
+         </cac:InvoiceDocumentReference></cac:BillingReference>\
+         <cac:BillingReference><cac:InvoiceDocumentReference><cbc:ID>B</cbc:ID>\
+         </cac:InvoiceDocumentReference></cac:BillingReference>\
+         <cac:AccountingSupplierParty>",
+        1,
+    );
+    let path = write_temp("two-bg3.xml", &ubl);
+    cli()
+        .args(["convert", path.to_str().unwrap(), "--to", "cii"])
+        .assert()
+        .code(1)
+        .stdout(predicates::str::is_empty())
+        .stderr(contains("would be lost"))
+        .stderr(contains("dropped"));
+    cli()
+        .args([
+            "convert",
+            path.to_str().unwrap(),
+            "--to",
+            "cii",
+            "--allow-loss",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("CrossIndustryInvoice"))
+        .stderr(contains("dropped"));
+}
+
+/// `--relevel` lowers a rule's severity, and the report says so.
+#[test]
+fn a_relevelled_rule_is_recorded() {
+    let path = write_temp("relevel.xml", &valid_ubl());
+    let out = stdout(&[
+        "validate",
+        path.to_str().unwrap(),
+        "--relevel",
+        "BR-CO-26=information",
+    ]);
+    assert!(out.contains("BR-CO-26"), "{out}");
+    cli()
+        .args(["validate", path.to_str().unwrap(), "--relevel", "BR-CO-26"])
+        .assert()
+        .code(2)
+        .stderr(contains("RULE=LEVEL"));
+    cli()
+        .args([
+            "validate",
+            path.to_str().unwrap(),
+            "--relevel",
+            "BR-CO-26=fatale",
+        ])
+        .assert()
+        .code(2)
+        .stderr(contains("use fatal, warning or information"));
+}
+
+/// ZUGFeRD MINIMUM is not an EN 16931 invoice: the answer is undefined, exit `1`.
+#[test]
+fn an_undefined_document_exits_one() {
+    let mut inv = en16931_formats::read(valid_ubl().as_bytes())
+        .expect("readable")
+        .invoice;
+    inv.specification_id = Some(en16931::profiles::ZUGFERD_MINIMUM_ID.to_owned());
+    inv.lines.clear();
+    let cii = en16931_formats::write_unchecked(&inv, en16931_formats::Syntax::Cii)
+        .expect("writable")
+        .xml;
+    let path = write_temp("minimum.xml", &cii);
+    cli()
+        .args(["validate", path.to_str().unwrap()])
+        .assert()
+        .code(1)
+        .stdout(contains("recommendation: undefined"))
+        .stdout(contains("totals only"));
+}
+
+/// SVRL carries every layer: a duplicated invoice number is a failed assert in
+/// this crate's namespace, beside the findings.
+#[test]
+fn svrl_carries_the_schema_layer() {
+    let ubl = valid_ubl().replacen(
+        "<cbc:ID>CLI-1</cbc:ID>",
+        "<cbc:ID>CLI-1</cbc:ID><cbc:ID>FORGED</cbc:ID>",
+        1,
+    );
+    assert!(ubl.contains("FORGED"), "fixture changed shape");
+    let path = write_temp("forged.xml", &ubl);
+    let out = cli()
+        .args(["validate", path.to_str().unwrap(), "--format", "svrl"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let xml = String::from_utf8(out).expect("UTF-8");
+    let doc = roxmltree::Document::parse(&xml).expect("well-formed SVRL");
+    assert!(
+        doc.descendants()
+            .any(|n| n.attribute("id") == Some("en16931:schema:duplicate")),
+        "{xml}"
+    );
+}
+
+/// The text rendering of a received document, pinned.
+#[test]
+fn the_text_output_is_pinned() {
+    let path = write_temp("golden.xml", &valid_ubl());
+    let out = stdout(&["validate", path.to_str().unwrap()]);
+    let body = out
+        .split_once('\n')
+        .map(|(_, rest)| rest)
+        .expect("a path line first");
+    assert_eq!(
+        body,
+        format!(
+            "recommendation: accept\n\
+             declared: EN 16931\n\
+             document: Seller GmbH — invoice CLI-1 of 2026-07-31\n\
+             rule set: EN 16931 (CEN {v})\n\
+             most severe: nothing to report\n\
+             container  valid\n\
+             syntax     valid\n\
+             schema     valid\n\
+             semantic   valid\n\
+             \x20 EN 16931 validation (EN 16931-1:2017+A1:2019) — 227 rule(s) checked, 0 finding(s), valid\n\
+             \x20   verified against: CEN {v}\n\
+             \x20   ({a})\n",
+            v = en16931::ARTEFACT_VERSION,
+            a = en16931::ATTRIBUTION
+        )
+    );
 }
 
 #[test]
@@ -257,11 +469,27 @@ fn json_output_carries_the_versioned_schema() {
         .stdout
         .clone();
     let value: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
-    assert_eq!(value["schema"], en16931::report::SCHEMA);
-    assert_eq!(value["valid"], true);
-    // Always an array, even for one document — a consumer must not have to
-    // branch on the shape of the top level.
-    assert_eq!(value["documents"].as_array().map(Vec::len), Some(1));
+    // Always an array of the interchange shape, even for one document.
+    let docs = value.as_array().expect("an array");
+    assert_eq!(docs.len(), 1);
+    let doc = &docs[0];
+    assert_eq!(doc["schema"], en16931::report::SCHEMA);
+    assert_eq!(doc["valid"], true);
+    assert_eq!(doc["recommendation"], "accept");
+    assert_eq!(doc["source"], path.to_str().unwrap());
+    let layers: Vec<&str> = doc["layers"]
+        .as_array()
+        .expect("layers")
+        .iter()
+        .filter_map(|l| l["name"].as_str())
+        .collect();
+    assert_eq!(layers, ["container", "syntax", "schema", "semantic"]);
+    // It reads back as the library's type.
+    let back: Vec<en16931::report::Report> = serde_json::from_slice(&out).expect("the schema");
+    assert_eq!(
+        back[0].identity.as_ref().and_then(|i| i.number.as_deref()),
+        Some("CLI-1")
+    );
 }
 
 #[test]
@@ -281,8 +509,7 @@ fn svrl_output_is_well_formed() {
     roxmltree::Document::parse(&xml).expect("well-formed SVRL");
 }
 
-/// SVRL is a validation report format, so asking `inspect` for one is a mistake
-/// worth naming rather than an empty file worth debugging.
+/// `inspect` refuses SVRL, which is a validation report format.
 #[test]
 fn inspect_refuses_svrl_and_says_why() {
     cli()
@@ -300,7 +527,7 @@ fn suppressions_are_recorded_in_the_output() {
         .args([
             "validate",
             path.to_str().unwrap(),
-            "--profile",
+            "--require",
             "XRechnung 3.0",
             "--without",
             "BR-DE-15",
@@ -312,9 +539,11 @@ fn suppressions_are_recorded_in_the_output() {
 
 #[test]
 fn explain_resolves_rules_restrictions_and_every_spelling() {
-    for query in ["BR-CO-14", "br-co-3", "BR-IG-1"] {
+    for query in ["BR-CO-14", "br-co-3", "br-af-1"] {
         cli().args(["explain", query]).assert().success();
     }
+    // No family is mapped onto another.
+    cli().args(["explain", "BR-IG-1"]).assert().failure();
     // A restriction is not a rule and still appears in reports under its id.
     cli()
         .args(["explain", "BR-DE-3"])
@@ -336,8 +565,9 @@ fn profiles_lists_what_this_build_can_check() {
         .assert()
         .success()
         .stdout(contains("XRechnung 3.0"))
+        .stdout(contains("zugferd-basic-wl"))
         .stdout(contains(en16931::ARTEFACT_VERSION))
-        // The licence condition travels with every user-visible surface.
+        // The licence attribution appears on every user-visible surface.
         .stdout(contains(en16931::ATTRIBUTION));
 }
 
@@ -353,16 +583,16 @@ fn a_batch_run_names_every_document_and_fails_on_the_worst() {
         .args(["validate", good.to_str().unwrap(), bad.to_str().unwrap()])
         .assert()
         .code(1)
-        .stdout(contains("2 document(s), 1 invalid"));
+        .stdout(contains(
+            "2 document(s): 1 accepted, 1 rejected, 0 undefined",
+        ));
 }
 
-/// `--strict` promotes advisories, and the default deliberately does not.
+/// `--strict` promotes advisories; the default does not.
 #[test]
 fn strict_turns_advisories_into_failures() {
-    // `BR-51` is the one warning in CEN's whole abstract model: an invoice
-    // should never carry a full card PAN. The document stays valid, which is
-    // exactly the case `--strict` exists for.
-    let mut inv = en16931_formats::ubl::from_str(&valid_ubl())
+    // `BR-51` (no full card PAN) is a warning: the document stays valid.
+    let mut inv = en16931_formats::read(valid_ubl().as_bytes())
         .expect("readable")
         .invoice;
     inv.payment = Some(en16931::invoice::PaymentInstructions {
@@ -375,7 +605,12 @@ fn strict_turns_advisories_into_failures() {
         )),
         ..Default::default()
     });
-    let path = write_temp("full-pan.xml", &en16931_formats::ubl::to_string(&inv));
+    let path = write_temp(
+        "full-pan.xml",
+        &en16931_formats::write_unchecked(&inv, en16931_formats::Syntax::Ubl)
+            .expect("writable")
+            .xml,
+    );
 
     cli()
         .args(["validate", path.to_str().unwrap()])
@@ -390,12 +625,8 @@ fn strict_turns_advisories_into_failures() {
         .stdout(contains("BR-51"));
 }
 
-/// The rule catalogue is derived from the registry, so it cannot drift from
-/// what the validator runs — **including the restrictions**.
-///
-/// Listing the rules alone would print 270 of XRechnung's 282 checks, and the
-/// twelve missing would be the German narrowings every counterparty quotes — so
-/// the comparison is against `check_ids()`, not against `extra_rules`.
+/// The rule catalogue is derived from the registry, restrictions included:
+/// it is compared against `check_ids()`, not `extra_rules`.
 #[test]
 fn the_catalogue_matches_what_each_profile_actually_runs() {
     let total = |args: &[&str]| -> usize {
@@ -406,9 +637,8 @@ fn the_catalogue_matches_what_each_profile_actually_runs() {
             .unwrap_or_else(|| panic!("no count in:\n{text}"))
     };
 
-    // One number, from two commands: the catalogue's total is exactly
-    // `check_ids()`, which is what `profiles` prints in its CHECKS column and
-    // what a report prints as `rule(s) checked`.
+    // The catalogue's total is exactly `check_ids()`, as `profiles` and a
+    // report print it.
     for p in en16931::profiles::ALL {
         assert_eq!(
             total(&["rules", "--profile", p.id]),
@@ -418,8 +648,7 @@ fn the_catalogue_matches_what_each_profile_actually_runs() {
         );
     }
 
-    // And the restrictions are there by id, in both shapes, because a user
-    // grepping the catalogue for `BR-DE-15` is the case this exists for.
+    // The restrictions are there by id, in both shapes.
     let text = stdout(&["rules", "--profile", "XRechnung 3.0"]);
     for id in ["BR-DE-1", "BR-DE-15", "BR-DE-17", "BR-DE-21"] {
         assert!(text.contains(id), "{id} missing from the text catalogue");
@@ -437,11 +666,8 @@ fn the_catalogue_matches_what_each_profile_actually_runs() {
 
 /// An id that names two rules does not get one severity in the header.
 ///
-/// `PEPPOL-EN16931-R120` is Peppol's rule, *fatal*, and it is also XRechnung's,
-/// which KoSIT's build rewrites to *warning* on the way in — same id, same
-/// text, different consequence. Printing whichever instance the registry meets
-/// first would answer a Peppol document with the German severity, which is the
-/// opposite of the question being asked.
+/// `PEPPOL-EN16931-R120` is fatal for Peppol and a warning in XRechnung (as
+/// KoSIT publishes it): same id and text, different consequence.
 #[test]
 fn a_rule_with_two_instances_reports_both() {
     let text = stdout(&["explain", "PEPPOL-EN16931-R120"]);
@@ -472,28 +698,21 @@ fn a_rule_with_one_severity_says_so_plainly() {
     assert!(text.contains("run by: EN 16931, XRechnung 3.0,"), "{text}");
 }
 
-/// A restriction says which profiles run it and at what severity.
-///
-/// Printing the narrowing and stopping leaves *"why did `BR-DE-17` not reject
-/// my invoice?"* unanswered — and the answer is that KoSIT publishes it at
-/// warning, because a lawful EN 16931 type code XRechnung does not admit is a
-/// scoping question rather than a malformed document.
+/// A restriction says which profiles run it and at what severity (KoSIT
+/// publishes `BR-DE-17` at warning).
 #[test]
 fn a_restriction_reports_the_severity_each_profile_runs_it_at() {
     let text = stdout(&["explain", "BR-DE-17"]);
     assert!(text.contains("[restriction]"), "{text}");
     assert!(text.contains("XRechnung 3.0 (warning)"), "{text}");
 
-    // …and one nobody re-levels still says fatal rather than saying nothing.
+    // …and one nobody re-levels says fatal.
     let text = stdout(&["explain", "BR-DE-3"]);
     assert!(text.contains("XRechnung 3.0 (fatal)"), "{text}");
 }
 
-/// `--profile` reports the severity that profile uses, not the rule's own.
-///
-/// This is the whole XRechnung finding, made greppable: `BR-CL-23` is fatal in
-/// the core model and a warning under the German CIUS, because KoSIT's validator
-/// configuration says so.
+/// `--profile` reports the severity that profile uses, not the rule's own:
+/// `BR-CL-23` is fatal in core and a warning under XRechnung.
 #[test]
 fn the_catalogue_reports_the_profiles_own_severity() {
     let row = |args: &[&str]| -> String {
@@ -555,18 +774,14 @@ fn completions_and_a_man_page_can_be_generated() {
         .stdout(contains(".TH en16931 1"));
 }
 
-/// A closed pipe is not an error, and printing a Rust backtrace into one is not
-/// what any other command-line tool does.
-///
-/// `println!` panics on `BrokenPipe`, which is why every command now builds its
-/// output into a `String` and hands it to one sink that knows to stay quiet.
+/// A closed pipe is not an error: all output goes through one sink that treats
+/// `BrokenPipe` as success.
 #[test]
 fn a_closed_pipe_is_silent() {
-    // `assert_cmd` gives no pipe to close, so the property is asserted where it
-    // is decided: the sink must treat `BrokenPipe` as success.
+    // `assert_cmd` gives no pipe to close, so the sink's decision is asserted.
     let e = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
     assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe);
-    // And nothing in the crate reaches stdout except through that sink.
+    // Nothing in the crate reaches stdout except through that sink.
     let src = include_str!("../src/output.rs");
     assert!(
         !src.contains("println!") && !src.contains("print!("),
@@ -576,22 +791,11 @@ fn a_closed_pipe_is_silent() {
 
 // ── hostile input ────────────────────────────────────────────────────────────
 
-/// A document nobody would write must be **refused**, not fatal.
+/// A hostile document is refused with a rejection naming the cause, never an
+/// abort.
 ///
-/// This command is pointed at files the user did not author, so the interesting
-/// inputs are the ones designed to hurt. All three below once produced, or would
-/// have produced, something other than "I could not read that":
-///
-/// * **Nesting.** `roxmltree` recurses per level and overflows the stack at a
-///   few hundred. That is not a panic — it aborts the process, exit `134`, with
-///   no report and nothing for `?` to catch. It is now refused before parsing.
-/// * **Billion laughs** and **XXE.** Both need a DTD, and the parser rejects any
-///   document carrying one; asserted here so a future parser swap cannot quietly
-///   re-open them.
-///
-/// The assertion that matters in every case is `code(2)` — *"could not read
-/// it"* — because the whole point of the exit codes is that a pipeline can tell
-/// that from *"this invoice is wrong"*.
+/// * Deep nesting is refused before parsing (`roxmltree` recurses per level).
+/// * Billion laughs and XXE need a DTD, and any DTD is rejected.
 #[test]
 fn hostile_documents_are_refused_rather_than_fatal() {
     let ns = "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2";
@@ -604,11 +808,10 @@ fn hostile_documents_are_refused_rather_than_fatal() {
             "</a>".repeat(5_000)
         ),
     );
-    cli()
-        .args(["validate", deep.to_str().unwrap()])
+    watched(&["validate", deep.to_str().unwrap()])
         .assert()
-        .code(2)
-        .stderr(contains("nested"));
+        .code(1)
+        .stdout(contains("nested"));
 
     let laughs = write_temp(
         "hostile-laughs.xml",
@@ -621,11 +824,10 @@ fn hostile_documents_are_refused_rather_than_fatal() {
                 .join("\n")
         ),
     );
-    cli()
-        .args(["validate", laughs.to_str().unwrap()])
+    watched(&["validate", laughs.to_str().unwrap()])
         .assert()
-        .code(2)
-        .stderr(contains("DTD"));
+        .code(1)
+        .stdout(contains("DTD"));
 
     let xxe = write_temp(
         "hostile-xxe.xml",
@@ -635,21 +837,16 @@ fn hostile_documents_are_refused_rather_than_fatal() {
              <Invoice xmlns=\"{ns}\"><ID>&xxe;</ID></Invoice>"
         ),
     );
-    cli()
-        .args(["validate", xxe.to_str().unwrap()])
+    watched(&["validate", xxe.to_str().unwrap()])
         .assert()
-        .code(2)
-        .stderr(contains("DTD"));
+        .code(1)
+        .stdout(contains("DTD"));
 }
 
 // ── diff ─────────────────────────────────────────────────────────────────────
 
-/// The claim the subcommand exists to make: **crossing syntaxes is not a change.**
-///
-/// A textual diff of these two files shares almost nothing — different root
-/// element, different namespaces, different names for every field. As invoices
-/// they are the same invoice, and that is the question a person converting a
-/// document actually has.
+/// Crossing syntaxes is not a change: the UBL and CII forms of one invoice
+/// compare equal as models.
 #[test]
 fn the_same_invoice_in_two_syntaxes_is_identical() {
     let ubl = write_temp("diff-ubl.xml", &valid_ubl());
@@ -670,12 +867,8 @@ fn the_same_invoice_in_two_syntaxes_is_identical() {
     let _ = std::fs::remove_file(&cii);
 }
 
-/// A scale difference is not a difference.
-///
-/// UBL writes BT-152 as `25.0` where CII writes `25`, and the model holds those
-/// to be one value — `Percentage` compares by value in `Eq`, `Ord` and `Hash`.
-/// The first real conversion this was run against reported three differences
-/// and every one of them was this, so it is pinned rather than remembered.
+/// A scale difference is not a difference: UBL's `25.0` and CII's `25` for
+/// BT-152 are one `Percentage`.
 #[test]
 fn a_trailing_zero_is_not_a_difference() {
     let a = write_temp("diff-scale-a.xml", &valid_ubl());
@@ -709,8 +902,7 @@ fn a_changed_field_is_reported_and_exits_one() {
         .stdout(contains("\"Musterstadt\" → \"Nirgendwo\""));
 }
 
-/// `1` is "they differ" and `2` is "I could not read one" — the same split
-/// `validate` makes, and for the same reason.
+/// `1` is "they differ" and `2` is "could not read one", as in `validate`.
 #[test]
 fn an_unreadable_side_exits_two_not_one() {
     let a = write_temp("diff-ok.xml", &valid_ubl());
@@ -747,7 +939,7 @@ fn the_json_diff_is_machine_readable() {
     assert_eq!(v["identical"], serde_json::json!(false));
     let d = &v["differences"][0];
     assert_eq!(d["change"], serde_json::json!("~"));
-    // A `String`, not a `"\"Musterstadt\""`.
+    // A `String`, not a JSON-encoded string.
     assert!(d["left"].is_string(), "left is a value, not a JSON blob");
 }
 
@@ -771,13 +963,8 @@ fn svrl_is_refused_for_a_comparison() {
 
 // ── categories ───────────────────────────────────────────────────────────────
 
-/// The pre-flight has the same three answers as `validate`, and they are the
-/// part a pipeline builds on.
-///
-/// `0` they may share a document · `1` they may not · `2` that is not a
-/// category. A caller that cannot tell "these cannot be billed together" from
-/// "you typed a code that does not exist" will eventually treat a typo as a
-/// business rule.
+/// The pre-flight has the same three answers as `validate`: `0` they may share
+/// a document, `1` they may not, `2` not a category.
 #[test]
 fn categories_exit_codes_are_the_same_three_as_validate() {
     cli().args(["categories", "S", "Z"]).assert().success();
@@ -791,10 +978,8 @@ fn categories_exit_codes_are_the_same_three_as_validate() {
     cli().args(["categories", "S", "X"]).assert().code(2);
 }
 
-/// A refusal names the categories in full, not only their codes.
-///
-/// `O` is *not* "other", and a caller who read it that way has made exactly the
-/// mistake this command exists to catch — which only the name shows.
+/// A refusal names the categories in full, not only their codes (`O` is not
+/// "other").
 #[test]
 fn categories_are_named_not_only_coded() {
     cli()
@@ -823,4 +1008,279 @@ fn the_municipal_case_is_refused_with_its_reason_and_its_way_out() {
         .code(1)
         .stdout(contains("REFUSED"))
         .stdout(contains("own document"));
+}
+
+/// A PDF from raw object bodies, numbered from 1, with a computed
+/// cross-reference table. Object 1 is the catalogue.
+fn raw_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+/// A small PDF whose embedded-files tree lists itself as its own child:
+/// `validate` rejects it and `extract` refuses it, promptly and saying why.
+#[test]
+fn a_hostile_pdf_is_refused_promptly_with_its_cause() {
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles 5 0 R >> >>",
+        "<< /Type /Pages /Count 0 /Kids [] >>",
+        "<< /Type /Filespec /F (factur-x.xml) /EF << /F 4 0 R >> >>",
+        "<< /Length 27 >>\nstream\n<rsm:CrossIndustryInvoice/>\nendstream",
+        "<< /Names [(factur-x.xml) 3 0 R] /Kids [5 0 R 5 0 R] >>",
+    ]
+    .map(|o| o.as_bytes().to_vec());
+    let pdf = raw_pdf(&objects);
+    let path = write_temp_bytes("cyclic.pdf", &pdf);
+
+    watched(&["validate", path.to_str().expect("UTF-8 path")])
+        .assert()
+        .code(1)
+        .stdout(contains("container  INVALID"))
+        .stdout(contains("refers back to itself"));
+    watched(&["extract", path.to_str().expect("UTF-8 path")])
+        .assert()
+        .code(2)
+        .stderr(contains("refers back to itself"));
+}
+
+/// A zlib stream that inflates to `1 + 258 * n` zero bytes: one literal, then
+/// fixed-Huffman length-258 / distance-1 matches, about 160:1.
+fn zlib_zeros(n: usize) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01];
+    let (mut acc, mut bits) = (0_u32, 0_u32);
+    let mut put = |value: u32, width: u32, out: &mut Vec<u8>| {
+        acc |= value << bits;
+        bits += width;
+        while bits >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            bits -= 8;
+        }
+    };
+    // Huffman codes go most-significant bit first.
+    let code = |c: u32, width: u32| c.reverse_bits() >> (32 - width);
+    put(1, 1, &mut out); // BFINAL
+    put(1, 2, &mut out); // fixed Huffman
+    put(code(0x30, 8), 8, &mut out); // literal 0
+    for _ in 0..n {
+        put(code(0xC5, 8), 8, &mut out); // length 258
+        put(0, 5, &mut out); // distance 1
+    }
+    put(0, 7, &mut out); // end of block
+    put(0, 7, &mut out); // pad to a byte
+    let len = 1 + 258 * n;
+    let adler = (((len % 65_521) as u32) << 16) | 1;
+    out.extend_from_slice(&adler.to_be_bytes());
+    out
+}
+
+/// An invoice that inflates past the per-stream limit is rejected by
+/// `validate` and refused by `extract`, naming the stream and the limit.
+///
+/// Run with limits lowered to 1 MiB / 2 MiB and a 4 MiB bomb, under the
+/// watchdog; the default limits are covered by the library's suite.
+#[test]
+fn a_pdf_over_the_inflation_limit_is_refused_naming_the_limit() {
+    let bomb = zlib_zeros(4 * 1024 * 1024 / 258);
+    let mut invoice = format!(
+        "<< /Filter /FlateDecode /Length {} >>\nstream\n",
+        bomb.len()
+    )
+    .into_bytes();
+    invoice.extend_from_slice(&bomb);
+    invoice.extend_from_slice(b"\nendstream");
+    let objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(factur-x.xml) 3 0 R] >> >> >>".to_vec(),
+        b"<< /Type /Pages /Count 0 /Kids [] >>".to_vec(),
+        b"<< /Type /Filespec /F (factur-x.xml) /EF << /F 4 0 R >> >>".to_vec(),
+        invoice,
+    ];
+    let path = write_temp_bytes("bomb.pdf", &raw_pdf(&objects));
+    let path = path.to_str().expect("UTF-8 path");
+    let small = [
+        "--max-stream-bytes",
+        "1048576",
+        "--max-total-bytes",
+        "2097152",
+    ];
+
+    watched(&[&["validate", path][..], &small].concat())
+        .assert()
+        .code(1)
+        .stdout(contains("factur-x.xml"))
+        .stdout(contains("1048576"));
+    watched(&[&["extract", path][..], &small].concat())
+        .assert()
+        .code(2)
+        .stderr(contains("factur-x.xml"))
+        .stderr(contains("1048576"));
+    // The limits are the caller's to lower.
+    watched(&["extract", path, "--max-stream-bytes", "1024"])
+        .assert()
+        .code(2)
+        .stderr(contains("1024"));
+}
+
+// ── embed ────────────────────────────────────────────────────────────────────
+
+/// A PDF/A-`part` file with one blank page, its cross-reference table computed.
+fn blank_pdfa(part: &str) -> Vec<u8> {
+    let xmp = format!(
+        "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\
+<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+<rdf:Description rdf:about=\"\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\" pdfaid:part=\"{part}\" pdfaid:conformance=\"B\"/>\
+</rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+    );
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>".to_owned(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> >>".to_owned(),
+        format!(
+            "<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n{xmp}\nendstream",
+            xmp.len()
+        ),
+    ];
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for off in offsets {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /ID [<00112233445566778899AABBCCDDEEFF> <00112233445566778899AABBCCDDEEFF>] >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn embed_writes_a_hybrid_pdf_that_extract_reads_back() {
+    let pdf = write_temp_bytes("blank.pdf", &blank_pdfa("3"));
+    let invoice = write_temp("embed.xml", &valid_ubl());
+    let out = std::env::temp_dir().join(format!("en16931-cli-{}-embedded.pdf", std::process::id()));
+    cli()
+        .args(["embed"])
+        .arg(&pdf)
+        .arg(&invoice)
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .success();
+    let xml = stdout(&["extract", out.to_str().unwrap()]);
+    assert!(xml.contains("CrossIndustryInvoice"), "{xml}");
+    assert!(xml.contains("CLI-1"));
+    // `extract` prints divergences to stderr; there are none.
+    cli()
+        .args(["extract", out.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr("");
+}
+
+#[test]
+fn embed_takes_the_json_envelope_and_an_explicit_profile() {
+    let model = en16931::examples::for_profile(&en16931::profiles::XRECHNUNG).expect("shipped");
+    let json = serde_json::to_string(&model).expect("serialises");
+    let pdf = write_temp_bytes("blank.pdf", &blank_pdfa("3"));
+    let invoice = write_temp("embed.json", &json);
+    let out = std::env::temp_dir().join(format!("en16931-cli-{}-xr.pdf", std::process::id()));
+    cli()
+        .args([
+            "embed",
+            "--profile",
+            "xrechnung",
+            "--relationship",
+            "source",
+        ])
+        .arg(&pdf)
+        .arg(&invoice)
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .success();
+    let bytes = std::fs::read(&out).expect("written");
+    let got =
+        en16931_formats::zugferd::extract(&bytes, &en16931_formats::zugferd::Limits::default())
+            .expect("reads back");
+    assert_eq!(got.filename, "xrechnung.xml");
+    assert_eq!(got.relationship.as_deref(), Some("Source"));
+}
+
+#[test]
+fn embed_refuses_with_exit_one_and_misuse_with_two() {
+    let invoice = write_temp("embed.xml", &valid_ubl());
+    let out = std::env::temp_dir().join(format!("en16931-cli-{}-never.pdf", std::process::id()));
+    // Not PDF/A-3: refused, nothing converted.
+    let pdf2 = write_temp_bytes("pdfa2.pdf", &blank_pdfa("2"));
+    cli()
+        .arg("embed")
+        .arg(&pdf2)
+        .arg(&invoice)
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .code(1)
+        .stderr(contains("PDF/A-2"));
+    // An invoice that is not valid under its profile.
+    let pdf = write_temp_bytes("blank.pdf", &blank_pdfa("3"));
+    let invalid = write_temp("invalid.xml", &valid_ubl().replace("CLI-1", ""));
+    cli()
+        .arg("embed")
+        .arg(&pdf)
+        .arg(&invalid)
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .code(1)
+        .stderr(contains("not valid"));
+    // A profile with no ZUGFeRD carrier.
+    cli()
+        .args(["embed", "--profile", "peppol"])
+        .arg(&pdf)
+        .arg(&invoice)
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .code(1)
+        .stderr(contains("no ZUGFeRD"));
+    // A file that does not exist.
+    cli()
+        .args(["embed", "/nonexistent/x.pdf"])
+        .arg(&invoice)
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .code(2);
+    assert!(!out.exists(), "nothing is written on a refusal");
 }

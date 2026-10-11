@@ -1,0 +1,66 @@
+# cargo-mutants configuration — https://mutants.rs/
+# Run through the justfile: `just mutants-diff` (the lines a change touches),
+# `just mutants` for the full sweep. Schema: `cargo mutants --emit-schema=config`.
+#
+# Local and optional; not run in CI. The full sweep is manual — `just mutants`,
+# or the `mutants.yml` workflow — and slow. Survivors and their reasons live in
+# `.cargo/mutants-baseline.txt`.
+
+# Every feature: `zugferd`, `serde` and `svrl` gate code that is mutated and tested.
+all_features = true
+
+# Mutants produce dead code and unused bindings; do not score them "unviable" for
+# warnings. The crates' own `-D warnings` gates run in CI.
+cap_lints = true
+
+# Every crate's tests run against every mutant. The rules live in `en16931`, but
+# CEN's conformance suite and the reader suites that exercise them live in
+# `en16931-formats`, so testing only the mutated package would miss the
+# strongest tests.
+test_workspace = true
+
+# The justfile recipes pass `--timeout 120`, which overrides the floor and the
+# multiplier below; those apply to a bare `cargo mutants`. A mutant that makes a
+# hostile-input test walk forever or inflate a bomb is stopped sooner, by that
+# test's own watchdog (512 MiB / 10 s, in a child process), and counts as
+# caught. The recipes run one job at a time (`--jobs 1`).
+minimum_test_timeout = 60
+timeout_multiplier = 3.0
+
+# `with_capacity` argument mutants only change reallocation counts; no test can
+# catch them.
+skip_calls_defaults = true
+
+# No debuginfo, no incremental state — `[profile.mutants]` in Cargo.toml.
+profile = "mutants"
+
+# Only the fast suites run against a mutant, so one costs seconds, not minutes:
+# the recipes point `EN16931_REFERENCE` at a directory that does not exist, so
+# the suites that need the reference corpus (conformance, the authority corpus,
+# the schema gate) skip, and the veraPDF gate — a Docker container, a minute a
+# run, at which cost it scored survivors as timeouts — is skipped by name.
+# Doctests are left out too. CI runs every one of them on every change; they
+# are not lost, only not re-run per mutant.
+additional_cargo_test_args = [
+    "--lib",
+    "--tests",
+    "--",
+    "--skip",
+    "every_embedded_file_is_pdf_a_3b_by_verapdf",
+]
+
+# Excluded by file, never by pattern (no `exclude_re`: an exclusion regex outlives
+# the code it was written for). Generated tables are byte-for-byte checked against
+# the artefacts by `cargo xtask check`; a mutant of one tests nothing the
+# generator does not. `xtask` is the generator itself and `cargo xtask check` is
+# its test.
+exclude_globs = [
+    "crates/en16931/src/codes/generated.rs",
+    "crates/en16931-formats/src/ubl/order.rs",
+    "crates/en16931-formats/src/ubl/once.rs",
+    "crates/en16931-formats/src/ubl/prohibitions_generated.rs",
+    "crates/en16931-formats/src/cii/order.rs",
+    "crates/en16931-formats/src/cii/once.rs",
+    "crates/en16931-formats/src/cii/prohibitions_generated.rs",
+    "xtask/**",
+]

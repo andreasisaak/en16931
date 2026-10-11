@@ -1,53 +1,17 @@
-//! Formatting that cannot print a value that is not the value.
+//! `Display` helpers that never truncate or round a value.
 //!
-//! # `Formatter::pad` truncates, and every type here used it
+//! Unlike [`core::fmt::Formatter::pad`], which truncates to `precision`
+//! characters (`{:.2}` on `1190.00` would print `11`):
 //!
-//! [`core::fmt::Formatter::pad`] is the standard helper for a `Display` that
-//! produces a string: it honours width, fill and alignment, and — because that
-//! is what precision means for a *string* — it also truncates to
-//! `precision` **characters**. Every `Display` in this crate called it.
-//!
-//! ```text
-//! format!("{:.2}", InvoiceAmount::parse("1190.00")?)   →  "11"
-//! format!("{:>12.4}", InvoiceAmount::parse("1190.00")?)   →  "        1190"
-//! format!("{:.4}", Date::parse("2026-07-31")?)         →  "2026"
-//! ```
-//!
-//! A caller writing `{:.2}` to get two decimal places got eleven euros. Not a
-//! layout defect — a **wrong number**, right-aligned in a column, in the one
-//! place a person reads it. This crate refuses to round an amount at a
-//! boundary; printing one at a hundredth of its value is the same failure with
-//! a worse blast radius, and it was reachable from ordinary formatting syntax.
-//!
-//! So nothing here truncates. Two helpers:
-//!
-//! * [`padded`] — width, fill and alignment, and precision **ignored**. For
-//!   values where precision has no meaning: a date, a code, a rule id, a path.
-//!   A truncated `BG-25[2]/BT-151` is not a shorter path, it is a different one.
-//! * [`number`] — the same, with precision read as a **minimum** number of
-//!   fraction digits.
-//!
-//! # Why precision is a minimum and not an exact count
-//!
-//! For an `f64`, `{:.2}` rounds, and that is unremarkable because an `f64` was
-//! never exact. These types are exact on purpose, and the crate's whole argument
-//! is that an amount which does not fit two decimals is an error rather than a
-//! rounding opportunity ([`crate::InvoiceAmount::parse`]). A `Display` that
-//! quietly rounded would put a number on an invoice that differs from the number
-//! the invoice states — which is the failure the type system here exists to
-//! prevent, arriving through the formatter instead.
-//!
-//! So `{:.4}` on `1190.00` is `1190.0000`, and `{:.0}` is still `1190.00`.
-//! Padding is lossless and truncation is not, so only one of them happens.
-//! Callers who genuinely want a rounded presentation have
-//! [`rust_decimal::Decimal::round_dp`] and the exact value to apply it to.
+//! * [`padded`] honours width, fill and alignment and ignores precision (dates,
+//!   codes, paths);
+//! * [`number`] reads precision as a minimum number of fraction digits:
+//!   `{:.4}` on `1190.00` is `1190.0000`, `{:.0}` is still `1190.00`. Round
+//!   with [`rust_decimal::Decimal::round_dp`] if you need to.
 
 use core::fmt;
 
-/// Write `s` honouring width, fill and alignment — and **never** precision.
-///
-/// [`Formatter::pad`](core::fmt::Formatter::pad) with its one dangerous
-/// behaviour removed. See the [module documentation](self).
+/// Write `s` honouring width, fill and alignment, ignoring precision.
 pub fn padded(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
     let Some(width) = f.width() else {
         return f.write_str(s);
@@ -57,10 +21,7 @@ pub fn padded(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
         return f.write_str(s);
     }
     let pad = width - len;
-    // `Default` matches `Formatter::pad`'s: a value rendered as a string aligns
-    // left unless asked otherwise. Preserved rather than improved, because
-    // changing the default alignment of every type in the crate is a separate
-    // decision from not corrupting the value.
+    // Left by default, as `Formatter::pad` does.
     let (before, after) = match f.align() {
         Some(fmt::Alignment::Right) => (pad, 0),
         Some(fmt::Alignment::Center) => (pad / 2, pad - pad / 2),
@@ -77,11 +38,10 @@ pub fn padded(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
     Ok(())
 }
 
-/// As [`padded`], reading precision as a **minimum** number of fraction digits.
+/// As [`padded`], reading precision as a minimum number of fraction digits.
 ///
-/// `value` must already be the canonical rendering — `"1190.00"`, `"19"`,
-/// `"0.28901"`. Zeros are appended to reach the requested scale and nothing is
-/// ever removed; see the [module documentation](self) for why.
+/// `value` is the canonical rendering (`"1190.00"`, `"19"`, `"0.28901"`);
+/// zeros are appended to reach the requested scale, nothing is removed.
 pub fn number(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
     let Some(want) = f.precision() else {
         return padded(f, value);
@@ -106,9 +66,7 @@ mod tests {
     use crate::{Date, InvoiceAmount, Percentage, Quantity, UnitPriceAmount};
     use rust_decimal::dec;
 
-    /// `{:.n}` is a minimum width for these types, never a truncation:
-    /// `Formatter::pad` would cut `1190.00` to `11`, which is a different
-    /// amount.
+    /// `{:.n}` is a minimum scale, never a truncation.
     #[test]
     fn precision_never_truncates_a_value() {
         let a = InvoiceAmount::parse("1190.00").expect("amount");
@@ -118,7 +76,7 @@ mod tests {
         assert_eq!(format!("{a:>12.4}"), "   1190.0000");
 
         let d = Date::parse("2026-07-31").expect("date");
-        assert_eq!(format!("{d:.4}"), "2026-07-31", "was \"2026\"");
+        assert_eq!(format!("{d:.4}"), "2026-07-31");
         assert_eq!(format!("{d:.2}"), "2026-07-31");
     }
 
@@ -138,7 +96,6 @@ mod tests {
         );
     }
 
-    /// Width, fill and alignment are unchanged — they were never the problem.
     #[test]
     fn width_fill_and_alignment_still_behave() {
         let a = InvoiceAmount::parse("1.00").expect("amount");

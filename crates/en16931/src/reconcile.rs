@@ -1,49 +1,22 @@
-//! Deriving BG-23 and BG-22 from the lines — the arithmetic every hand-mapper
-//! otherwise re-implements.
-//!
-//! # Why this is in the model crate and not in `billing`
-//!
-//! `billing` computes an invoice *forwards*: quantities and prices in, positions
-//! and tax layers out. An ERP that already has its own engine does not want a
-//! second one — it has the numbers. What it does not have is EN 16931's
-//! **presentation** of them: which rows form one BG-23 group, whether a category
-//! states a rate at all, which of BT-107 and BT-108 must be absent rather than
-//! zero, and where the rounding goes.
-//!
-//! That is not arithmetic, it is the standard's own bookkeeping, and every
-//! hand-mapper re-derives it from the rule texts. `BR-CO-10` … `BR-CO-16`, the
-//! `-08` and `-09` rows of all nine category families, and `BR-CO-18` are one
-//! function.
+//! Deriving BG-23 (VAT breakdown) and BG-22 (document totals) from the lines,
+//! allowances and charges: `BR-CO-10` … `BR-CO-16` and the `-08` / `-09` rows of
+//! every VAT category family.
 //!
 //! ```
 //! use en16931::{Invoice, InvoiceAmount, validate};
 //! use en16931::reconcile::Reconciler;
 //!
 //! # fn demo(mut inv: Invoice) -> Result<(), Box<dyn std::error::Error>> {
-//! // The lines, the parties and the allowances are yours. BG-23 and BG-22 are
-//! // not: they are a function of the lines, and this computes that function.
 //! Reconciler::new().apply(&mut inv)?;
 //!
 //! assert!(validate(&inv).fatal().all(|f| !f.rule.starts_with("BR-CO-1")));
 //! # Ok(()) }
 //! ```
 //!
-//! # Where it stops, on purpose
-//!
-//! It computes the amounts. It does **not** invent a BT-120 exemption reason
-//! (`BR-E-10` and its four siblings require one, and only the seller knows what
-//! it is — see [`Reconciler::exemption`]), a due date, or a VAT identifier.
-//! Reconciling and validating are different jobs; run [`crate::validate`]
-//! afterwards, because a reconciled invoice is *arithmetically* consistent and
-//! nothing more.
-//!
-//! # It does not disagree with the validator
-//!
-//! Grouping comes from [`crate::validation::rules::category::profile`] — the
-//! same table the `-08` rows check against — rather than from a second reading
-//! of the standard. `every_category_reconciles_to_a_valid_breakdown` builds one
-//! invoice per category and asserts the result carries no arithmetic finding,
-//! so the two cannot drift apart silently.
+//! It computes amounts only: exemption reasons come from the caller
+//! ([`Reconciler::exemption`]), and the result still needs [`crate::validate`].
+//! Grouping uses [`crate::validation::rules::category::profile`], the table the
+//! validator checks against.
 
 use rust_decimal::{Decimal, RoundingStrategy};
 
@@ -56,19 +29,14 @@ use crate::{InvoiceAmount, Percentage, VatCategory};
 
 /// Why an invoice could not be reconciled.
 ///
-/// **Not** a validation finding. These say "the arithmetic cannot be performed
-/// at all"; a [`crate::ValidationReport`] says "the arithmetic was performed and
-/// disagrees". Every variant is something [`crate::validate`] would also report,
-/// which is deliberate — a caller who ignores these and validates anyway still
-/// learns about them.
+/// The arithmetic could not be performed at all; [`crate::validate`] would also
+/// report each of these.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReconcileError {
     /// A line, allowance or charge carries a VAT category outside UNCL 5305.
     ///
-    /// Grouping and the tax rule both come from the category's semantics, so an
-    /// unknown code leaves nothing to compute. `BR-CL-17` / `BR-CL-18` report
-    /// the same thing at validation time; this is the earlier, louder version.
+    /// Validation reports the same as `BR-CL-17` / `BR-CL-18`.
     #[error(
         "{at} carries VAT category {code:?}, which is not in UNCL 5305 — \
          BG-23 grouping and the tax rule both depend on the category (BR-CL-18)"
@@ -82,9 +50,8 @@ pub enum ReconcileError {
 
     /// A taxed category with no rate to multiply by.
     ///
-    /// `S`, `L`, `M` and `B` derive BT-117 from BT-119. Defaulting an absent
-    /// rate to zero would produce a breakdown that balances and charges no tax,
-    /// which is the one wrong answer nobody notices.
+    /// `S`, `L`, `M` and `B` derive BT-117 from BT-119; an absent rate is not
+    /// defaulted to zero.
     #[error(
         "{at} is VAT category {category} at no rate; a taxed category derives its tax \
          amount from the rate, and defaulting it to zero would silently under-declare VAT"
@@ -108,14 +75,10 @@ pub enum ReconcileError {
 
 /// What reconciliation produced, before it is put back on an invoice.
 ///
-/// Returned by [`Reconciler::compute`] for a caller who wants to inspect or
-/// diff the numbers rather than overwrite theirs — which is the useful shape
-/// when the question is *"does my ERP agree with EN 16931?"* rather than
-/// *"give me the numbers"*.
+/// Returned by [`Reconciler::compute`], for comparing against existing figures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reconciled {
-    /// BG-23, one entry per group, ordered by category then rate so two runs
-    /// over equal input produce equal output.
+    /// BG-23, one entry per group, ordered by category then rate.
     pub vat_breakdown: Vec<VatBreakdown>,
     /// BG-22.
     pub totals: DocumentTotals,
@@ -153,13 +116,9 @@ impl Reconciler {
     /// BT-120 / BT-121 for one VAT category — what `BR-E-10` and its four
     /// siblings require and no amount of arithmetic can supply.
     ///
-    /// Five categories *must* carry a reason (`E`, `AE`, `K`, `G`, `O`) and four
-    /// *must not* (`S`, `Z`, `L`, `M`). This sets it for the categories that
-    /// need it; a reason given for a category that forbids one is **dropped**
-    /// rather than written, because writing it would turn a caller's mistake
-    /// into a `BR-S-10` finding on a document that is otherwise correct.
-    ///
-    /// Pass `None` for either half — the rules accept the text or the code.
+    /// `E`, `AE`, `K`, `G` and `O` require a reason; for `S`, `Z`, `L` and `M`,
+    /// which forbid one (e.g. `BR-S-10`), it is dropped. Either half may be
+    /// `None`.
     ///
     /// ```
     /// use en16931::reconcile::Reconciler;
@@ -186,8 +145,7 @@ impl Reconciler {
 
     /// BT-113 — an amount already paid, subtracted from BT-115 by `BR-CO-16`.
     ///
-    /// Absent is not zero: BT-113 is omitted when nothing was prepaid, and
-    /// `BR-CO-16` branches on its presence.
+    /// Unset means BT-113 is absent, not zero.
     #[must_use]
     pub fn paid(mut self, amount: InvoiceAmount) -> Self {
         self.paid = Some(amount);
@@ -204,8 +162,7 @@ impl Reconciler {
     /// BT-111 — the total VAT in the accounting currency, required by `BR-53`
     /// whenever BT-6 is present.
     ///
-    /// Not derived: it is BT-110 converted at a rate this crate does not have
-    /// and must not invent.
+    /// Not derived: the conversion rate is not known.
     #[must_use]
     pub fn vat_total_accounting(mut self, amount: InvoiceAmount) -> Self {
         self.vat_total_accounting = Some(amount);
@@ -228,12 +185,10 @@ impl Reconciler {
 
     /// Compute and write both groups back onto the invoice.
     ///
-    /// Everything else is left alone — this replaces exactly
-    /// [`Invoice::vat_breakdown`] and [`Invoice::totals`].
+    /// Replaces only [`Invoice::vat_breakdown`] and [`Invoice::totals`].
     ///
     /// # Errors
-    /// As [`compute`](Self::compute). The invoice is **unchanged** on error:
-    /// both groups are computed before either is written.
+    /// As [`compute`](Self::compute); the invoice is unchanged on error.
     pub fn apply(&self, inv: &mut Invoice) -> Result<(), ReconcileError> {
         let r = self.compute(inv)?;
         inv.vat_breakdown = r.vat_breakdown;
@@ -245,8 +200,7 @@ impl Reconciler {
 
     /// One entry per group, grouped exactly as the `-08` rows check.
     fn breakdown(&self, inv: &Invoice) -> Result<Vec<VatBreakdown>, ReconcileError> {
-        // Collect the keys first, in document order, then sort — so the output
-        // is a function of the input and not of iteration order.
+        // Sorted, so output order does not depend on document order.
         let mut keys: Vec<(VatCategory, Option<Percentage>)> = Vec::new();
         for (cat, rate, at) in content(inv) {
             let semantics = VatCategory::from_code(cat.as_str()).ok_or_else(|| {
@@ -287,8 +241,7 @@ impl Reconciler {
         };
 
         // BT-116 = Σ line net + Σ document charges − Σ document allowances, over
-        // the rows in this group. Every term is already two decimals, so the sum
-        // is exact in minor units and `BR-*-08` holds with no tolerance used.
+        // the rows in this group; exact, since every term has two decimals.
         let positive = inv
             .lines
             .iter()
@@ -331,10 +284,6 @@ impl Reconciler {
 
     /// BT-120 / BT-121 for a category: what the caller configured, else what the
     /// invoice's existing BG-23 already carried, else nothing.
-    ///
-    /// Preserving the invoice's own reasons is what makes `apply` safe to call
-    /// on an invoice a caller has already filled in by hand — the numbers are
-    /// recomputed and the prose survives.
     fn reason_for(&self, inv: &Invoice, category: VatCategory) -> (Option<String>, Option<Code>) {
         if category.forbids_exemption_reason() {
             return (None, None);
@@ -369,9 +318,7 @@ impl Reconciler {
         // BT-106.
         let line_total = sum(&mut inv.lines.iter().map(|l| l.net_amount), "BT-106")?;
 
-        // BT-107 / BT-108 — **absent is not zero**. `BR-CO-11` and `-12` accept
-        // an absent total only when the corresponding group is empty, and
-        // `BR-CO-13` branches on presence.
+        // BT-107 / BT-108: absent, not zero, when the group is empty.
         let allowance_total = if inv.allowances.is_empty() {
             None
         } else {
@@ -389,9 +336,7 @@ impl Reconciler {
             .and_then(|v| v.checked_add(charge_total.unwrap_or(InvoiceAmount::ZERO)))
             .map_err(|_| ReconcileError::Overflow { term: "BT-109" })?;
 
-        // BT-110 = Σ BT-117. Stated whenever there is a breakdown at all, even
-        // when it sums to zero: `BR-CO-14` permits absence there, and every
-        // deployed profile expects the element.
+        // BT-110 = Σ BT-117, stated whenever there is a breakdown, even if zero.
         let vat_total = if breakdown.is_empty() {
             None
         } else {
@@ -426,7 +371,7 @@ impl Reconciler {
 
 // ── Free functions ────────────────────────────────────────────────────────────
 
-/// Reconcile with every default — the one-liner for the common case.
+/// Reconcile with every default.
 ///
 /// # Errors
 /// As [`Reconciler::compute`].
@@ -460,10 +405,8 @@ fn content(inv: &Invoice) -> impl Iterator<Item = (&Code, Option<Percentage>, Pa
 
 /// The rate a group is keyed on.
 ///
-/// For the six categories whose `-01` row says *"exactly one"*, every row in the
-/// category belongs to one group whatever rate it states — so the key must not
-/// depend on the rate, or a document mixing `Some(0)` and `None` on category `E`
-/// would produce two groups and fail `BR-E-01`.
+/// `None` for categories whose `-01` row says "exactly one" group, so rows at
+/// `Some(0)` and `None` do not split.
 fn group_rate(category: VatCategory, rate: Option<Percentage>) -> Option<Percentage> {
     if profile(category).grouped_by_rate() {
         rate
@@ -472,26 +415,17 @@ fn group_rate(category: VatCategory, rate: Option<Percentage>) -> Option<Percent
     }
 }
 
-/// BT-119 for a group — which is **not** BT-152.
+/// BT-119 for a group, stated for every category including `O`.
 ///
-/// Every group states it, category `O` included, which is why this takes no
-/// category argument and is a named function anyway: the temptation is to reuse
-/// [`VatCategory::states_rate`] here, and that would be wrong.
-///
-/// `BR-O-05` suppresses the *line* rate (BT-152) for `O`. BT-119 has no such
-/// rule: `BR-48` merely **permits** its absence there, and XRechnung's
-/// `BR-DE-14` requires it unconditionally with no category exception. Stating
-/// `0` satisfies all three; omitting it fails the KoSIT validator.
+/// Unlike BT-152 (`BR-O-05`), BT-119 may be stated for `O` (`BR-48`), and
+/// XRechnung's `BR-DE-14` requires it, so `0` is used.
 fn breakdown_rate(rate: Option<Percentage>) -> Option<Percentage> {
     rate.or(Some(Percentage::ZERO))
 }
 
 /// BT-117 for a taxed group: BT-116 × BT-119 / 100, to two decimals.
 ///
-/// **Commercial rounding**, half away from zero, so `−0.125` goes to `−0.13` as
-/// it does on the credit note a German auditor reads. `BR-CO-17` and the `-09`
-/// rows allow a full currency unit of slack, so the strategy is not what makes
-/// this pass — it is what makes the number the one a person would have written.
+/// Rounds half away from zero (`−0.125` → `−0.13`).
 fn tax_on(base: InvoiceAmount, rate: Option<Percentage>) -> Result<InvoiceAmount, ReconcileError> {
     let rate = rate.map_or(Decimal::ZERO, Percentage::into_decimal);
     let exact = base
@@ -551,7 +485,7 @@ mod tests {
         inv
     }
 
-    /// The feedback's own example: two lines, two VAT rates.
+    /// Two lines, two VAT rates.
     #[test]
     fn two_lines_two_rates_produce_two_groups_and_a_balancing_total() {
         let mut inv = invoice(vec![
@@ -581,8 +515,7 @@ mod tests {
         assert_eq!(t.charge_total, None);
     }
 
-    /// The rounding case the feedback flagged as the one to be careful with:
-    /// three 2-dp lines whose exact VAT sum is not the sum of per-line VAT.
+    /// VAT is computed once on the group total.
     #[test]
     fn rounding_happens_once_on_the_group_not_per_line() {
         let mut inv = invoice(vec![
@@ -592,9 +525,7 @@ mod tests {
         ]);
         reconcile(&mut inv).expect("reconciles");
 
-        // Per line: 0.0095 → 0.01 each → 0.03. On the group: 0.15 × 19 % =
-        // 0.0285 → 0.03. Same here, and the group figure is the one BR-S-09
-        // checks — computing it per line is how the two diverge on real data.
+        // 0.15 × 19 % = 0.0285 → 0.03, the figure BR-S-09 checks.
         assert_eq!(inv.vat_breakdown[0].taxable_amount.to_string(), "0.15");
         assert_eq!(inv.vat_breakdown[0].tax_amount.to_string(), "0.03");
         assert!(
@@ -605,10 +536,10 @@ mod tests {
         );
     }
 
-    /// Half away from zero, not half to even — what a person would have written.
+    /// Half away from zero, not half to even.
     #[test]
     fn the_midpoint_rounds_away_from_zero() {
-        // 26.30 × 19 % = 4.9970 — no midpoint. 2.50 × 5 % = 0.125, exactly one.
+        // 2.50 × 5 % = 0.125, a midpoint.
         assert_eq!(
             tax_on(
                 InvoiceAmount::parse("2.50").unwrap(),
@@ -631,8 +562,7 @@ mod tests {
         );
     }
 
-    /// Document-level allowances and charges land in the right group and the
-    /// right sign — BT-107 is subtracted, BT-108 added, both stated positive.
+    /// Document allowances are subtracted from, and charges added to, their group.
     #[test]
     fn allowances_and_charges_move_the_base_of_their_own_group() {
         let mut inv = invoice(vec![line("1", "1000.00", "S", Some(dec!(19)))]);
@@ -669,7 +599,7 @@ mod tests {
         assert_eq!(t.gross_total.to_string(), "1130.50");
     }
 
-    /// BT-113 and BT-114 flow into BT-115, and stay absent when unset.
+    /// BT-113 and BT-114 flow into BT-115.
     #[test]
     fn prepayment_and_rounding_reach_the_amount_due() {
         let inv = invoice(vec![line("1", "1000.00", "S", Some(dec!(19)))]);
@@ -682,9 +612,7 @@ mod tests {
         assert_eq!(r.totals.due.to_string(), "999.99");
     }
 
-    /// The keystone claim: whatever the category, the result passes the rules
-    /// that check the arithmetic. This is what stops the reconciler and the
-    /// validator drifting apart.
+    /// For every category, the result passes the arithmetic rules.
     #[test]
     fn every_category_reconciles_to_a_valid_breakdown() {
         for cat in VatCategory::ALL {
@@ -696,10 +624,7 @@ mod tests {
                 None
             };
             let mut inv = invoice(vec![line("1", "1000.00", cat.code(), rate)]);
-            // The `-02`/`-03`/`-04` rows want tax identifiers, which are the
-            // caller's data. Supplying them keeps the assertion below over the
-            // *whole* family rather than a hand-picked subset — except for `O`,
-            // whose row is the one phrased as a prohibition.
+            // The `-02`/`-03`/`-04` rows want tax identifiers (`O` forbids them).
             if cat != VatCategory::OutOfScope {
                 inv.seller.vat_identifier = Some("DE123456789".into());
                 inv.buyer.vat_identifier = Some("DE987654321".into());
@@ -709,8 +634,7 @@ mod tests {
                 inv.seller.address.country = Some(Code::new("IT"));
                 inv.buyer.address.country = Some(Code::new("IT"));
             }
-            // `BR-IC-11` / `-12` want a delivery date and country. Also caller
-            // data, and also not something to exclude from the assertion.
+            // `BR-IC-11` / `-12` want a delivery date and country.
             inv.delivery = Some(crate::invoice::Delivery {
                 party_name: None,
                 location: None,
@@ -726,10 +650,7 @@ mod tests {
                 .apply(&mut inv)
                 .unwrap_or_else(|e| panic!("{cat}: {e}"));
 
-            // The rules a reconciler is answerable for: the totals chain, the
-            // VAT derivation, and every row of the nine category families.
-            // Deliberately not `BR-08`/`BR-09`/`BR-10` — those want a postal
-            // address, which is the caller's data, not the arithmetic's.
+            // The totals chain, BR-48 and every category family's rows.
             const FAMILIES: [&str; 10] = [
                 "BR-S-", "BR-Z-", "BR-E-", "BR-AE-", "BR-IC-", "BR-G-", "BR-O-", "BR-AF-",
                 "BR-AG-", "BR-B-",
@@ -749,7 +670,7 @@ mod tests {
         }
     }
 
-    /// `O` is the trap: no rate on the line, a rate on the breakdown.
+    /// `O`: no rate on the line, a rate on the breakdown.
     #[test]
     fn out_of_scope_states_bt_119_but_not_bt_152() {
         let mut inv = invoice(vec![line("1", "1000.00", "O", None)]);
@@ -766,14 +687,8 @@ mod tests {
         assert_eq!(inv.vat_breakdown[0].tax_amount, InvoiceAmount::ZERO);
     }
 
-    /// A zero-tax category with rows at `Some(0)` and `None` is still one group.
-    ///
-    /// The `None` row is itself invalid — `BR-AE-05` says the *line* rate "shall
-    /// be 0", and absent is not zero — which is precisely why this matters. A
-    /// parser must be able to load such a document, and the grouping must not
-    /// split on it, or the report would carry a spurious `BR-AE-01` about a
-    /// breakdown that has two groups instead of the `BR-AE-05` about the line
-    /// that caused it.
+    /// A zero-tax category with rows at `Some(0)` and `None` is still one group,
+    /// so the invalid row surfaces as `BR-AE-05` rather than `BR-AE-01`.
     #[test]
     fn exactly_one_group_categories_do_not_split_on_the_rate() {
         let mut inv = invoice(vec![
@@ -809,7 +724,7 @@ mod tests {
     fn existing_exemption_reasons_are_preserved() {
         let mut inv = invoice(vec![line("1", "100.00", "E", Some(Decimal::ZERO))]);
         inv.vat_breakdown.push(VatBreakdown {
-            taxable_amount: InvoiceAmount::ZERO, // deliberately wrong
+            taxable_amount: InvoiceAmount::ZERO, // wrong; recomputed
             tax_amount: InvoiceAmount::ZERO,
             category: Code::new("E"),
             rate: Some(Percentage::ZERO),
@@ -836,8 +751,7 @@ mod tests {
         assert!(!inv.vat_breakdown[0].has_exemption_reason(), "BR-S-10");
     }
 
-    /// Reconciling twice changes nothing — the operation is idempotent, which is
-    /// what lets it sit in a pipeline that may run it more than once.
+    /// Reconciling twice changes nothing.
     #[test]
     fn reconciliation_is_idempotent() {
         let mut inv = invoice(vec![

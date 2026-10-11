@@ -1,30 +1,13 @@
-//! Code lists — EN 16931-1 §6.5.8 `Code. Type`.
+//! Code lists — EN 16931-1 §6.5.8 `Code. Type`. Codes are case-sensitive.
 //!
-//! > Codes are used to specify allowed values in elements as well as for lists
-//! > of options. Code is different from Identifier in that allowed values have
-//! > standardized meanings that can be known by the recipient. […] Codes shall
-//! > be entered exactly as shown in the selected code list.
-//!
-//! Eighteen lists, **4 887 values**, all generated from the pinned CEN
+//! Eighteen lists, **4 876 values**, all generated from the pinned CEN
 //! validation artefacts by `cargo xtask codegen` and re-verified against them by
 //! `tests/codelists.rs`. See [`generated`].
 //!
-//! # Two shapes, for two kinds of list
-//!
-//! - **Small, closed, semantically load-bearing** lists become enums, because
-//!   the code's *meaning* drives rules. [`VatCategory`] is the case that
-//!   matters: ten codes, each with different rules about rate, tax amount and
-//!   exemption reason.
-//! - **Large, open, referentially checked** lists stay as sorted `&[&str]` with
-//!   [`contains`] doing a binary search. 2 162 unit codes do not want to be an
-//!   enum, and nothing in the standard branches on *which* unit it is.
-//!
-//! # Catching a bad code at the map, not at the report
-//!
-//! [`contains`] answers yes or no. [`guard`] answers *what to do*: it returns a
-//! [`CodeError`](guard::CodeError) naming the rule that would have reported the
-//! value, and — where the crate can tell — the successor of a withdrawn code,
-//! the case-folded spelling, or the whitespace that made it fail.
+//! Lists are sorted `&[&str]` checked with [`contains`]; [`VatCategory`] is an
+//! enum because rules branch on its meaning. [`guard`] checks a value up front
+//! and returns a [`CodeError`](guard::CodeError) naming the rule and, where
+//! known, a fix (successor code, case, whitespace).
 //!
 //! ```
 //! use en16931::codes::guard;
@@ -40,8 +23,7 @@ use core::fmt;
 
 /// Whether `code` appears in a generated list.
 ///
-/// The lists are sorted at generation time, so this is a binary search with no
-/// allocation and no runtime setup.
+/// A binary search over the generator-sorted list.
 ///
 /// ```
 /// use en16931::codes::{contains, generated::UNIT_CODES};
@@ -55,15 +37,10 @@ pub fn contains(list: &[&str], code: &str) -> bool {
     list.binary_search(&code).is_ok()
 }
 
-/// EN 16931 **BT-118 / BT-151 / BT-95 / BT-102** — the UNCL 5305 VAT category.
+/// EN 16931 BT-118 / BT-151 / BT-95 / BT-102 — the UNCL 5305 VAT category.
 ///
-/// Ten codes, fixed by `BR-CL-17` and `BR-CL-18`. This enum is deliberately
-/// **not** `#[non_exhaustive]`: it mirrors a closed, externally governed list,
-/// and a caller mapping to an output format legitimately needs exhaustive
-/// matching. If CEN adds a code, that is a breaking change and should look like
-/// one.
-///
-/// # The three predicates, and why they are not the same question
+/// Ten codes (`BR-CL-17`, `BR-CL-18`). Not `#[non_exhaustive]`, so callers can
+/// match exhaustively; a new code would be a breaking change.
 ///
 /// | | `carries_tax` | `requires_exemption_reason` | `forbids_exemption_reason` | `states_rate` |
 /// |---|---|---|---|---|
@@ -78,17 +55,8 @@ pub fn contains(list: &[&str], code: &str) -> bool {
 /// | `M` IPSI | ✓ | | ✓ | ✓ |
 /// | `B` Split payment | ✓ | | | ✓ |
 ///
-/// Three traps this table encodes, all of which implementations get wrong:
-///
-/// 1. **`Z` and `E` both carry zero tax, but `Z` *forbids* an exemption reason
-///    and `E` *requires* one.** Zero-rating and exemption are legally distinct —
-///    input tax stays deductible under `Z`. (BR-Z-10 vs BR-E-10.)
-/// 2. **`B` is the only category where both reason predicates are false.** The
-///    artefacts contain no `BR-B-09` forcing the tax to zero, no `BR-B-05`
-///    constraining the rate and no `BR-B-10` requiring a reason. Split payment
-///    charges VAT normally; the *buyer* remits it.
-/// 3. **`states_rate` is about BT-152, not BT-119.** See its own documentation —
-///    this is the subtlest distinction in the whole enum.
+/// `Z` forbids an exemption reason while `E` requires one (BR-Z-10, BR-E-10);
+/// `B` has no reason rule either way. `states_rate` concerns BT-152, not BT-119.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VatCategory {
@@ -116,24 +84,15 @@ pub enum VatCategory {
 
 /// Why a set of VAT categories cannot appear in one document.
 ///
-/// Returned by [`VatCategory::can_share_document`]. It carries the rules that
-/// *would* report the conflict, so a caller can cite them to whoever asked for
-/// the invoice — which is the difference between "we cannot bill this" and "we
-/// cannot bill this, and here is the clause".
+/// Returned by [`VatCategory::can_share_document`], with the governing rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CategoryConflict {
     /// The exclusive category — `O` or `B`.
     pub category: VatCategory,
-    /// One category it cannot share a document with. There may be others; this
-    /// is the first found, and naming one is enough to explain the refusal.
+    /// The first category found that it cannot share a document with.
     pub conflicts_with: VatCategory,
-    /// The rules that **govern** this exclusivity, in the artefacts' spelling.
-    ///
-    /// Not "the rules that will fire": `BR-O-11` covers a second breakdown
-    /// group, `BR-O-12` a line, `BR-O-13` an allowance and `BR-O-14` a charge,
-    /// and which of them reports depends on *where* the other category appears
-    /// — which a set of category codes cannot say. The family is the clause a
-    /// caller cites; at least one of its members will report the document.
+    /// The rules governing this exclusivity; which of them fires depends on
+    /// where the other category appears.
     pub rules: &'static [&'static str],
     /// What to do instead.
     pub hint: &'static str,
@@ -188,10 +147,7 @@ impl VatCategory {
 
     /// Parse a UNCL 5305 code.
     ///
-    /// **Case-sensitive**, because §6.5.8 says *"Codes shall be entered exactly
-    /// as shown in the selected code list"* and `BR-CL-17` compares literally.
-    /// Accepting `"ae"` here would make this crate disagree with every validator
-    /// on a document it then declared valid.
+    /// Case-sensitive (§6.5.8, `BR-CL-17`).
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
         Some(match code {
@@ -209,29 +165,9 @@ impl VatCategory {
         })
     }
 
-    /// **Can these categories share one document?** — answerable before the
-    /// document exists.
-    ///
-    /// # Why this is not simply `validate`
-    ///
-    /// Two of the ten categories are *exclusive*, and they are the only rules
-    /// in EN 16931 that a set of category codes decides on its own — no
-    /// amounts, no lines, no parties. Everything else needs a document.
-    ///
-    /// That makes this the same kind of question as
-    /// [`Profile::missing_terms`](crate::Profile::missing_terms): the answer is
-    /// **exact**, and it is available at the moment a caller is choosing what to
-    /// put on an invoice rather than after assembling one it then has to throw
-    /// away.
-    ///
-    /// The case that forced it is German municipal billing. A *hoheitliche
-    /// Abwassergebühr* is not subject to VAT (`O`), drinking water is taxable
-    /// (`S`), and `BR-O-11` … `BR-O-14` forbid `O` from sharing a document with
-    /// anything else — so the combined invoice that over 90 % of municipalities
-    /// issue **has no valid EN 16931 rendering at all**. That is the standard's
-    /// decision and no implementation can fix it. What an implementation owes is
-    /// a refusal that names the reason *before* the work, instead of a wall of
-    /// findings after it.
+    /// Whether these categories can share one document, checked without one:
+    /// `O` excludes every other category (`BR-O-11` … `BR-O-14`) and `B`
+    /// excludes `S` (`BR-B-02`).
     ///
     /// ```
     /// use en16931::VatCategory;
@@ -258,11 +194,7 @@ impl VatCategory {
     pub fn can_share_document(categories: &[Self]) -> Result<(), CategoryConflict> {
         let has = |c: Self| categories.contains(&c);
 
-        // The exclusive categories first: one of them excludes *everything*, so
-        // it is the broader answer and the more useful one to report when both
-        // conflicts are present. Which categories those are is
-        // [`Self::is_exclusive`]'s to know, not this function's — the two
-        // disagreeing about `O` is exactly the drift worth designing out.
+        // Exclusive categories first: they are the broader conflict.
         if let Some(exclusive) = categories.iter().copied().find(|c| c.is_exclusive())
             && let Some(other) = categories.iter().copied().find(|c| *c != exclusive)
         {
@@ -301,11 +233,8 @@ impl VatCategory {
         )
     }
 
-    /// Whether a VAT breakdown in this category **must** state BT-120 or BT-121.
-    ///
-    /// BR-E-10, BR-AE-10, BR-IC-10, BR-G-10 and BR-O-10. Each accepts *either*
-    /// the reason text **or** the reason code — modelling only the text forces a
-    /// caller holding a VATEX code to invent prose.
+    /// Whether a VAT breakdown in this category must state BT-120 or BT-121
+    /// (BR-E-10, BR-AE-10, BR-IC-10, BR-G-10, BR-O-10).
     #[must_use]
     pub const fn requires_exemption_reason(self) -> bool {
         matches!(
@@ -318,10 +247,8 @@ impl VatCategory {
         )
     }
 
-    /// Whether a VAT breakdown in this category **must not** state BT-120 or BT-121.
-    ///
-    /// BR-S-10, BR-Z-10, BR-AF-10 and BR-AG-10. A taxed or zero-rated supply is
-    /// not an exemption and needs no justification.
+    /// Whether a VAT breakdown in this category must not state BT-120 or BT-121
+    /// (BR-S-10, BR-Z-10, BR-AF-10, BR-AG-10).
     #[must_use]
     pub const fn forbids_exemption_reason(self) -> bool {
         matches!(
@@ -330,31 +257,17 @@ impl VatCategory {
         )
     }
 
-    /// Whether a **line, allowance or charge** in this category states a VAT rate.
+    /// Whether a line, allowance or charge in this category states a VAT rate
+    /// (BT-152 / BT-96 / BT-103). Only `O` does not (BR-O-05 … BR-O-07), so a
+    /// writer omits the element rather than writing `0`.
     ///
-    /// `O` is the only category that does not. BR-O-05, BR-O-06 and BR-O-07 say
-    /// the element *"shall not contain"* BT-152 / BT-96 / BT-103, where every
-    /// other zero-tax category says the rate *"shall be 0"*. A serialiser must
-    /// therefore **suppress** the element for `O` rather than emit `0`.
-    ///
-    /// # This does not apply to BT-119
-    ///
-    /// The VAT **breakdown** rate is a different business term. BR-48 makes it
-    /// optional only *"if the Invoice is not subject to VAT"*, and XRechnung's
-    /// **BR-DE-14** then requires it **unconditionally** — *"Das Element 'VAT
-    /// category rate' (BT-119) muss übermittelt werden"*, fatal, with no
-    /// category exception. Suppressing BT-119 for `O` on the strength of
-    /// BR-O-05 is the natural mistake and it fails the KoSIT validator.
+    /// Not about BT-119: XRechnung's BR-DE-14 requires that even for `O`.
     #[must_use]
     pub const fn states_rate(self) -> bool {
         !matches!(self, Self::OutOfScope)
     }
 
     /// The category's name, as EN 16931 and UNCL 5305 write it.
-    ///
-    /// Short enough for a table and unambiguous enough to catch the mistake the
-    /// code alone hides: `O` is *not* "other", and a caller who read it that way
-    /// has produced an invoice that can carry nothing else (BR-O-11 … BR-O-14).
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -393,19 +306,7 @@ mod tests {
     use super::generated::*;
     use super::*;
 
-    /// Every generated list, by name — the single place this module enumerates
-    /// them.
-    ///
-    /// A hand-written list is what let three tables go unchecked: this array
-    /// said `15` while [`generated`] had grown to eighteen, and
-    /// `NOTE_SUBJECT_CODES`, `PEPPOL_EAS_SCHEMES` and `PEPPOL_MIME_CODES` were
-    /// never asserted to be sorted at all. They are binary-searched like the
-    /// rest, so an unsorted one would have reported a valid code as invalid and
-    /// no test would have said so.
-    ///
-    /// `no_generated_list_escapes_the_sortedness_check` now reads the generated
-    /// source and fails if this array does not name every `pub static` in it, so
-    /// the next table cannot be forgotten the same way.
+    /// Every generated list, by name; checked against [`generated::TABLES`].
     const LISTS: &[(&str, &[&str])] = &[
         ("ALLOWANCE_REASON_CODES", ALLOWANCE_REASON_CODES),
         ("CHARGE_REASON_CODES", CHARGE_REASON_CODES),
@@ -429,8 +330,7 @@ mod tests {
 
     #[test]
     fn every_generated_list_is_sorted_and_unique() {
-        // `contains` binary-searches, so an unsorted table would silently return
-        // false negatives — a valid code reported as invalid.
+        // `contains` binary-searches.
         for (name, list) in LISTS {
             assert!(!list.is_empty(), "{name} is empty");
             for w in list.windows(2) {
@@ -439,16 +339,7 @@ mod tests {
         }
     }
 
-    /// The check above is only as good as [`LISTS`], so [`LISTS`] is checked.
-    ///
-    /// Against [`generated::TABLES`], which the generator emits alongside the
-    /// tables themselves and therefore cannot omit one of — rather than by
-    /// counting `pub static` lines in the generated source, which breaks on a
-    /// change to the syntax rather than to the subject.
-    ///
-    /// [`LISTS`] stays hand-written: it is the list this module promises to
-    /// binary-search, and deriving it from the same source it is checking
-    /// against would make the check vacuous.
+    /// [`LISTS`] names exactly the tables in [`generated::TABLES`].
     #[test]
     fn no_generated_list_escapes_the_sortedness_check() {
         for (name, _) in generated::TABLES {
@@ -520,8 +411,7 @@ mod tests {
 
     #[test]
     fn the_two_bt_3_lists_are_not_disjoint_but_split_380_from_381() {
-        // BR-CL-01's test is a `self::` disjunction over two lists. They share
-        // exactly one code, and that one is not 380 or 381.
+        // The two BR-CL-01 lists share exactly one code, `81`.
         assert!(contains(INVOICE_TYPE_CODES, "380"));
         assert!(!contains(INVOICE_TYPE_CODES, "381"));
         assert!(contains(CREDIT_NOTE_TYPE_CODES, "381"));

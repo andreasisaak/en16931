@@ -1,0 +1,107 @@
+name: Upstream watch
+
+# Is any pin behind its source? `cargo xtask watch` compares every pin in
+# `xtask/src/fetch.rs` (the fetched repositories and archive, the watched-only
+# repositories, the veraPDF images) with what upstream publishes now, tagged or
+# not. This job keeps one issue per source that moved, labelled
+# `upstream-watch`: opened or updated (with the run date) while it is behind,
+# closed once the pin catches up. It moves no pin, runs no suite and changes no
+# file; a source it cannot read fails the run.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays, 05:17 UTC
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Repository ref whose pins to read (must contain `cargo xtask watch`)"
+        required: false
+        default: ""
+      dry-run:
+        description: "List the would-be issues in the job summary instead of changing issues"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  watch:
+    name: Watch the pinned sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compare every pin with upstream
+        id: watch
+        run: |
+          set +e
+          cargo xtask watch --out "$RUNNER_TEMP/watch.json"
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          test -s "$RUNNER_TEMP/watch.json"
+
+      - name: One issue per moved source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry-run && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/watch.json"
+          label=upstream-watch
+          if [ "$DRY_RUN" = false ]; then
+            gh label create "$label" --force --color FBCA04 \
+              --description "A pinned source moved upstream"
+          fi
+          echo "## Upstream watch ($(jq -r .date "$report"))" >> "$GITHUB_STEP_SUMMARY"
+          jq -c '.sources[]' "$report" | while read -r source; do
+            name=$(jq -r .name <<<"$source")
+            state=$(jq -r .state <<<"$source")
+            pin=$(jq -r .pin <<<"$source")
+            title="Upstream: $name moved"
+            echo "- \`$name\`: **$state** — $pin" >> "$GITHUB_STEP_SUMMARY"
+            existing=""
+            if [ "$DRY_RUN" = false ]; then
+              existing=$(gh issue list --state open --label "$label" --limit 100 \
+                --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
+            fi
+            drift=$(jq '[.findings[] | select(.state == "released" or .state == "announced")] | length' <<<"$source")
+            if [ "$state" = unknown ]; then
+              # The run fails below; an issue changes only for what was read.
+              jq -r '.findings[] | select(.state == "unknown") | "  - unknown: \(.text)"' <<<"$source" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            if [ "$state" = current ]; then
+              if [ -n "$existing" ]; then
+                gh issue close "$existing" --comment "The pin ($pin) is current."
+              fi
+            elif [ "$drift" -gt 0 ]; then
+              body=$(jq -r .issue.body <<<"$source")
+              if [ "$DRY_RUN" = true ]; then
+                { echo; echo "<details><summary>$title</summary>"; echo; echo "$body"; echo "</details>"; echo; } >> "$GITHUB_STEP_SUMMARY"
+              elif [ -n "$existing" ]; then
+                gh issue edit "$existing" --body "$body"
+              else
+                gh issue create --title "$title" --label "$label" --body "$body"
+              fi
+            fi
+          done
+
+      - name: Nothing in the checkout changed
+        run: test -z "$(git status --porcelain)"
+
+      - name: Every source was read
+        if: steps.watch.outputs.status != '0'
+        run: |
+          echo "::error::cargo xtask watch could not read every source (see its log above)"
+          exit 1

@@ -1,25 +1,10 @@
-//! The EN 16931 core invoice model — Table 2, as structs.
+//! The EN 16931 core invoice model (EN 16931-1 Table 2) as structs.
 //!
-//! # Why coded fields are [`Code`] and not enums
-//!
-//! Only [`crate::VatCategory`] is an enum, because rules *branch* on what it
-//! means: you cannot write BR-S-08 without knowing that `S` is "standard rated".
-//! Every other coded term — BT-3, BT-5, BT-130, BT-98 — is only ever checked for
-//! *membership*, and nothing in the standard behaves differently for `KWH` than
-//! for `MTQ`.
-//!
-//! Membership checks want a [`Code`], not an enum, because of the principle this
-//! crate applies throughout: **types enforce representability, rules enforce
-//! validity.** A document carrying `BT-3 = "999"` is invalid, and a parser must
-//! still be able to load it in order to say so. An enum would turn a reportable
-//! finding into an unreportable parse failure with no BT path attached.
-//!
-//! # Why totals are `Option` where the standard says 0..1
-//!
-//! Absent is not zero. BR-CO-13 has four branches depending on which of BT-107
-//! and BT-108 are present, and BR-CO-16 has four depending on BT-113 and BT-114.
-//! Collapsing absent to zero makes this crate disagree with every validator on
-//! invoices that omit the fields — which is most of them.
+//! Coded terms are [`Code`], not enums, so an invalid value such as
+//! `BT-3 = "999"` still loads and is reported by the rules with its path; only
+//! [`crate::VatCategory`] is an enum, because rules branch on its meaning.
+//! Terms with cardinality 0..1 are `Option`: absent is not zero (BR-CO-13 and
+//! BR-CO-16 branch on presence).
 
 use crate::bt::{Group, Path};
 use crate::{
@@ -91,8 +76,6 @@ impl From<String> for Code {
 }
 
 impl From<Code> for String {
-    /// So a checked [`Code`] from [`crate::codes::guard`] can be handed to any
-    /// `impl Into<String>` parameter without a detour through `as_str`.
     fn from(c: Code) -> Self {
         c.0
     }
@@ -113,8 +96,7 @@ pub struct Period {
 impl Period {
     /// Whether the end is on or after the start — BR-29 / BR-30.
     ///
-    /// `None` when either endpoint is absent, which BR-CO-19 / BR-CO-20 handle
-    /// separately: at least one must be present, but not necessarily both.
+    /// `None` when either endpoint is absent (BR-CO-19 / BR-CO-20 allow one).
     #[must_use]
     pub fn is_ordered(&self) -> Option<bool> {
         match (self.start, self.end) {
@@ -140,16 +122,49 @@ pub struct PostalAddress {
     pub post_code: Option<String>,
     /// BT-39 / BT-54 — country subdivision.
     pub subdivision: Option<String>,
-    /// BT-40 / BT-55 / BT-69 / BT-80 — **mandatory** country code (BR-09, BR-11).
+    /// BT-40 / BT-55 / BT-69 / BT-80 — mandatory country code (BR-09, BR-11).
     pub country: Option<Code>,
+}
+
+impl PostalAddress {
+    /// An address with street, city, post code and country (BT-35, BT-37,
+    /// BT-38, BT-40 on a seller; BT-50, BT-52, BT-53, BT-55 on a buyer).
+    ///
+    /// The country is checked against ISO 3166-1 (`BR-CL-14`) here. Line 2,
+    /// line 3 and the subdivision are set on the fields.
+    ///
+    /// ```
+    /// use en16931::invoice::PostalAddress;
+    ///
+    /// let a = PostalAddress::new("Hauptstraße 1", "Musterstadt", "12345", "DE")?;
+    /// assert_eq!(a.country.as_ref().map(|c| c.as_str()), Some("DE"));
+    /// assert!(PostalAddress::new("Hauptstraße 1", "Musterstadt", "12345", "XX").is_err());
+    /// # Ok::<(), en16931::codes::guard::CodeError>(())
+    /// ```
+    ///
+    /// # Errors
+    /// [`CodeError`](crate::codes::guard::CodeError) when `country` is not an
+    /// ISO 3166-1 alpha-2 code.
+    pub fn new(
+        street: impl Into<String>,
+        city: impl Into<String>,
+        post_code: impl Into<String>,
+        country: &str,
+    ) -> Result<Self, crate::codes::guard::CodeError> {
+        Ok(Self {
+            line1: Some(street.into()),
+            city: Some(city.into()),
+            post_code: Some(post_code.into()),
+            country: Some(crate::codes::guard::country(country)?),
+            ..Self::default()
+        })
+    }
 }
 
 /// BG-6 SELLER CONTACT or BG-9 BUYER CONTACT.
 ///
-/// Optional in the core model and **mandatory in XRechnung** — `BR-DE-2`
-/// requires the group, and `BR-DE-5` … `BR-DE-7` require all three of its terms.
-/// That is `Restriction::Mandatory` doing real work: three CIUS rules, three
-/// lines of data.
+/// Optional in the core model; XRechnung requires the seller's (`BR-DE-2`) with
+/// all three terms (`BR-DE-5` … `BR-DE-7`).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Contact {
@@ -161,15 +176,33 @@ pub struct Contact {
     pub email: Option<String>,
 }
 
+impl Contact {
+    /// A contact with all three terms — what XRechnung requires of the seller
+    /// (`BR-DE-5`, `-6`, `-7`).
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        phone: impl Into<String>,
+        email: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: Some(name.into()),
+            phone: Some(phone.into()),
+            email: Some(email.into()),
+        }
+    }
+}
+
 /// BG-4 SELLER or BG-7 BUYER.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Party {
-    /// BT-27 / BT-44 — **mandatory** name (BR-06, BR-07).
+    /// BT-27 / BT-44 — mandatory name (BR-06, BR-07).
     pub name: Option<String>,
     /// BT-28 / BT-45 — trading name.
     pub trading_name: Option<String>,
     /// BT-29 / BT-46 — identifiers.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub identifiers: Vec<Identifier>,
     /// BT-30 / BT-47 — legal registration identifier.
     pub legal_registration: Option<Identifier>,
@@ -179,22 +212,17 @@ pub struct Party {
     pub tax_registration: Option<String>,
     /// BT-33 — seller additional legal information, such as share capital.
     pub additional_legal_information: Option<String>,
-    /// BT-34 / BT-49 — **mandatory** electronic address with a scheme
+    /// BT-34 / BT-49 — mandatory electronic address with a scheme
     /// (BR-62, BR-63).
     pub electronic_address: Option<Identifier>,
-    /// BG-5 / BG-8 — **mandatory** postal address (BR-08, BR-10).
+    /// BG-5 / BG-8 — mandatory postal address (BR-08, BR-10).
     pub address: PostalAddress,
-    /// BG-6 / BG-9 — contact. Optional in the core model, mandatory in
-    /// XRechnung (`BR-DE-2`).
+    /// BG-6 / BG-9 — contact. XRechnung requires BG-6 (`BR-DE-2`).
     pub contact: Contact,
 }
 
-/// Which side of the transaction a [`Party`] is on.
-///
-/// EN 16931 gives the seller and the buyer *different* business terms for the
-/// same information — the seller's city is BT-37 and the buyer's is BT-52 — and
-/// profiles restrict them independently. So a party cannot be checked against a
-/// profile without saying which one it is.
+/// Which side of the transaction a [`Party`] is on; seller and buyer use
+/// different business terms (BT-37 vs BT-52 for the city).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PartyRole {
     /// BG-4 — the seller.
@@ -215,13 +243,57 @@ impl PartyRole {
 }
 
 impl Party {
-    /// The terms `profile` requires of this party that it does not yet carry.
+    /// A party with name (BT-27 / BT-44, `BR-06` / `BR-07`) and postal address
+    /// (BG-5 / BG-8, `BR-08` / `BR-10`). Everything else is set with the
+    /// `with_*` methods or on the fields.
     ///
-    /// A **pre-flight for master data**: it answers *"which extra fields will
-    /// this profile ask me for about this company?"* without an invoice, so a
-    /// caller can fetch them from a contract or customer service in one round
-    /// trip rather than discovering them from a post-hoc
-    /// [`validate`](crate::validate).
+    /// ```
+    /// use en16931::Identifier;
+    /// use en16931::invoice::{Contact, Party, PostalAddress};
+    ///
+    /// let seller = Party::new(
+    ///         "Stadtwerke Musterstadt GmbH",
+    ///         PostalAddress::new("Hauptstraße 1", "Musterstadt", "12345", "DE")?,
+    ///     )
+    ///     .with_vat_identifier("DE123456789")
+    ///     .with_electronic_address(Identifier::eas("4012345000009", "0088")?)
+    ///     .with_contact(Contact::new("Erika Muster", "+49 30 1234567", "rechnung@example.de"));
+    /// assert_eq!(seller.vat_identifier.as_deref(), Some("DE123456789"));
+    /// # Ok::<(), en16931::codes::guard::CodeError>(())
+    /// ```
+    #[must_use]
+    pub fn new(name: impl Into<String>, address: PostalAddress) -> Self {
+        Self {
+            name: Some(name.into()),
+            address,
+            ..Self::default()
+        }
+    }
+
+    /// BT-31 / BT-48 — the VAT identifier, with its country prefix (`BR-CO-09`).
+    #[must_use]
+    pub fn with_vat_identifier(mut self, id: impl Into<String>) -> Self {
+        self.vat_identifier = Some(id.into());
+        self
+    }
+
+    /// BT-34 / BT-49 — the electronic address; build it with
+    /// [`Identifier::eas`], which checks the scheme.
+    #[must_use]
+    pub fn with_electronic_address(mut self, address: Identifier) -> Self {
+        self.electronic_address = Some(address);
+        self
+    }
+
+    /// BG-6 / BG-9 — the contact.
+    #[must_use]
+    pub fn with_contact(mut self, contact: Contact) -> Self {
+        self.contact = contact;
+        self
+    }
+
+    /// The terms `profile` requires of this party that it does not yet carry,
+    /// checked without an invoice.
     ///
     /// ```
     /// use en16931::invoice::{Party, PartyRole};
@@ -238,13 +310,8 @@ impl Party {
     /// assert!(!seller.iter().map(|m| m.term.0).any(|t| t == 52));
     /// ```
     ///
-    /// # What it cannot tell you
-    ///
-    /// The same limit as [`Profile::missing_terms`]: restrictions are data and
-    /// are answered exactly; the conditional rules in `extra_rules` depend on
-    /// the whole document and are not. `BR-DE-16`, which wants *one of* BT-30,
-    /// BT-31 or BT-32 on the seller, is one of those — it is a disjunction, not
-    /// a mandatory term, and no per-field answer would be honest.
+    /// As with [`Profile::missing_terms`], only restrictions are answered;
+    /// conditional rules such as `BR-DE-16` (one of BT-30, BT-31, BT-32) are not.
     ///
     /// [`Profile::missing_terms`]: crate::validation::profile::Profile::missing_terms
     #[must_use]
@@ -253,11 +320,8 @@ impl Party {
         profile: &crate::Profile,
         role: PartyRole,
     ) -> Vec<crate::validation::profile::Missing> {
-        // The restrictions read from an `Invoice`, so the party is placed in a
-        // scratch one and the answers filtered to that role's group. Reusing
-        // the profile's own data is the whole point: a second table of "which
-        // terms does XRechnung want of a buyer" would be one more thing to keep
-        // in step with the first.
+        // Restrictions read an `Invoice`: place the party in a scratch one and
+        // keep the answers for its group.
         let mut scratch = Invoice::default();
         match role {
             PartyRole::Seller => scratch.seller = self.clone(),
@@ -274,21 +338,9 @@ impl Party {
 
 /// Whether the document is an invoice or a credit note.
 ///
-/// # Why this is not derived from BT-3
-///
-/// CEN's conformance suite settles it: `BR-CO-25` must not fire on a credit
-/// note, and the suite's credit-note cases carry **no BT-3 at all**. A model
-/// that infers the kind from the type code cannot answer what those cases ask.
-///
-/// It is also what the syntaxes actually carry. UBL has two root elements,
-/// `ubl-invoice:Invoice` and `ubl-creditnote:CreditNote`, and several CEN rules
-/// are bound to one of them rather than to a business term. CII marks it on
-/// `ExchangedDocument`. Deriving it back out of BT-3 throws away something both
-/// syntaxes state outright.
-///
-/// `BR-CL-01` then becomes exact rather than permissive: an *invoice* carrying
-/// `381` is invalid, which is what the artefact's `self::` disjunction says and
-/// what a membership test over the union of both lists cannot express.
+/// Not derived from BT-3: it is what the UBL root element states, CEN rules
+/// such as `BR-CO-25` key on it, and CEN credit-note test cases carry no BT-3.
+/// `BR-CL-01` checks BT-3 against the list for this kind.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DocumentKind {
@@ -300,15 +352,6 @@ pub enum DocumentKind {
 }
 
 /// BG-1 INVOICE NOTE — free text with an optional subject code.
-///
-/// BT-21 exists because a note's *purpose* is not inferable from its wording. A
-/// German invoice's reverse-charge sentence and its payment instructions are
-/// both free text; only the code says which is which, and downstream systems
-/// route on the code.
-///
-/// UBL and CII carry BT-21 differently — UBL embeds it in the note text as
-/// `#AAI#the text`, CII gives it its own element — which is precisely the sort
-/// of difference this crate exists to keep out of the model.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InvoiceNote {
@@ -336,11 +379,23 @@ impl InvoiceNote {
     }
 }
 
+impl From<&str> for InvoiceNote {
+    fn from(note: &str) -> Self {
+        Self::new(note)
+    }
+}
+
+impl From<String> for InvoiceNote {
+    fn from(note: String) -> Self {
+        Self::new(note)
+    }
+}
+
 /// BG-10 PAYEE — where payment is directed, when that is not the seller.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Payee {
-    /// BT-59 — **mandatory** payee name (BR-17), when BG-10 differs from BG-4.
+    /// BT-59 — mandatory payee name (BR-17), when BG-10 differs from BG-4.
     pub name: Option<String>,
     /// BT-60 — payee identifier.
     pub identifier: Option<Identifier>,
@@ -348,20 +403,16 @@ pub struct Payee {
     pub legal_registration: Option<Identifier>,
 }
 
-/// BG-11 SELLER TAX REPRESENTATIVE PARTY.
-///
-/// A seller established outside the member state of supply may appoint one; the
-/// representative then declares and pays the VAT. Several category rows accept
-/// its BT-63 in place of the seller's own BT-31.
+/// BG-11 SELLER TAX REPRESENTATIVE PARTY. Several VAT category rules accept
+/// its BT-63 in place of the seller's BT-31.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TaxRepresentative {
-    /// BT-62 — **mandatory** name (BR-18).
+    /// BT-62 — mandatory name (BR-18).
     pub name: Option<String>,
-    /// BT-63 — **mandatory** VAT identifier (BR-56).
+    /// BT-63 — mandatory VAT identifier (BR-56).
     pub vat_identifier: Option<String>,
-    /// BG-12 — **mandatory** postal address (BR-19), whose BT-69 country code is
-    /// itself mandatory (BR-20).
+    /// BG-12 — mandatory postal address (BR-19); BT-69 is mandatory (BR-20).
     pub address: PostalAddress,
 }
 
@@ -369,7 +420,7 @@ pub struct TaxRepresentative {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrecedingInvoice {
-    /// BT-25 — **mandatory** reference (BR-55).
+    /// BT-25 — mandatory reference (BR-55).
     pub reference: DocumentReference,
     /// BT-26 — issue date.
     pub issue_date: Option<Date>,
@@ -379,7 +430,7 @@ pub struct PrecedingInvoice {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupportingDocument {
-    /// BT-122 — **mandatory** reference (BR-52).
+    /// BT-122 — mandatory reference (BR-52).
     pub reference: DocumentReference,
     /// BT-123 — description.
     pub description: Option<String>,
@@ -393,7 +444,7 @@ pub struct SupportingDocument {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CreditTransfer {
-    /// BT-84 — **mandatory** payment account identifier (BR-50).
+    /// BT-84 — mandatory payment account identifier (BR-50).
     pub account_identifier: Option<String>,
     /// BT-85 — payment account name.
     pub account_name: Option<String>,
@@ -405,11 +456,8 @@ pub struct CreditTransfer {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PaymentCard {
-    /// BT-87 — card primary account number.
-    ///
-    /// `BR-51` is the **one warning** in the entire CEN abstract model: an
-    /// invoice should never carry a full PAN. PCI DSS permits at most the first
-    /// six and last four digits.
+    /// BT-87 — card primary account number. `BR-51` (a warning): never the full
+    /// PAN, at most the first six and last four digits.
     pub primary_account_number: Option<String>,
     /// BT-88 — payment card holder name.
     pub holder_name: Option<String>,
@@ -427,17 +475,9 @@ pub struct DirectDebit {
     pub debited_account: Option<String>,
 }
 
-/// BG-17, BG-18 or BG-19 — **mutually exclusive** by construction.
-///
-/// The standard nests three sub-groups under BG-16 and every profile treats them
-/// as alternatives: XRechnung's `BR-DE-23-b` says that when BT-81 names a credit
-/// transfer, *"dürfen BG-18 und BG-19 nicht übermittelt werden"*, and `-24-b` and
-/// `-25-b` say the same in the other two directions.
-///
-/// Modelled as an enum so those three rules have nothing left to check — the
-/// combination they forbid cannot be written down. `BR-DE-23-a`, `-24-a` and
-/// `-25-a` remain real rules, because they tie the *variant* to BT-81's value,
-/// which the type system cannot see.
+/// BG-17, BG-18 or BG-19 — mutually exclusive by construction, so
+/// `BR-DE-23-b`, `-24-b` and `-25-b` cannot fail. `BR-DE-23-a` … `-25-a`, which
+/// tie the variant to BT-81, are still checked.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaymentMeans {
@@ -453,7 +493,7 @@ pub enum PaymentMeans {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PaymentInstructions {
-    /// BT-81 — **mandatory** payment means code (BR-49).
+    /// BT-81 — mandatory payment means code (BR-49).
     pub means_code: Option<Code>,
     /// BT-82 — payment means text.
     pub means_text: Option<String>,
@@ -464,6 +504,63 @@ pub struct PaymentInstructions {
 }
 
 impl PaymentInstructions {
+    /// A SEPA credit transfer to `iban`: BT-81 = `58` (UNTDID 4461, *SEPA credit
+    /// transfer*) and one BG-17 with BT-84 and, when given, BT-86.
+    ///
+    /// A non-SEPA transfer is code `30`; build it on the fields.
+    ///
+    /// ```
+    /// use en16931::invoice::PaymentInstructions;
+    ///
+    /// let pay = PaymentInstructions::sepa_credit_transfer("DE02120300000000202051", Some("BYLADEM1001"));
+    /// assert_eq!(pay.means_code.as_ref().map(|c| c.as_str()), Some("58"));
+    /// assert_eq!(pay.account_identifier(), Some("DE02120300000000202051"));
+    /// ```
+    ///
+    /// The IBAN is not checked here; with the `sepa` feature the rules check
+    /// BT-84 at validation.
+    #[must_use]
+    pub fn sepa_credit_transfer(iban: impl Into<String>, bic: Option<&str>) -> Self {
+        Self {
+            means_code: Some(Code::new("58")),
+            means: Some(PaymentMeans::CreditTransfer(vec![CreditTransfer {
+                account_identifier: Some(iban.into()),
+                account_name: None,
+                provider_identifier: bic.map(str::to_owned),
+            }])),
+            ..Self::default()
+        }
+    }
+
+    /// A SEPA direct debit: BT-81 = `59` (UNTDID 4461, *SEPA direct debit*) and
+    /// BG-19 with BT-89 (`mandate`), BT-90 (`creditor_id`) and, when given,
+    /// BT-91 (`debited_account` — XRechnung requires it, `BR-DE-31`).
+    ///
+    /// ```
+    /// use en16931::invoice::PaymentInstructions;
+    ///
+    /// let pay = PaymentInstructions::sepa_direct_debit(
+    ///     "MANDATE-0001", "DE98ZZZ09999999999", Some("DE75512108001245126199"));
+    /// assert_eq!(pay.means_code.as_ref().map(|c| c.as_str()), Some("59"));
+    /// assert_eq!(pay.mandate_reference(), Some("MANDATE-0001"));
+    /// ```
+    #[must_use]
+    pub fn sepa_direct_debit(
+        mandate: impl Into<String>,
+        creditor_id: impl Into<String>,
+        debited_account: Option<&str>,
+    ) -> Self {
+        Self {
+            means_code: Some(Code::new("59")),
+            means: Some(PaymentMeans::DirectDebit(DirectDebit {
+                mandate_reference: Some(mandate.into()),
+                creditor_identifier: Some(creditor_id.into()),
+                debited_account: debited_account.map(str::to_owned),
+            })),
+            ..Self::default()
+        }
+    }
+
     /// BT-84, when this is a credit transfer.
     #[must_use]
     pub fn account_identifier(&self) -> Option<&str> {
@@ -506,22 +603,20 @@ pub struct Delivery {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LineVat {
-    /// BT-151 / BT-95 / BT-102 — **mandatory** category code
+    /// BT-151 / BT-95 / BT-102 — mandatory category code
     /// (BR-CO-04, BR-32, BR-37).
     pub category: Code,
     /// BT-152 / BT-96 / BT-103 — the rate.
     ///
-    /// `None` for category `O` only: BR-O-05/06/07 say the element *"shall not
-    /// contain"* a rate, where every other zero-tax category says it *"shall be
-    /// 0"*. This is **not** BT-119 — see [`crate::VatCategory::states_rate`].
+    /// `None` for category `O` only (BR-O-05/06/07); other zero-tax categories
+    /// state 0. Not BT-119 — see [`crate::VatCategory::states_rate`].
     pub rate: Option<Percentage>,
 }
 
 impl LineVat {
     /// The category's semantics, if the code is one of the ten UNCL 5305 values.
     ///
-    /// `None` means `BR-CL-17` / `BR-CL-18` fails, and the category-specific
-    /// rules cannot be evaluated for this element.
+    /// `None` means `BR-CL-17` / `BR-CL-18` fails and category rules skip it.
     #[must_use]
     pub fn semantics(&self) -> Option<crate::VatCategory> {
         crate::VatCategory::from_code(self.category.as_str())
@@ -532,24 +627,19 @@ impl LineVat {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VatBreakdown {
-    /// BT-116 — **mandatory** taxable amount (BR-45).
+    /// BT-116 — mandatory taxable amount (BR-45).
     pub taxable_amount: InvoiceAmount,
-    /// BT-117 — **mandatory** tax amount (BR-46).
+    /// BT-117 — mandatory tax amount (BR-46).
     pub tax_amount: InvoiceAmount,
-    /// BT-118 — **mandatory** category code (BR-47).
+    /// BT-118 — mandatory category code (BR-47).
     pub category: Code,
-    /// BT-119 — the category rate.
-    ///
-    /// BR-48 makes it optional *"if the Invoice is not subject to VAT"*.
-    /// XRechnung's **BR-DE-14 requires it unconditionally**, so a document
-    /// targeting that profile must fill it even for category `O`.
+    /// BT-119 — the category rate. Optional when not subject to VAT (BR-48);
+    /// XRechnung requires it always (BR-DE-14), even for category `O`.
     pub rate: Option<Percentage>,
     /// BT-120 — exemption reason text.
     pub exemption_reason: Option<String>,
-    /// BT-121 — exemption reason code, from the CEF VATEX list.
-    ///
-    /// The category rules accept *either* this or BT-120; modelling only the
-    /// text forces a caller holding a VATEX code to invent prose.
+    /// BT-121 — exemption reason code, from the CEF VATEX list. The category
+    /// rules accept either this or BT-120.
     pub exemption_reason_code: Option<Code>,
 }
 
@@ -568,8 +658,7 @@ impl VatBreakdown {
 
     /// The grouping key BR-S-08 and its siblings compare on.
     ///
-    /// The rate is compared by value, so `19` and `19.00` are one group — see
-    /// [`Percentage`] for why that needs no normalisation step here.
+    /// The rate compares by value, so `19` and `19.00` are one group.
     #[must_use]
     pub fn group_key(&self) -> (Code, Option<Percentage>) {
         (self.category.clone(), self.rate)
@@ -580,18 +669,17 @@ impl VatBreakdown {
 
 /// BG-20 DOCUMENT LEVEL ALLOWANCE or BG-21 DOCUMENT LEVEL CHARGE.
 ///
-/// One type for both, because every rule about them is the same rule with a
-/// different BT number. Which one it is comes from the field it lives in.
+/// Which one it is follows from the [`Invoice`] field holding it.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentAllowanceCharge {
-    /// BT-92 / BT-99 — **mandatory** amount (BR-31, BR-36). Stated **positive**.
+    /// BT-92 / BT-99 — mandatory amount (BR-31, BR-36), stated positive.
     pub amount: InvoiceAmount,
     /// BT-93 / BT-100 — base amount. Paired with the percentage (`R041`/`R042`).
     pub base_amount: Option<InvoiceAmount>,
     /// BT-94 / BT-101 — percentage. Paired with the base amount.
     pub percentage: Option<Percentage>,
-    /// BT-95 / BT-102 and BT-96 / BT-103 — **mandatory** VAT (BR-32, BR-37).
+    /// BT-95 / BT-102 and BT-96 / BT-103 — mandatory VAT (BR-32, BR-37).
     pub vat: LineVat,
     /// BT-97 / BT-104 — reason text.
     pub reason: Option<String>,
@@ -603,7 +691,7 @@ pub struct DocumentAllowanceCharge {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineAllowanceCharge {
-    /// BT-136 / BT-141 — **mandatory** amount (BR-41, BR-43).
+    /// BT-136 / BT-141 — mandatory amount (BR-41, BR-43).
     pub amount: InvoiceAmount,
     /// BT-137 / BT-142 — base amount.
     pub base_amount: Option<InvoiceAmount>,
@@ -621,7 +709,7 @@ pub struct LineAllowanceCharge {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PriceDetails {
-    /// BT-146 — **mandatory** item net price (BR-26). Not negative (BR-27).
+    /// BT-146 — mandatory item net price (BR-26). Not negative (BR-27).
     pub net_price: UnitPriceAmount,
     /// BT-147 — item price discount.
     pub price_discount: Option<UnitPriceAmount>,
@@ -637,9 +725,9 @@ pub struct PriceDetails {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ItemAttribute {
-    /// BT-160 — **mandatory** attribute name (BR-54), such as "Colour".
+    /// BT-160 — mandatory attribute name (BR-54), such as "Colour".
     pub name: Option<String>,
-    /// BT-161 — **mandatory** attribute value (BR-54), such as "Red".
+    /// BT-161 — mandatory attribute value (BR-54), such as "Red".
     pub value: Option<String>,
 }
 
@@ -647,7 +735,7 @@ pub struct ItemAttribute {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Item {
-    /// BT-153 — **mandatory** item name (BR-25).
+    /// BT-153 — mandatory item name (BR-25).
     pub name: Option<String>,
     /// BT-154 — item description.
     pub description: Option<String>,
@@ -655,13 +743,15 @@ pub struct Item {
     pub seller_identifier: Option<String>,
     /// BT-156 — buyer's item identifier.
     pub buyer_identifier: Option<String>,
-    /// BT-157 — standard identifier. **Must** carry a scheme (BR-64).
+    /// BT-157 — standard identifier. Must carry a scheme (BR-64).
     pub standard_identifier: Option<Identifier>,
-    /// BT-158 — classification identifiers. **Must** carry a scheme (BR-65).
+    /// BT-158 — classification identifiers. Must carry a scheme (BR-65).
+    #[cfg_attr(feature = "serde", serde(default))]
     pub classification_identifiers: Vec<Identifier>,
     /// BT-159 — item country of origin.
     pub origin_country: Option<Code>,
     /// BG-32 — item attributes.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub attributes: Vec<ItemAttribute>,
 }
 
@@ -669,7 +759,7 @@ pub struct Item {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceLine {
-    /// BT-126 — **mandatory** line identifier (BR-21).
+    /// BT-126 — mandatory line identifier (BR-21).
     pub id: String,
     /// BT-127 — line note.
     pub note: Option<String>,
@@ -679,33 +769,31 @@ pub struct InvoiceLine {
     pub accounting_reference: Option<String>,
     /// BT-128 — line object identifier.
     pub object_identifier: Option<Identifier>,
-    /// BT-129 — **mandatory** invoiced quantity (BR-22). **May be negative.**
+    /// BT-129 — mandatory invoiced quantity (BR-22). May be negative.
     pub quantity: Quantity,
-    /// BT-130 — **mandatory** unit of measure code (BR-23).
+    /// BT-130 — mandatory unit of measure code (BR-23).
     pub unit_code: Code,
-    /// BT-131 — **mandatory** line net amount (BR-24).
+    /// BT-131 — mandatory line net amount (BR-24).
     pub net_amount: InvoiceAmount,
     /// BG-26 — line period.
     pub period: Option<Period>,
     /// BG-27 — line allowances. Already folded into BT-131.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub allowances: Vec<LineAllowanceCharge>,
     /// BG-28 — line charges. Already folded into BT-131.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub charges: Vec<LineAllowanceCharge>,
-    /// BG-29 — **mandatory** price details.
+    /// BG-29 — mandatory price details.
     pub price: PriceDetails,
-    /// BG-30 — **mandatory** line VAT information (BR-CO-04).
+    /// BG-30 — mandatory line VAT information (BR-CO-04).
     pub vat: LineVat,
     /// BG-31 — item information.
     pub item: Item,
 }
 
 impl InvoiceLine {
-    /// A line, naming the seven terms EN 16931 makes mandatory on every one.
-    ///
-    /// BT-126, BT-153, BT-129, BT-130, BT-131, BT-151 and BT-152 — the terms
-    /// `BR-21` … `BR-26` and `BR-CO-04` require. The same discipline as
-    /// [`Invoice::builder`]: forgetting one is a compile error rather than a
-    /// finding.
+    /// A line from BT-126, BT-153, BT-129, BT-130, BT-131, BT-151 and BT-152
+    /// (`BR-21` … `BR-25`, `BR-CO-04`); BT-146 is derived.
     ///
     /// ```
     /// use en16931::{InvoiceAmount, InvoiceLine, Percentage, Quantity};
@@ -725,23 +813,9 @@ impl InvoiceLine {
     /// # Ok::<(), en16931::ParseAmountError>(())
     /// ```
     ///
-    /// # BT-146 is derived, and when that is wrong
-    ///
-    /// `BR-26` makes the item net price mandatory, so it cannot be left unset.
-    /// For a line stating both a quantity and a net amount the unit price is
-    /// their quotient, and that is what this computes — exactly what
-    /// `PEPPOL-EN16931-R120` then checks in the other direction.
-    ///
-    /// Two cases where the quotient is not the price you meant, both fixed with
-    /// [`with_price`](Self::with_price):
-    ///
-    /// * the real price has a **base quantity** (BT-149) — `0.42 EUR per 100
-    ///   pieces` is not `0.0042 EUR per piece`, and the two render differently
-    ///   on the invoice a human reads;
-    /// * the quotient does not terminate, so the derived price carries the
-    ///   division's own rounding rather than the one your price list states.
-    ///
-    /// A zero quantity leaves BT-146 at zero rather than dividing.
+    /// BT-146 (`BR-26`) is set to net amount / quantity, or zero for a zero
+    /// quantity. Use [`with_price`](Self::with_price) when the price has a base
+    /// quantity (BT-149) or the quotient does not terminate.
     #[must_use]
     pub fn new(
         id: impl Into<String>,
@@ -822,30 +896,29 @@ impl InvoiceLine {
 
 /// BG-22 DOCUMENT TOTALS.
 ///
-/// Five of the ten terms are `Option`, and **absent is not zero** — see the
-/// module documentation.
+/// The five `Option` terms distinguish absent from zero.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DocumentTotals {
-    /// BT-106 — **mandatory** sum of line net amounts (BR-12).
+    /// BT-106 — mandatory sum of line net amounts (BR-12).
     pub line_total: InvoiceAmount,
     /// BT-107 — sum of document level allowances.
     pub allowance_total: Option<InvoiceAmount>,
     /// BT-108 — sum of document level charges.
     pub charge_total: Option<InvoiceAmount>,
-    /// BT-109 — **mandatory** total without VAT (BR-13).
+    /// BT-109 — mandatory total without VAT (BR-13).
     pub taxable_total: InvoiceAmount,
     /// BT-110 — total VAT amount.
     pub vat_total: Option<InvoiceAmount>,
     /// BT-111 — total VAT in the accounting currency. Required with BT-6 (BR-53).
     pub vat_total_accounting: Option<InvoiceAmount>,
-    /// BT-112 — **mandatory** total with VAT (BR-14).
+    /// BT-112 — mandatory total with VAT (BR-14).
     pub gross_total: InvoiceAmount,
     /// BT-113 — paid amount.
     pub paid: Option<InvoiceAmount>,
     /// BT-114 — rounding amount.
     pub rounding: Option<InvoiceAmount>,
-    /// BT-115 — **mandatory** amount due for payment (BR-15).
+    /// BT-115 — mandatory amount due for payment (BR-15).
     pub due: InvoiceAmount,
 }
 
@@ -853,42 +926,33 @@ pub struct DocumentTotals {
 
 /// An EN 16931 core invoice.
 ///
-/// Fields are public: this is a data record, and both a builder and a parser
-/// need to populate it. Validity is [`crate::validation`]'s job, not the type's.
-/// # Constructing one
+/// A data record with public fields; validity is checked by
+/// [`crate::validation`]. Mandatory terms are `Option` too, so an incomplete
+/// document can be loaded and reported on.
 ///
-/// [`Invoice`] is `#[non_exhaustive]`, so that the business terms EN 16931-1:2026
-/// adds are additive rather than breaking . That means no
-/// struct literal from outside this crate — which is deliberate, and leaves two
-/// supported ways in:
+/// `#[non_exhaustive]`, so construct it with [`Invoice::builder`] (which takes
+/// BT-24, BT-1, BT-2, BT-3 and BT-5) or [`Invoice::default`] plus field
+/// assignment.
 ///
-/// - **[`Invoice::builder`]** for producing an invoice, which names the
-///   mandatory terms in its signature so the common mistakes are compile errors;
-/// - **[`Invoice::default`] plus field assignment** for parsing one, where terms
-///   arrive in whatever order the syntax presents them and *any* of them may be
-///   missing — which is exactly the document a parser must be able to load in
-///   order to report on.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// Under the `serde` feature it serialises as `{"en16931": "0.8", "invoice":
+/// {…}}` ([`JSON_VERSION`]); any other version is refused. List fields may be
+/// omitted.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct Invoice {
-    /// Whether this is an invoice or a credit note.
-    ///
-    /// Not a business term — it is what the syntax's root element states, and
-    /// several CEN rules are bound to one root rather than to a term. See
-    /// [`DocumentKind`].
+    /// Invoice or credit note — not a business term; see [`DocumentKind`].
     pub kind: DocumentKind,
-    /// BT-24 — **mandatory** specification identifier (BR-01). Selects the profile.
+    /// BT-24 — specification identifier, mandatory (BR-01). Selects the profile.
     pub specification_id: Option<String>,
     /// BT-23 — business process type.
     pub business_process: Option<String>,
-    /// BT-1 — **mandatory** invoice number (BR-02).
+    /// BT-1 — invoice number, mandatory (BR-02).
     pub number: Option<String>,
-    /// BT-2 — **mandatory** issue date (BR-03).
+    /// BT-2 — issue date, mandatory (BR-03).
     pub issue_date: Option<Date>,
-    /// BT-3 — **mandatory** invoice type code (BR-04).
+    /// BT-3 — invoice type code, mandatory (BR-04).
     pub type_code: Option<Code>,
-    /// BT-5 — **mandatory** invoice currency code (BR-05).
+    /// BT-5 — invoice currency code, mandatory (BR-05).
     pub currency: Option<Code>,
     /// BT-6 — VAT accounting currency code.
     pub vat_accounting_currency: Option<Code>,
@@ -902,10 +966,8 @@ pub struct Invoice {
     pub buyer_reference: Option<String>,
     /// BT-11 — project reference.
     pub project_reference: Option<DocumentReference>,
-    /// BT-12 — contract reference.
-    ///
-    /// Required by XRechnung's `BR-DE-CVD-01` on an invoice for road vehicles
-    /// under the Clean Vehicles Directive.
+    /// BT-12 — contract reference. Required by `BR-DE-CVD-01` on a
+    /// clean-vehicles invoice.
     pub contract_reference: Option<DocumentReference>,
     /// BT-13 — purchase order reference.
     pub purchase_order_reference: Option<DocumentReference>,
@@ -915,16 +977,11 @@ pub struct Invoice {
     pub receiving_advice_reference: Option<DocumentReference>,
     /// BT-16 — despatch advice reference.
     pub despatch_advice_reference: Option<DocumentReference>,
-    /// BT-17 — tender or lot reference.
-    ///
-    /// Required by XRechnung's `BR-DE-CVD-02` — public procurement of clean
-    /// road vehicles has to be traceable back to the tender it came from.
+    /// BT-17 — tender or lot reference. Required by `BR-DE-CVD-02` on a
+    /// clean-vehicles invoice.
     pub tender_reference: Option<DocumentReference>,
-    /// BT-18 — invoiced object identifier, at document level.
-    ///
-    /// The thing being billed for when it is not a purchase order: a subscriber
-    /// number, a meter point, a vehicle. `BR-CL-07` constrains its scheme, and
-    /// applies to this **and** to BT-128 on a line — one rule, two contexts.
+    /// BT-18 — invoiced object identifier (a meter point, a subscriber number).
+    /// `BR-CL-07` constrains its scheme, as on BT-128.
     pub object_identifier: Option<Identifier>,
     /// BT-19 — buyer accounting reference.
     pub accounting_reference: Option<String>,
@@ -961,24 +1018,171 @@ pub struct Invoice {
     pub lines: Vec<InvoiceLine>,
     /// BG-22 — document totals.
     pub totals: DocumentTotals,
-    /// Data with no core business term — see [`crate::extensions`].
-    ///
-    /// §4.3's second mechanism: a CIUS *restricts*, an Extension *adds*. Carried
-    /// here so a format crate that can represent it does, and `EN-EXT-01` warns
-    /// when the target profile cannot — rather than letting it vanish.
+    /// Data with no core business term — see [`crate::extensions`]. `EN-EXT-01`
+    /// warns when the target profile cannot carry it.
     pub extensions: crate::extensions::Extensions,
 }
 
+// ── JSON envelope ─────────────────────────────────────────────────────────────
+
+/// The version of the JSON envelope an [`Invoice`] is stored in under the
+/// `serde` feature: `{"en16931": "0.8", "invoice": {…}}`.
+///
+/// A reader refuses any other version.
+pub const JSON_VERSION: &str = "0.8";
+
+#[cfg(feature = "serde")]
+mod json {
+    use super::*;
+    use serde::de::{self, MapAccess, SeqAccess, Visitor};
+    use serde::ser::SerializeStruct as _;
+
+    /// The field list; the remote derive makes the compiler check it against
+    /// [`Invoice`].
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(remote = "Invoice")]
+    struct Body {
+        kind: DocumentKind,
+        specification_id: Option<String>,
+        business_process: Option<String>,
+        number: Option<String>,
+        issue_date: Option<Date>,
+        type_code: Option<Code>,
+        currency: Option<Code>,
+        vat_accounting_currency: Option<Code>,
+        vat_point_date: Option<Date>,
+        vat_point_date_code: Option<Code>,
+        due_date: Option<Date>,
+        buyer_reference: Option<String>,
+        project_reference: Option<DocumentReference>,
+        contract_reference: Option<DocumentReference>,
+        purchase_order_reference: Option<DocumentReference>,
+        sales_order_reference: Option<DocumentReference>,
+        receiving_advice_reference: Option<DocumentReference>,
+        despatch_advice_reference: Option<DocumentReference>,
+        tender_reference: Option<DocumentReference>,
+        object_identifier: Option<Identifier>,
+        accounting_reference: Option<String>,
+        payment_terms: Option<String>,
+        #[serde(default)]
+        notes: Vec<InvoiceNote>,
+        #[serde(default)]
+        preceding_invoices: Vec<PrecedingInvoice>,
+        seller: Party,
+        buyer: Party,
+        payee: Option<Payee>,
+        tax_representative: Option<TaxRepresentative>,
+        delivery: Option<Delivery>,
+        invoicing_period: Option<Period>,
+        payment: Option<PaymentInstructions>,
+        #[serde(default)]
+        allowances: Vec<DocumentAllowanceCharge>,
+        #[serde(default)]
+        charges: Vec<DocumentAllowanceCharge>,
+        #[serde(default)]
+        vat_breakdown: Vec<VatBreakdown>,
+        #[serde(default)]
+        attachments: Vec<SupportingDocument>,
+        #[serde(default)]
+        lines: Vec<InvoiceLine>,
+        totals: DocumentTotals,
+        #[serde(default)]
+        extensions: crate::extensions::Extensions,
+    }
+
+    struct Out<'a>(&'a Invoice);
+
+    impl serde::Serialize for Out<'_> {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            Body::serialize(self.0, s)
+        }
+    }
+
+    struct In(Invoice);
+
+    impl<'de> serde::Deserialize<'de> for In {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            Body::deserialize(d).map(In)
+        }
+    }
+
+    impl serde::Serialize for Invoice {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            let mut st = s.serialize_struct("Invoice", 2)?;
+            st.serialize_field("en16931", JSON_VERSION)?;
+            st.serialize_field("invoice", &Out(self))?;
+            st.end()
+        }
+    }
+
+    fn check<E: de::Error>(found: &str) -> Result<(), E> {
+        if found == JSON_VERSION {
+            Ok(())
+        } else {
+            Err(E::custom(format!(
+                "Invoice JSON version {found:?}; this build reads version {JSON_VERSION:?}"
+            )))
+        }
+    }
+
+    struct Envelope;
+
+    impl<'de> Visitor<'de> for Envelope {
+        type Value = Invoice;
+
+        fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(
+                f,
+                "an Invoice envelope {{\"en16931\": \"{JSON_VERSION}\", \"invoice\": …}}"
+            )
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Invoice, A::Error> {
+            let mut version = false;
+            let mut invoice = None;
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "en16931" => {
+                        check(&map.next_value::<String>()?)?;
+                        version = true;
+                    }
+                    "invoice" => invoice = Some(map.next_value::<In>()?.0),
+                    other => return Err(de::Error::unknown_field(other, FIELDS)),
+                }
+            }
+            if !version {
+                return Err(de::Error::custom(format!(
+                    "not an Invoice envelope: no \"en16931\" version (this build reads {JSON_VERSION:?})"
+                )));
+            }
+            invoice.ok_or_else(|| de::Error::missing_field("invoice"))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Invoice, A::Error> {
+            let version: String = seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+            check(&version)?;
+            let body: In = seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+            Ok(body.0)
+        }
+    }
+
+    const FIELDS: &[&str] = &["en16931", "invoice"];
+
+    impl<'de> serde::Deserialize<'de> for Invoice {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_struct("Invoice", FIELDS, Envelope)
+        }
+    }
+}
+
 impl Invoice {
-    /// Start building an invoice, naming the terms EN 16931 makes mandatory on
-    /// every document.
-    ///
-    /// The five arguments are BT-24, BT-1, BT-2, BT-3 and BT-5 — the terms
-    /// BR-01 … BR-05 require unconditionally. Everything else is optional here
-    /// and checked by [`crate::validation::validate`], because whether it is
-    /// required depends on the document: BR-CO-25 wants a due date only when
-    /// something is owed, and the category families want a VAT identifier only
-    /// for the categories that levy tax.
+    /// Start building an invoice from BT-24, BT-1, BT-2, BT-3 and BT-5 (BR-01 …
+    /// BR-05). Everything else is set on the builder and checked by
+    /// [`crate::validation::validate`].
     #[must_use]
     pub fn builder(
         specification_id: impl Into<String>,
@@ -999,11 +1203,9 @@ impl Invoice {
         }
     }
 
-    /// Turn this invoice into the credit note that cancels it — a German
-    /// *Stornorechnung* — without re-billing.
+    /// The credit note that cancels this invoice (*Stornorechnung*).
     ///
-    /// Copies everything, then makes the four changes that distinguish a credit
-    /// note from the invoice it reverses:
+    /// Copies everything, then changes:
     ///
     /// | | |
     /// |---|---|
@@ -1012,16 +1214,8 @@ impl Invoice {
     /// | BT-1, BT-2 | the caller's — a credit note is its own document with its own number |
     /// | BG-3 | a [`PrecedingInvoice`] naming the original's BT-1 and BT-2 |
     ///
-    /// # What it deliberately does not do
-    ///
-    /// **It does not negate the amounts.** Under EN 16931 a credit note states
-    /// what is being credited as a *positive* figure — the document type is
-    /// what carries the direction. Negating would produce a document that fails
-    /// `BR-S-08` against its own lines and states the wrong thing twice.
-    ///
-    /// **It does not drop the payment terms.** BT-9 and BT-20 survive because
-    /// only the seller knows whether the credit is repayable and when;
-    /// `BR-CO-25` does not fire on a credit note, so neither is required.
+    /// Amounts are not negated: a credit note states positive figures and the
+    /// document type carries the direction. BT-9 and BT-20 are kept.
     ///
     /// ```
     /// # use en16931::{Date, Invoice};
@@ -1036,9 +1230,7 @@ impl Invoice {
     /// # Ok(()) }
     /// ```
     ///
-    /// An invoice with no BT-1 produces no BG-3 rather than an empty reference:
-    /// `BR-55` requires BT-25 to have content, and inventing a blank one would
-    /// turn a missing number into a second, more confusing finding.
+    /// An invoice with no BT-1 gets no BG-3, since a blank BT-25 fails `BR-55`.
     #[must_use]
     pub fn to_credit_note(&self, number: impl Into<String>, issue_date: Date) -> Self {
         let mut note = self.clone();
@@ -1055,10 +1247,8 @@ impl Invoice {
         note
     }
 
-    /// Every path a rule might want to iterate, for diagnostics and tests.
-    ///
-    /// Not used by the engine — rules iterate the collection they care about —
-    /// but useful for asserting that a report covers what it should.
+    /// The totals path plus one path per line, VAT breakdown, allowance and
+    /// charge; for diagnostics and tests.
     #[must_use]
     pub fn occupied_groups(&self) -> Vec<Path> {
         let mut v = vec![Path::group(Group::Totals)];
@@ -1071,8 +1261,7 @@ impl Invoice {
 
     /// The VAT category semantics present anywhere in the document.
     ///
-    /// Used by the exclusivity rules — BR-O-11 … BR-O-14 — and by the
-    /// category-specific families to decide whether they apply at all.
+    /// Used by BR-O-11 … BR-O-14 and to decide which category families apply.
     #[must_use]
     pub fn categories_used(&self) -> Vec<crate::VatCategory> {
         let mut v: Vec<_> = self
@@ -1093,8 +1282,8 @@ impl Invoice {
     }
 }
 
-/// The business terms this module addresses, as constants, so a rule never
-/// writes a bare number.
+/// Named constants for business terms — `terms::BUYER_REFERENCE` rather than
+/// `BtId(10)`. Not every term has one.
 pub mod terms {
     use crate::bt::BtId;
 
@@ -1199,9 +1388,6 @@ pub mod terms {
     }
 }
 
-#[allow(unused_imports)]
-use terms as _terms_are_public;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,8 +1403,7 @@ mod tests {
 
     #[test]
     fn an_invalid_code_is_representable() {
-        // The whole point: a parser must be able to load `BT-3 = "999"` so the
-        // engine can report BR-CL-01 against it, with a path.
+        // Loadable, so BR-CL-01 can report it.
         let bad = Code::new("999");
         assert_eq!(bad.as_str(), "999");
         assert!(!bad.is_in(crate::codes::generated::INVOICE_TYPE_CODES));
@@ -1239,8 +1424,7 @@ mod tests {
         assert_eq!(bad.semantics(), None, "so BR-CL-18 fires and others skip");
     }
 
-    /// The Stornorechnung path: everything survives, four things change, and
-    /// the result is still valid against the rules the original passed.
+    /// Everything is copied; kind, BT-3, BT-1, BT-2 and BG-3 change.
     #[test]
     fn a_credit_note_reverses_the_document_without_touching_the_money() {
         let mut inv = Invoice::builder(
@@ -1305,16 +1489,134 @@ mod tests {
         };
         assert_eq!(open.is_ordered(), None);
     }
+
+    #[test]
+    fn the_constructors_set_exactly_the_terms_they_are_given() {
+        let built = Party::new(
+            "Beispiel AG",
+            PostalAddress::new("Marktplatz 2", "Beispielstadt", "54321", "DE").expect("DE"),
+        )
+        .with_vat_identifier("DE987654321")
+        .with_electronic_address(Identifier::schemed("991-01234-56", "0204"))
+        .with_contact(Contact::new("Max", "+49 1", "max@example.de"));
+        let literal = Party {
+            name: Some("Beispiel AG".into()),
+            vat_identifier: Some("DE987654321".into()),
+            electronic_address: Some(Identifier::schemed("991-01234-56", "0204")),
+            address: PostalAddress {
+                line1: Some("Marktplatz 2".into()),
+                city: Some("Beispielstadt".into()),
+                post_code: Some("54321".into()),
+                country: Some(Code::new("DE")),
+                ..PostalAddress::default()
+            },
+            contact: Contact {
+                name: Some("Max".into()),
+                phone: Some("+49 1".into()),
+                email: Some("max@example.de".into()),
+            },
+            ..Party::default()
+        };
+        assert_eq!(built, literal);
+
+        let err = PostalAddress::new("a", "b", "c", "GERMANY").unwrap_err();
+        assert_eq!(err.rule, "BR-CL-14");
+    }
+
+    #[test]
+    fn the_payment_constructors_set_code_and_group_together() {
+        let ct = PaymentInstructions::sepa_credit_transfer("DE02120300000000202051", None);
+        assert_eq!(
+            ct,
+            PaymentInstructions {
+                means_code: Some(Code::new("58")),
+                means: Some(PaymentMeans::CreditTransfer(vec![CreditTransfer {
+                    account_identifier: Some("DE02120300000000202051".into()),
+                    ..CreditTransfer::default()
+                }])),
+                ..PaymentInstructions::default()
+            }
+        );
+        let dd = PaymentInstructions::sepa_direct_debit("M-1", "DE98ZZZ09999999999", None);
+        assert_eq!(
+            dd,
+            PaymentInstructions {
+                means_code: Some(Code::new("59")),
+                means: Some(PaymentMeans::DirectDebit(DirectDebit {
+                    mandate_reference: Some("M-1".into()),
+                    creditor_identifier: Some("DE98ZZZ09999999999".into()),
+                    debited_account: None,
+                })),
+                ..PaymentInstructions::default()
+            }
+        );
+    }
+
+    /// Under XRechnung, findings concern only terms the constructors do not
+    /// take, and `missing_for` predicts the party ones.
+    #[test]
+    fn what_the_constructors_leave_out_is_what_xrechnung_asks_for() {
+        use crate::profiles::XRECHNUNG;
+        let party = |name: &str, vat: &str| {
+            Party::new(
+                name,
+                PostalAddress::new("Hauptstraße 1", "Musterstadt", "12345", "DE").expect("DE"),
+            )
+            .with_vat_identifier(vat)
+        };
+        let seller = party("Stadtwerke Musterstadt GmbH", "DE123456789");
+        let predicted: Vec<u16> = seller
+            .missing_for(&XRECHNUNG, PartyRole::Seller)
+            .iter()
+            .map(|m| m.term.0)
+            .collect();
+        let inv = Invoice::builder(
+            XRECHNUNG.specification_id,
+            "R-1",
+            Date::parse("2026-07-31").expect("date"),
+            "380",
+            "EUR",
+        )
+        .seller(seller)
+        .buyer(party("Beispiel AG", "DE987654321"))
+        .payment(PaymentInstructions::sepa_credit_transfer(
+            "DE02120300000000202051",
+            None,
+        ))
+        .due_in_days(14)
+        .line(InvoiceLine::new(
+            "1",
+            "Netznutzung",
+            crate::Quantity::new(rust_decimal::Decimal::from(10)),
+            "KWH",
+            crate::InvoiceAmount::from_minor_units(1_000),
+            "S",
+            Some(crate::Percentage::new(rust_decimal::Decimal::from(19))),
+        ))
+        .build_reconciled()
+        .expect("reconciles");
+        let report = XRECHNUNG.validate(&inv);
+        let fatal: Vec<&str> = report.fatal().map(|f| f.rule.as_str()).collect();
+        assert!(fatal.contains(&"BR-DE-15"), "BT-10: {report}");
+        // The seller contact XRechnung wants (BT-41 … BT-43) is predicted…
+        for t in [41, 42, 43] {
+            assert!(predicted.contains(&t), "BT-{t} predicted: {predicted:?}");
+        }
+        // …and nothing the constructors were given is reported.
+        for f in report.fatal() {
+            let terms: Vec<u16> = f.path.term.map(|t| t.0).into_iter().collect();
+            for given in [27, 35, 37, 38, 40, 31, 44, 50, 52, 53, 55, 48, 81, 84] {
+                assert!(!terms.contains(&given), "BT-{given} was given: {f}");
+            }
+        }
+    }
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
 /// Fluent construction for [`Invoice`]. Obtain one from [`Invoice::builder`].
 ///
-/// The builder deliberately does **not** validate. Validation is a report over a
-/// whole document (see [`crate::validation`]), and a builder that refused to
-/// produce an invalid invoice would leave a caller unable to ask *why* it is
-/// invalid — which is the question they actually have.
+/// The builder does not validate; run [`crate::validation`] on the result.
 #[derive(Debug, Clone)]
 pub struct InvoiceBuilder {
     inv: Invoice,
@@ -1332,9 +1634,7 @@ macro_rules! setter {
     };
 }
 
-/// A setter taking anything that converts — for the string and code terms,
-/// where `&str` is what a caller has and `.to_owned()` at every call site is
-/// noise the builder exists to remove.
+/// A setter taking anything that converts into the field's type.
 macro_rules! into_setter {
     ($name:ident, $field:ident, $ty:ty, $doc:literal) => {
         #[doc = $doc]
@@ -1349,11 +1649,8 @@ macro_rules! into_setter {
 impl InvoiceBuilder {
     setter!(due_date, due_date, Date, "BT-9 — payment due date.");
 
-    /// BT-20 — payment terms, as free text.
-    ///
-    /// One of the two ways to satisfy `BR-CO-25`, and the one to reach for when
-    /// the amount is computed but the terms belong to an ERP: the rule wants
-    /// *either* a due date **or** this, and this is prose nobody has to derive.
+    /// BT-20 — payment terms, as free text. `BR-CO-25` accepts this or a due
+    /// date.
     ///
     /// ```
     /// # use en16931::{Invoice, Date};
@@ -1370,11 +1667,7 @@ impl InvoiceBuilder {
         self
     }
 
-    /// BT-9 — a due date `days` after the issue date.
-    ///
-    /// The German default is "zahlbar innerhalb 14 Tagen", and computing
-    /// `issue + 14` by hand means reaching for a date library this crate
-    /// deliberately does not depend on. [`Date`] can already do it.
+    /// BT-9 — a due date `days` after the issue date; unset without BT-2.
     ///
     /// ```
     /// # use en16931::{Invoice, Date};
@@ -1416,21 +1709,15 @@ impl InvoiceBuilder {
         "BT-6 — VAT accounting currency code."
     );
 
-    /// BT-10 — buyer reference.
-    ///
-    /// Mandatory in XRechnung (`BR-DE-15`) and optional in the core model. In
-    /// Germany this is where the **Leitweg-ID** goes — not in BT-49, whose
-    /// scheme is an EAS code (see [`crate::codes::guard::eas`]).
+    /// BT-10 — buyer reference. Mandatory in XRechnung (`BR-DE-15`), where it
+    /// carries the Leitweg-ID (not BT-49, see [`crate::codes::guard::eas`]).
     #[must_use]
     pub fn buyer_reference(mut self, value: impl Into<String>) -> Self {
         self.inv.buyer_reference = Some(value.into());
         self
     }
 
-    /// BT-23 — the business process this invoice belongs to.
-    ///
-    /// Peppol's `R001` requires it and `R007` fixes its format; core EN 16931
-    /// only says it may be there.
+    /// BT-23 — business process type. Required by Peppol (`R001`, format `R007`).
     #[must_use]
     pub fn business_process(mut self, value: impl Into<String>) -> Self {
         self.inv.business_process = Some(value.into());
@@ -1525,25 +1812,26 @@ impl InvoiceBuilder {
         self
     }
 
-    /// Append a BG-1 invoice note (BT-22), with no subject code.
+    /// Append a BG-1 invoice note — text alone (BT-22), or an [`InvoiceNote`]
+    /// with its BT-21 subject code.
+    ///
+    /// ```
+    /// # use en16931::{Date, Invoice, InvoiceNote};
+    /// let inv = Invoice::builder("urn:cen.eu:en16931:2017", "R-1",
+    ///         Date::parse("2026-07-31")?, "380", "EUR")
+    ///     .note("Vielen Dank für Ihren Auftrag")
+    ///     .note(InvoiceNote::new("Steuerschuldnerschaft des Leistungsempfängers").with_subject("AAI"))
+    ///     .build();
+    /// assert_eq!(inv.notes.len(), 2);
+    /// # Ok::<(), en16931::ParseDateError>(())
+    /// ```
     #[must_use]
-    pub fn note(mut self, note: impl Into<String>) -> Self {
-        self.inv.notes.push(InvoiceNote::new(note));
-        self
-    }
-
-    /// Append a BG-1 invoice note with a BT-21 subject code.
-    #[must_use]
-    pub fn coded_note(mut self, note: InvoiceNote) -> Self {
-        self.inv.notes.push(note);
+    pub fn note(mut self, note: impl Into<InvoiceNote>) -> Self {
+        self.inv.notes.push(note.into());
         self
     }
 
     /// BG-22 — the document totals.
-    ///
-    /// A setter like every other, and [`build`](Self::build) is the only way to
-    /// finish — returning `Invoice` here would make one method both a setter
-    /// and the terminal, so `.totals(…).build()` would not compile.
     #[must_use]
     pub fn totals(mut self, totals: DocumentTotals) -> Self {
         self.inv.totals = totals;
@@ -1552,12 +1840,8 @@ impl InvoiceBuilder {
 
     /// Finish, stating the totals yourself.
     ///
-    /// Totals left unstated default to zero, which `BR-CO-10` … `BR-CO-16` will
-    /// then report against — this method does not compute them, because
-    /// silently inventing a total is how an unbalanced invoice reaches a
-    /// counterparty. When the lines *are* the source of truth, use
-    /// [`build_reconciled`](Self::build_reconciled), which computes them and
-    /// says so in its name.
+    /// Totals not set stay zero / absent and are reported by `BR-CO-10` …
+    /// `BR-CO-16`; [`build_reconciled`](Self::build_reconciled) computes them.
     #[must_use]
     pub fn build(self) -> Invoice {
         self.inv
@@ -1565,16 +1849,10 @@ impl InvoiceBuilder {
 
     /// Finish, deriving BG-23 and BG-22 from the lines.
     ///
-    /// The counterpart to [`build`](Self::build), for the caller whose engine
-    /// produced lines and left the standard's bookkeeping — which group is
-    /// which, whether BT-107 is absent or zero, where the rounding goes — to
-    /// this crate. See [`crate::reconcile`](mod@crate::reconcile) for exactly what is computed and
-    /// what is deliberately not.
-    ///
+    /// See [`crate::reconcile`](mod@crate::reconcile) for what is computed.
     /// Anything set with [`totals`](Self::totals) or
-    /// [`vat_breakdown`](Self::vat_breakdown) beforehand is **replaced**, except
-    /// that exemption reasons on an existing BG-23 are preserved — the numbers
-    /// are recomputed and the prose is not invented.
+    /// [`vat_breakdown`](Self::vat_breakdown) is replaced, except exemption
+    /// reasons on an existing BG-23, which are kept.
     ///
     /// ```
     /// # use en16931::{Date, Invoice, InvoiceAmount, Percentage, Quantity, validate};

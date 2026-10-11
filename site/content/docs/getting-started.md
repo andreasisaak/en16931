@@ -17,21 +17,24 @@ One binary, named `en16931`. It reads UBL, CII and ZUGFeRD PDFs, and picks the
 rule set from the document's own BT-24 customization identifier.
 
 ```sh
-en16931 validate rechnung.xml            # verdict, findings, exit code
-en16931 inspect  rechnung.pdf            # what *is* this file?
-en16931 convert  rechnung.xml --to cii   # through the model, not element by element
-en16931 explain  BR-CO-14                # what does this rule say, and who runs it?
+en16931 validate rechnung.xml                # accept, reject or undefined — and why
+en16931 validate rechnung.xml -r xrechnung   # …and require a profile of it
+en16931 inspect  rechnung.pdf                # what *is* this file?
+en16931 convert  rechnung.xml --to cii       # through the model; refuses to lose anything
+en16931 extract  rechnung.pdf                # the embedded XML, verbatim
+en16931 embed    gerendert.pdf rechnung.xml -o rechnung.pdf   # a ZUGFeRD hybrid
+en16931 explain  BR-CO-14                    # what does this rule say, and who runs it?
 ```
 
-Exit `0` valid, `1` invalid, `2` unreadable — so a pipeline can tell *this
-invoice is wrong* from *that path does not exist*. The [CLI
-page](@/docs/cli.md) covers every subcommand.
+Exit `0` accepted, `1` rejected or undefined, `2` a file that could not be
+opened — so a pipeline can tell *this invoice is wrong* from *that path does not
+exist*. The [CLI page](@/docs/cli.md) covers every subcommand.
 
 ## The library
 
 ```toml
 [dependencies]
-en16931 = "0.3"
+en16931 = "0.8"
 rust_decimal = "1"
 ```
 
@@ -42,7 +45,7 @@ a browser without leaving the client.
 Add the syntax layer only if a document has to cross a wire:
 
 ```toml
-en16931-formats = { version = "0.3", features = ["ubl", "cii"] }
+en16931-formats = { version = "0.8", features = ["ubl", "cii"] }
 ```
 
 ## A first invoice
@@ -50,33 +53,21 @@ en16931-formats = { version = "0.3", features = ["ubl", "cii"] }
 Two lines at two VAT rates, built, reconciled and validated. Nothing is elided:
 
 ```rust
-use en16931::invoice::{Party, PostalAddress};
+use en16931::invoice::{Party, PaymentInstructions, PostalAddress};
 use en16931::{Date, Identifier, InvoiceAmount, Percentage, Quantity, prelude::*};
 use rust_decimal::dec;
 
-let seller = Party {
-    name: Some("Stadtwerke Musterstadt GmbH".into()),
-    vat_identifier: Some("DE123456789".into()),
-    electronic_address: Some(Identifier::eas("4012345000009", "0088")?),   // GLN
-    address: PostalAddress {
-        city: Some("Musterstadt".into()),
-        post_code: Some("12345".into()),
-        country: Some(en16931::codes::guard::country("DE")?),             // BR-09
-        ..Default::default()
-    },
-    ..Default::default()
-};
-let buyer = Party {
-    name: Some("Beispiel AG".into()),
-    electronic_address: Some(Identifier::eas("991-01234-56", "0204")?),
-    address: PostalAddress {
-        city: Some("Beispielstadt".into()),
-        post_code: Some("54321".into()),
-        country: Some(en16931::codes::guard::country("DE")?),             // BR-11
-        ..Default::default()
-    },
-    ..Default::default()
-};
+let seller = Party::new(
+        "Stadtwerke Musterstadt GmbH",
+        PostalAddress::new("Hauptstraße 1", "Musterstadt", "12345", "DE")?,  // BR-09
+    )
+    .with_vat_identifier("DE123456789")
+    .with_electronic_address(Identifier::eas("4012345000009", "0088")?);    // GLN
+let buyer = Party::new(
+        "Beispiel AG",
+        PostalAddress::new("Marktplatz 2", "Beispielstadt", "54321", "DE")?, // BR-11
+    )
+    .with_electronic_address(Identifier::eas("991-01234-56", "0204")?);
 
 let invoice = Invoice::builder(
         "urn:cen.eu:en16931:2017",       // BT-24 — which rule set applies
@@ -87,6 +78,7 @@ let invoice = Invoice::builder(
     )
     .seller(seller)
     .buyer(buyer)
+    .payment(PaymentInstructions::sepa_credit_transfer("DE02120300000000202051", None))
     .due_in_days(14)                     // BT-9 — satisfies BR-CO-25
     .line(InvoiceLine::new(
         "1", "Netznutzung Arbeitspreis",
@@ -109,11 +101,9 @@ assert!(validate(&invoice).is_valid());
 
 Three things in there are worth pausing on.
 
-**`Identifier::eas` is checked at the call**, not at validation time. `9958` is
-the scheme every German integrator reaches for and it was withdrawn on
-2023-07-31; the constructor rejects it and names its successor. A code list that
-only speaks up in the final report tells you at the end of the pipeline what it
-could have told you at the start.
+**`Identifier::eas` is checked at the call**, not at validation time. `9958`,
+withdrawn on 2023-07-31, is rejected with its successor named; for a GLN
+(`0088`) the check digit is checked too.
 
 **`build_reconciled` computes BG-22 and BG-23**, the document totals and the VAT
 breakdown. They are a *function* of the lines — `BR-CO-10` … `BR-CO-16`, the
@@ -123,9 +113,24 @@ positions, it should not also have to know that BT-107 is *absent* rather than
 zero when there are no allowances. Use `.build()` instead when the totals came
 from somewhere authoritative and you want them checked rather than replaced.
 
-**Mandatory means non-`Option`.** BT-1, BT-2, BT-3 and BT-5 are arguments to
-`builder`, not fields you can forget. The rules exist for the cardinalities the
-type system cannot express, not as a substitute for it.
+**Mandatory terms are arguments.** BT-24, BT-1, BT-2, BT-3 and BT-5 are
+arguments to `builder`, so code that builds an invoice cannot forget them. In
+`Invoice` itself they are `Option`, so that a received document missing one can
+still be read and reported on (`BR-01` … `BR-05`).
+
+**Or start from a valid invoice.** `en16931::examples::for_profile(&profile)`
+returns a valid invoice for every shipped profile, and `examples::annex_a()` the
+eight worked examples of EN 16931-1 Annex A. Change one field and the report
+names exactly what that change broke:
+
+```rust
+use en16931::{examples, profiles};
+
+let mut invoice = examples::for_profile(&profiles::XRECHNUNG).expect("shipped");
+invoice.buyer_reference = None;                     // drop the Leitweg-ID
+let report = profiles::XRECHNUNG.validate(&invoice);
+assert_eq!(report.fatal().map(|f| f.rule.as_str()).collect::<Vec<_>>(), ["BR-DE-15"]);
+```
 
 ## Reading a report
 
@@ -174,10 +179,32 @@ let proof: Validated<XRechnung> = Validated::new(invoice)?;   // Err carries the
 that serialiser physically cannot be given an unchecked invoice, or one checked
 against a different profile. See [profiles](@/docs/profiles.md).
 
-## Where to go next
+## Then a document
+
+When the invoice has to cross a wire, `en16931-formats` has one call per task.
+Receiving is the one a mandate makes everyone do — bytes and a policy in, a
+decision out:
+
+```rust
+use en16931::profiles;
+use en16931_formats::{Policy, Recommendation, Syntax};
+
+let policy = Policy { require: Some(&profiles::XRECHNUNG), ..Policy::default() };
+let got = en16931_formats::receive(&bytes, &policy);
+if got.recommendation != Recommendation::Accept {
+    eprintln!("{got}");                 // the decision, why, and every layer's report
+}
+
+let out = en16931_formats::write(&proof, Syntax::Ubl);   // a proof in, BT-24 stamped
+```
+
+See [syntaxes](@/docs/syntaxes.md) for reading, writing and converting, and
+[ZUGFeRD](@/docs/zugferd.md) for hybrid PDFs.
+
+## See also
 
 - **[The semantic model](@/docs/model.md)** — business terms, the ten data types, and why amounts are not `f64`.
-- **[Validation](@/docs/validation.md)** — the 317 rules, severity, tolerance regimes, and reports you can store and diff.
+- **[Validation](@/docs/validation.md)** — the 334 rules, severity, tolerance regimes, and reports you can store and diff.
 - **[Profiles](@/docs/profiles.md)** — XRechnung, Peppol BIS Billing 3.0, CIUS versus Extension.
 - **[Syntaxes](@/docs/syntaxes.md)** — UBL 2.1 and UN/CEFACT CII, both directions.
 - **[Conformance](@/docs/conformance.md)** — what is measured, and against whose artefacts.

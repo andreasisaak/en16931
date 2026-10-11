@@ -1,81 +1,493 @@
-//! A **document tree that serialises itself into schema order**.
+//! The XML both bindings share: reading (bytes to a parsed tree, one set of
+//! helpers, duplicates found and cut) and writing (a document tree that
+//! serialises itself into schema order).
 //!
-//! Shared by both bindings, because both need exactly the same thing and for
-//! exactly the same reason.
-//!
-//! # Why a tree and not a string
-//!
-//! UBL and CII content models are XSD `sequence`s: a document carrying the
-//! right elements in the wrong order is invalid, and **no Schematron rule says
-//! so** — ordering is the schema's job, and this crate ships no schema.
-//!
-//! A hand-sequenced writer therefore has to get the order right at every call
-//! site, in two syntaxes, one of which (UBL) has two document elements that
-//! disagree about where `cbc:TaxPointDate` goes. That was tried, and it was
-//! wrong. So the writer emits in whatever order reads best and this module
-//! sorts by the derived tables ([`crate::ubl::order`], [`crate::cii::order`]).
-//! Misordering became unrepresentable rather than tested-for.
-//!
-//! # It also enforces the prohibitions
-//!
-//! 1 218 of the 1 339 syntax rules say some element "shall not be used". The
-//! serialiser checks each path against the extracted tables, so "the writer
-//! cannot emit a forbidden element" is a property of *this* module rather than
-//! a habit spread across two hundred call sites.
-//!
-//! # Nothing is dropped silently
-//!
-//! Anything the target sequence has no place for is removed **and reported**.
-//! UBL's `<CreditNote>` has no `cbc:DueDate`; dropping BT-9 is correct, and
-//! dropping it quietly would mean a payment due date vanishing between two
-//! systems with nothing in any log.
-//!
-//! Three mechanisms notice, and they all write to the same list, because a
-//! caller asking *"what did I lose?"* should not have to know which one it was:
+//! The writer emits in any order; [`Xml::finish`] sorts each level by the
+//! generated tables ([`crate::ubl::order`], [`crate::cii::order`]) and checks
+//! every element path against the prohibitions. Anything removed is reported,
+//! all into one list:
 //!
 //! | | |
 //! |---|---|
 //! | the sequence tables | an element the target document has no place for |
 //! | the prohibitions | an element CEN fences out of the EN 16931 subset |
-//! | [`Xml::dropped`] | what only the writer knows — CII nesting BT-147 inside the gross-price aggregate, a credit note whose BT-3 says otherwise, a group that would serialise empty |
+//! | [`Xml::note`] | what only the writer knows, e.g. CII's BT-147 without a gross price |
 
 use core::fmt::Write as _;
+use std::borrow::Cow;
+
+use crate::report::{Entry, Kind};
+
+// ── Decoding ──────────────────────────────────────────────────────────────────
+
+/// The text of an XML document, from its bytes.
+///
+/// XML 1.0 (§4.3.3) obliges a processor to read **UTF-8 and UTF-16**, and
+/// requires UTF-16 to begin with a byte-order mark. So:
+///
+/// | Bytes begin with | Read as |
+/// |---|---|
+/// | `EF BB BF` | UTF-8, the mark dropped |
+/// | `FF FE` / `FE FF` | UTF-16 LE / BE, the mark dropped |
+/// | anything else | UTF-8 |
+///
+/// The XML declaration's `encoding`, when present, must name the family that
+/// was found; a contradicting mark is refused. Every other encoding
+/// (`ISO-8859-1`, `windows-1252`) is refused by name.
+pub(crate) fn decode(bytes: &[u8]) -> Result<Cow<'_, str>, crate::Error> {
+    let refuse = |found: &str| crate::Error::Encoding {
+        found: found.to_owned(),
+    };
+    let (text, family): (Cow<'_, str>, &str) =
+        if let Some(rest) = bytes.strip_prefix(b"\xEF\xBB\xBF") {
+            (
+                Cow::Borrowed(core::str::from_utf8(rest).map_err(|_| refuse("invalid UTF-8"))?),
+                "UTF-8",
+            )
+        } else if let Some(rest) = bytes.strip_prefix(b"\xFF\xFE") {
+            (Cow::Owned(utf16(rest, u16::from_le_bytes)?), "UTF-16")
+        } else if let Some(rest) = bytes.strip_prefix(b"\xFE\xFF") {
+            (Cow::Owned(utf16(rest, u16::from_be_bytes)?), "UTF-16")
+        } else if bytes.starts_with(b"<\0") || bytes.starts_with(b"\0<") {
+            return Err(refuse("UTF-16 without a byte-order mark"));
+        } else {
+            (
+                Cow::Borrowed(core::str::from_utf8(bytes).map_err(|_| refuse("invalid UTF-8"))?),
+                "UTF-8",
+            )
+        };
+    if let Some(declared) = declared_encoding(&text)
+        && !declared.eq_ignore_ascii_case(family)
+    {
+        return Err(refuse(declared));
+    }
+    Ok(text)
+}
+
+/// UTF-16 code units to a `String`, refusing an unpaired surrogate or an odd
+/// byte count rather than replacing it.
+fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Result<String, crate::Error> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(crate::Error::Encoding {
+            found: "invalid UTF-16".to_owned(),
+        });
+    }
+    char::decode_utf16(bytes.as_chunks::<2>().0.iter().map(|c| unit(*c)))
+        .collect::<Result<String, _>>()
+        .map_err(|_| crate::Error::Encoding {
+            found: "invalid UTF-16".to_owned(),
+        })
+}
+
+/// The `encoding` pseudo-attribute of the XML declaration, if there is one.
+fn declared_encoding(text: &str) -> Option<&str> {
+    let decl = text.strip_prefix("<?xml")?;
+    let decl = &decl[..decl.find("?>")?];
+    let at = decl.find("encoding")?;
+    let rest = decl[at + "encoding".len()..]
+        .trim_start()
+        .strip_prefix('=')?;
+    let rest = rest.trim_start();
+    let quote = rest.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let rest = &rest[1..];
+    Some(&rest[..rest.find(quote)?])
+}
+
+// ── Parsing ───────────────────────────────────────────────────────────────────
+
+/// Parse, refusing nesting past [`MAX_DEPTH`] before the parser recurses.
+pub(crate) fn parse(text: &str) -> Result<roxmltree::Document<'_>, crate::Error> {
+    let depth = max_depth(text);
+    if depth > MAX_DEPTH {
+        return Err(crate::Error::TooDeep {
+            depth,
+            limit: MAX_DEPTH,
+        });
+    }
+    roxmltree::Document::parse(text).map_err(|e| {
+        let pos = e.pos();
+        // The parser's message ends in its own ` at ROW:COL`; the position is
+        // carried as fields, so it is said once.
+        let message = e.to_string();
+        let suffix = format!(" at {}:{}", pos.row, pos.col);
+        crate::Error::Xml {
+            message: message
+                .strip_suffix(&suffix)
+                .map_or_else(|| message.clone(), str::to_owned),
+            line: pos.row,
+            column: pos.col,
+        }
+    })
+}
+
+// ── Reading helpers — one behaviour for both syntaxes ─────────────────────────
+
+/// A parsed element.
+pub(crate) type Node<'a, 'i> = roxmltree::Node<'a, 'i>;
+
+/// Local name, namespace-independent.
+pub(crate) fn name<'i>(n: Node<'_, 'i>) -> &'i str {
+    n.tag_name().name()
+}
+
+/// Direct element children.
+pub(crate) fn kids<'a, 'i>(n: Node<'a, 'i>) -> impl Iterator<Item = Node<'a, 'i>> {
+    n.children().filter(Node::is_element)
+}
+
+/// The first direct child with this local name.
+pub(crate) fn kid<'a, 'i>(n: Node<'a, 'i>, want: &str) -> Option<Node<'a, 'i>> {
+    kids(n).find(|c| name(*c) == want)
+}
+
+/// An element's text **as written**: every direct text child, concatenated.
+///
+/// `12<!-- note -->34` is `1234`, the `XPath` string value; CDATA is text.
+/// Not trimmed: BT-20's trailing newline matters (`BR-DE-18`).
+pub(crate) fn raw_text(n: Node<'_, '_>) -> Option<String> {
+    let mut out = String::new();
+    for c in n.children().filter(Node::is_text) {
+        out.push_str(c.text().unwrap_or_default());
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// An element's text, trimmed, and `None` when that leaves nothing.
+///
+/// An empty or whitespace-only element is an absent term, in both syntaxes.
+pub(crate) fn text(n: Node<'_, '_>) -> Option<String> {
+    raw_text(n)
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+}
+
+/// [`text`] of the first child named `want`.
+pub(crate) fn child_text(n: Node<'_, '_>, want: &str) -> Option<String> {
+    kid(n, want).and_then(text)
+}
+
+/// The chain of local names from the document element down to `n`.
+pub(crate) fn path_of(n: Node<'_, '_>) -> String {
+    let mut names: Vec<&str> = n
+        .ancestors()
+        .filter(Node::is_element)
+        .map(|a| name(a))
+        .collect();
+    names.reverse();
+    names.join("/")
+}
+
+// ── Duplicates ────────────────────────────────────────────────────────────────
+
+/// One row of a generated single-occurrence table, compiled.
+struct Row {
+    rule: &'static str,
+    warning: bool,
+    anchored: bool,
+    context: Vec<&'static str>,
+    /// A predicate the context element itself must satisfy.
+    when: Option<Predicate>,
+    steps: Vec<Step>,
+}
+
+/// One step of a relative path: a local name, whether it is reached through
+/// `//`, and at most one predicate.
+struct Step {
+    name: &'static str,
+    descend: bool,
+    predicate: Option<Predicate>,
+}
+
+/// `[path = 'literal']`, `[path != 'literal']`, optionally comparing the value
+/// upper-cased or with its whitespace normalised.
+struct Predicate {
+    path: Vec<&'static str>,
+    negated: bool,
+    upper: bool,
+    normalise: bool,
+    literal: &'static str,
+}
+
+fn local_of(qualified: &'static str) -> &'static str {
+    qualified.rsplit(':').next().unwrap_or(qualified)
+}
+
+/// Split on `/` outside brackets.
+fn split_steps(path: &'static str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (i, c) in path.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => {
+                out.push(&path[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&path[start..]);
+    out
+}
+
+/// Compile the canonical row spelling the generator writes:
+/// `cac:A[upper:cac:B/cbc:C=VAT]/cbc:D`, a leading `//` for a descendant step.
+fn compile(rows: &'static [(&'static str, &'static str, &'static str, &'static str)]) -> Vec<Row> {
+    rows.iter()
+        .map(|(rule, level, context, relative)| {
+            let anchored = context.starts_with('/') && !context.starts_with("//");
+            let mut when = None;
+            let context = split_steps(context.trim_start_matches('/'))
+                .into_iter()
+                .map(|step| match step.split_once('[') {
+                    Some((head, pred)) => {
+                        when = Some(predicate(pred.trim_end_matches(']')));
+                        local_of(head)
+                    }
+                    None => local_of(step),
+                })
+                .collect();
+            let mut steps = Vec::new();
+            let mut descend = false;
+            for raw in split_steps(relative) {
+                if raw.is_empty() {
+                    // `//x` splits into an empty step and `x`.
+                    descend = true;
+                    continue;
+                }
+                let (head, predicate) = match raw.split_once('[') {
+                    Some((head, pred)) => (head, Some(predicate(pred.trim_end_matches(']')))),
+                    None => (raw, None),
+                };
+                steps.push(Step {
+                    name: local_of(head),
+                    descend,
+                    predicate,
+                });
+                descend = false;
+            }
+            Row {
+                rule,
+                warning: *level == "warning",
+                anchored,
+                context,
+                when,
+                steps,
+            }
+        })
+        .collect()
+}
+
+fn predicate(body: &'static str) -> Predicate {
+    let (upper, body) = match body.strip_prefix("upper:") {
+        Some(rest) => (true, rest),
+        None => (false, body),
+    };
+    let (normalise, body) = match body.strip_prefix("norm:") {
+        Some(rest) => (true, rest),
+        None => (false, body),
+    };
+    let (path, negated, literal) = if let Some((p, l)) = body.split_once("!=") {
+        (p, true, l)
+    } else {
+        let (p, l) = body.split_once('=').unwrap_or((body, ""));
+        (p, false, l)
+    };
+    Predicate {
+        path: path.split('/').map(local_of).collect(),
+        negated,
+        upper,
+        normalise,
+        literal,
+    }
+}
+
+impl Predicate {
+    fn holds(&self, n: Node<'_, '_>) -> bool {
+        let mut at = Some(n);
+        for step in &self.path {
+            at = at.and_then(|x| kid(x, step));
+        }
+        let mut value = at.and_then(raw_text).unwrap_or_default();
+        if self.normalise {
+            value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        if self.upper {
+            value = value.to_uppercase();
+        }
+        (value == self.literal) != self.negated
+    }
+}
+
+/// A compiled single-occurrence table, indexed by the last name of each row's
+/// context.
+pub(crate) struct Once {
+    rows: Vec<Row>,
+    by_context: std::collections::HashMap<&'static str, Vec<usize>>,
+}
+
+impl Once {
+    /// Compile a generated table.
+    pub(crate) fn new(
+        rows: &'static [(&'static str, &'static str, &'static str, &'static str)],
+    ) -> Self {
+        let rows = compile(rows);
+        let mut by_context: std::collections::HashMap<&'static str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            if let Some(last) = r.context.last() {
+                by_context.entry(last).or_default().push(i);
+            }
+        }
+        Self { rows, by_context }
+    }
+}
+
+/// A second or later occurrence of a single-occurrence element.
+pub(crate) struct Duplicate<'a, 'i> {
+    pub node: Node<'a, 'i>,
+    pub rule: &'static str,
+    /// The rule that forbids it is published as a warning.
+    pub warning: bool,
+}
+
+/// Every second and later occurrence the table forbids, outermost only, in
+/// document order.
+pub(crate) fn duplicates<'a, 'i>(
+    doc: &'a roxmltree::Document<'i>,
+    once: &Once,
+) -> Vec<Duplicate<'a, 'i>> {
+    let mut found: Vec<Duplicate<'a, 'i>> = Vec::new();
+    let mut stack: Vec<&str> = Vec::new();
+    walk(doc.root_element(), once, &mut stack, &mut found);
+    // A node two rows report keeps the stricter reading: fatal before warning.
+    found.sort_by_key(|d| (d.node.range().start, d.warning));
+    found.dedup_by_key(|d| d.node.id());
+    // Outermost only: a duplicated group's own duplicates go with it.
+    let mut out: Vec<Duplicate<'a, 'i>> = Vec::new();
+    for d in found {
+        if !out
+            .iter()
+            .any(|o| d.node.ancestors().any(|a| a.id() == o.node.id()))
+        {
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn walk<'a, 'i>(
+    n: Node<'a, 'i>,
+    once: &Once,
+    stack: &mut Vec<&'i str>,
+    found: &mut Vec<Duplicate<'a, 'i>>,
+) {
+    stack.push(name(n));
+    if let Some(rows) = once.by_context.get(name(n)) {
+        for &i in rows {
+            let row = &once.rows[i];
+            let matches = if row.anchored {
+                stack.len() == row.context.len() && stack.iter().eq(row.context.iter())
+            } else {
+                stack.ends_with(&row.context)
+            };
+            if !matches || row.when.as_ref().is_some_and(|p| !p.holds(n)) {
+                continue;
+            }
+            let mut nodes = vec![n];
+            for step in &row.steps {
+                let mut next = Vec::new();
+                for x in nodes {
+                    let candidates: Box<dyn Iterator<Item = Node<'a, 'i>>> = if step.descend {
+                        Box::new(x.descendants().skip(1).filter(Node::is_element))
+                    } else {
+                        Box::new(kids(x))
+                    };
+                    next.extend(candidates.filter(|c| {
+                        name(*c) == step.name && step.predicate.as_ref().is_none_or(|p| p.holds(*c))
+                    }));
+                }
+                nodes = next;
+            }
+            nodes.sort_by_key(|n| n.range().start);
+            for extra in nodes.into_iter().skip(1) {
+                found.push(Duplicate {
+                    node: extra,
+                    rule: row.rule,
+                    warning: row.warning,
+                });
+            }
+        }
+    }
+    for c in kids(n) {
+        walk(c, once, stack, found);
+    }
+    stack.pop();
+}
+
+/// `text` without the byte ranges of `cut` — the document as it would be had
+/// the duplicates not been there.
+pub(crate) fn without(text: &str, cut: &[Duplicate<'_, '_>]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for d in cut {
+        let r = d.node.range();
+        if r.start >= at {
+            out.push_str(&text[at..r.start]);
+            at = r.end;
+        }
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// The entry for a duplicate, before it is cut.
+pub(crate) fn duplicate_entry(d: &Duplicate<'_, '_>, schema: &str) -> Entry {
+    let leaf = kids(d.node).next().is_none();
+    let mut e = Entry::new(
+        if d.warning {
+            Kind::Repeated
+        } else {
+            Kind::Duplicate
+        },
+        path_of(d.node),
+        if d.rule.is_empty() {
+            format!(
+                "a second occurrence of an element {schema} allows once; the first is read, \
+                 this one is not"
+            )
+        } else if d.warning {
+            "a further occurrence of an element CEN's syntax rule (a warning) allows once; \
+             the first is read, this one is not"
+                .to_owned()
+        } else {
+            "a further occurrence of an element CEN's syntax rule allows once; the first is \
+             read, this one is not"
+                .to_owned()
+        },
+    );
+    if leaf && let Some(v) = text(d.node) {
+        e = e.value(v);
+    }
+    if !d.rule.is_empty() {
+        e = e.rule(d.rule);
+    }
+    e
+}
 
 // ── Depth guard ───────────────────────────────────────────────────────────────
 
 /// The deepest element nesting either reader will accept.
 ///
-/// # This is not a style limit. It is the only thing between a counterparty's
-/// document and `SIGABRT`.
-///
-/// `roxmltree::Document::parse` recurses once per level of nesting, and around
-/// five hundred levels it **overflows the stack**. A stack overflow is not a
-/// panic: Rust cannot unwind it and cannot catch it, so the process aborts. A
-/// validator whose entire job is to be pointed at documents someone else wrote
-/// therefore had a two-line denial of service in it —
-/// `en16931 validate theirs.xml` exiting `134` instead of `2`, and any service
-/// embedding [`crate::ubl::from_str`] simply dying.
-///
-/// It cannot be handled after the fact, so it is refused before. One linear scan
-/// of the bytes, no allocation, and the answer is a typed error.
-///
-/// # Why 64
-///
-/// Measured, not guessed. `deep_documents_are_refused_before_they_can_abort` in
-/// `tests/corpus.rs` walks every published UBL and CII instance in the artefact
-/// tree and asserts the deepest is far below this — the real answer is about a
-/// dozen, because both content models are shallow by construction.
-///
-/// The headroom goes the other way. The overflow measured at ~500 levels was on
-/// the main thread's 8 MB, in a debug build: roughly 16 KB of stack per level. A
-/// worker thread gets 2 MB by default, which is ~125 levels, so a limit chosen
-/// to fit the *main* thread would still abort inside a web server. 64 levels is
-/// five times the deepest real document and about 1 MB of stack in the worst
-/// build.
-pub(crate) const MAX_DEPTH: usize = 64;
+/// A security limit: the parser recurses per level and a stack overflow aborts
+/// the process, so deeper documents are refused by a linear byte scan before
+/// parsing. Real UBL and CII instances nest about a dozen deep
+/// (`tests/corpus.rs` checks the reference corpus); a debug build uses about
+/// 16 KB of stack per level, so 64 fits a 2 MB worker-thread stack.
+pub const MAX_DEPTH: usize = 64;
 
-/// The two ends of the range, checked when the crate compiles rather than when
-/// a test runs — a bound on a constant is not something to discover at runtime.
+/// The bounds on [`MAX_DEPTH`], checked at compile time.
 const _: () = {
     assert!(
         MAX_DEPTH >= 32,
@@ -89,11 +501,9 @@ const _: () = {
 
 /// The deepest element nesting in `xml`, without parsing it.
 ///
-/// Deliberately a scanner rather than a parser: the whole point is to answer
-/// before anything recurses. It is allowed to be approximate in one direction
-/// only — over-reporting depth would reject a lawful document, so comments,
-/// CDATA, processing instructions and quoted attribute values (in which `>` is
-/// legal, and appears in real invoices carrying URLs) are all skipped properly.
+/// A scanner, so it answers before anything recurses. It must never
+/// over-report: comments, CDATA, processing instructions and quoted attribute
+/// values are skipped.
 pub(crate) fn max_depth(xml: &str) -> usize {
     let b = xml.as_bytes();
     let (mut i, mut depth, mut max) = (0usize, 0usize, 0usize);
@@ -116,9 +526,8 @@ pub(crate) fn max_depth(xml: &str) -> usize {
         } else if rest.starts_with(b"?") {
             i = after(i + 2, b"?>");
         } else if rest.starts_with(b"!") {
-            // `<!DOCTYPE …>`. `roxmltree` refuses these outright, which is what
-            // makes billion-laughs and XXE non-issues here; skipping it keeps
-            // this scanner from miscounting on the way to that refusal.
+            // `<!DOCTYPE …>`: `roxmltree` refuses it later (no XXE, no
+            // billion laughs); skipped here so the count stays right.
             i = after(i + 2, b">");
         } else if rest.starts_with(b"/") {
             depth = depth.saturating_sub(1);
@@ -168,52 +577,46 @@ pub(crate) struct Rules {
     pub forbidden_attribute: fn(&str) -> Option<&'static str>,
 }
 
+/// An element under construction.
 #[derive(Clone)]
-pub(crate) struct Node {
+pub(crate) struct XNode {
     name: String,
     attrs: Vec<(String, String)>,
     text: Option<String>,
-    children: Vec<Node>,
+    children: Vec<XNode>,
+    /// The business term the writer emitted this element for, when it said —
+    /// so a drop the sequence tables or the prohibitions discover can name it.
+    term: Option<&'static str>,
 }
 
 /// A document under construction.
 pub(crate) struct Xml {
-    stack: Vec<Node>,
+    stack: Vec<XNode>,
     rules: &'static Rules,
     /// Losses the *writer* knows about, as opposed to the ones the sequence
     /// tables and the prohibitions discover during rendering.
     ///
-    /// Some terms have nowhere to go in a syntax for reasons no table can see:
-    /// CII nests BT-147 inside the gross-price aggregate, so a discount stated
-    /// without a gross price cannot be written at all. The writer is the only
-    /// thing that knows, so it says so here rather than dropping it in silence.
-    notes: Vec<String>,
+    /// E.g. CII nests BT-147 inside the gross-price aggregate, so a discount
+    /// without a gross price cannot be written.
+    notes: Vec<Entry>,
     /// Prohibition ids this document is permitted to violate.
     ///
-    /// # Why a writer may ever be allowed to
-    ///
-    /// The prohibitions are **CEN core's** subset definition, and an Extension
-    /// is §4.3's mechanism for going outside it. `UBL-CR-646` forbids
-    /// `cac:SubInvoiceLine` and `UBL-CR-470` forbids `cac:PrepaidPayment`;
-    /// KoSIT's XRechnung Extension scenario reports both at `information`
-    /// precisely so `BG-DEX-01` and `BG-DEX-09` can be carried.
-    ///
-    /// So a write *for a profile that declares the extension group* waives the
-    /// matching prohibition, and a write for anything else does not — the
-    /// element is dropped and reported, as before. The capability comes from
-    /// [`en16931::Profile::extensions`], the same field `EN-EXT-01` reads, so
-    /// the warning and the writer cannot disagree about what a profile can hold.
+    /// A profile declaring an extension group (§4.3) waives the matching core
+    /// prohibition: `UBL-CR-646` (`cac:SubInvoiceLine`, BG-DEX-01) and
+    /// `UBL-CR-470` (`cac:PrepaidPayment`, BG-DEX-09). Decided from
+    /// [`en16931::Profile::extensions`].
     waived: &'static [&'static str],
 }
 
 impl Xml {
     pub fn new(root: &str, attrs: Vec<(String, String)>, rules: &'static Rules) -> Self {
         Self {
-            stack: vec![Node {
+            stack: vec![XNode {
                 name: root.to_owned(),
                 attrs,
                 text: None,
                 children: Vec::new(),
+                term: None,
             }],
             rules,
             notes: Vec::new(),
@@ -223,31 +626,36 @@ impl Xml {
 
     /// Permit the prohibitions in `ids` for this document — see [`Xml::waived`].
     ///
-    /// UBL only, and that is not an oversight in the `cfg`: the CII binding does
-    /// not *write* `BG-DEX-01` or `BG-DEX-09` at all — it reports them in
-    /// `dropped` — so there is no prohibition for it to waive. A waiver it never
-    /// calls would be a method advertising a capability the binding does not
-    /// have, and under `--no-default-features --features cii` the compiler says
-    /// so out loud.
-    ///
-    /// When the CII writer learns those groups, this loses the attribute and
-    /// gains a second caller.
+    /// UBL only: the CII writer reports `BG-DEX-01` and `BG-DEX-09` as dropped.
     #[cfg(feature = "ubl")]
     pub fn waiving(mut self, ids: &'static [&'static str]) -> Self {
         self.waived = ids;
         self
     }
 
-    /// Record a term this syntax has no place for, with the reason.
-    ///
-    /// Goes into the same list the sequence tables and prohibitions write to,
-    /// because a caller asking "what did I lose?" should not have to know which
-    /// of three mechanisms noticed.
-    pub fn dropped(&mut self, what: impl Into<String>) {
-        self.notes.push(what.into());
+    /// Record what only the writer knows: a term this syntax has no place for,
+    /// a required element the model lacks, a value derived because the syntax
+    /// demands one.
+    pub fn note(&mut self, entry: Entry) {
+        self.notes.push(entry);
     }
 
-    fn push(&mut self, node: Node) {
+    /// Run `f`, tagging every element it emits at this level with `term`.
+    ///
+    /// So a `Dropped` entry names the term (UBL's `<CreditNote>` has no
+    /// `cbc:DueDate`: BT-9).
+    #[cfg(feature = "ubl")]
+    pub fn term(&mut self, term: &'static str, f: impl FnOnce(&mut Self)) {
+        let before = self.stack.last().map_or(0, |n| n.children.len());
+        f(self);
+        if let Some(top) = self.stack.last_mut() {
+            for c in top.children.iter_mut().skip(before) {
+                c.term = Some(term);
+            }
+        }
+    }
+
+    fn push(&mut self, node: XNode) {
         self.stack
             .last_mut()
             .expect("the root is never popped")
@@ -257,7 +665,7 @@ impl Xml {
 
     /// `<name attrs>text</name>`.
     pub fn leaf(&mut self, name: &str, attrs: &[(&str, &str)], text: &str) {
-        self.push(Node {
+        self.push(XNode {
             name: name.to_owned(),
             attrs: attrs
                 .iter()
@@ -265,20 +673,20 @@ impl Xml {
                 .collect(),
             text: Some(text.to_owned()),
             children: Vec::new(),
+            term: None,
         });
     }
 
     /// Run `f` inside `name`, emitting nothing at all if `f` writes nothing.
     ///
-    /// Both syntaxes treat an empty aggregate as present-but-blank and several
-    /// rules count occurrences, so a wrapper around no children is not merely
-    /// untidy — it changes what the document asserts.
+    /// An empty aggregate is present-but-blank and rules count occurrences.
     pub fn group(&mut self, name: &str, f: impl FnOnce(&mut Self)) {
-        self.stack.push(Node {
+        self.stack.push(XNode {
             name: name.to_owned(),
             attrs: Vec::new(),
             text: None,
             children: Vec::new(),
+            term: None,
         });
         f(self);
         let node = self.stack.pop().expect("group pushed a node");
@@ -287,25 +695,27 @@ impl Xml {
         }
     }
 
+    /// [`Xml::group`], saying whether the group was emitted (had children).
+    #[cfg(feature = "ubl")]
+    pub fn group_emitted(&mut self, name: &str, f: impl FnOnce(&mut Self)) -> bool {
+        let before = self.stack.last().map_or(0, |n| n.children.len());
+        self.group(name, f);
+        self.stack.last().map_or(0, |n| n.children.len()) > before
+    }
+
     /// Like [`Xml::group`], but emitted even when empty.
     ///
-    /// CII's `rsm:ExchangedDocumentContext` and `ram:ApplicableHeaderTradeDelivery`
-    /// are **mandatory in the D16B sequence** and may legitimately have no
-    /// children — a minimal invoice delivers nothing and says nothing about a
-    /// process. Pruning them produces a document that fails schema validation
-    /// while looking tidier, so the two cases are distinguished at the call
-    /// site rather than guessed at here.
-    ///
-    /// CII-only: UBL has no aggregate that is both mandatory and legitimately
-    /// empty, so gating this keeps the `ubl`-only build free of dead code
-    /// rather than merely free of a warning about it.
+    /// For CII's `rsm:ExchangedDocumentContext` and
+    /// `ram:ApplicableHeaderTradeDelivery`, mandatory in D16B and possibly
+    /// empty. CII only.
     #[cfg(feature = "cii")]
     pub fn group_required(&mut self, name: &str, f: impl FnOnce(&mut Self)) {
-        self.stack.push(Node {
+        self.stack.push(XNode {
             name: name.to_owned(),
             attrs: Vec::new(),
             text: None,
             children: Vec::new(),
+            term: None,
         });
         f(self);
         let node = self.stack.pop().expect("group pushed a node");
@@ -315,7 +725,7 @@ impl Xml {
     /// Serialise, ordering every level and enforcing the prohibitions.
     ///
     /// Returns the document and everything the syntax could not carry.
-    pub fn finish(mut self) -> (String, Vec<String>) {
+    pub fn finish(mut self) -> (String, Vec<Entry>) {
         let mut root = self.stack.pop().expect("the root");
         debug_assert!(self.stack.is_empty(), "unbalanced group()");
         let mut out = String::with_capacity(4096);
@@ -338,22 +748,16 @@ impl Xml {
 /// Does a document path fall under `context` with `relative` beneath it?
 ///
 /// A context beginning with a single `/` anchors at the document element; `//`
-/// or a bare name matches at any depth. That distinction is load-bearing:
-/// `/ubl:Invoice` + `not(cbc:UUID)` forbids a `cbc:UUID` **child of the
-/// document element**, and treating it as floating would forbid the element
-/// wherever it appears.
+/// or a bare name matches at any depth.
 ///
-/// The document element is compared by local name, because a writer using a
-/// default namespace emits `Invoice` where the Schematron writes `ubl:Invoice`.
-/// Everything below it is compared qualified, as both sides spell it.
+/// The document element is compared by local name (`Invoice` vs
+/// `ubl:Invoice`); everything below it qualified.
 pub(crate) fn path_matches(path: &str, context: &str, relative: &str) -> bool {
     let floating = context.starts_with("//") || !context.starts_with('/');
     let ctx = context.trim_start_matches('/');
     if floating {
-        // `path == "{ctx}/{relative}"`, or `path` ends with `"/{ctx}/{relative}"`
-        // — compared in place. This ran once per prohibition per element and
-        // built two `String`s each time, which is how writing a document came
-        // to cost more than reading one (D44).
+        // `path == "{ctx}/{relative}"`, or `path` ends with `"/{ctx}/{relative}"`,
+        // compared without allocating.
         return ends_with_segment_pair(path, ctx, relative);
     }
     // Anchored: the whole path must be the context element followed by the
@@ -364,17 +768,9 @@ pub(crate) fn path_matches(path: &str, context: &str, relative: &str) -> bool {
     local(head) == local(ctx) && rest == relative
 }
 
-/// A prohibition table indexed by the last segment of its relative path.
-///
-/// # Why an index rather than a scan
-///
-/// `forbidden_path` runs **once per element emitted** and the UBL table has
-/// 1 548 entries, so a scan is most of what writing a document costs.
-///
-/// A prohibition can only match a path whose final element name is the final
-/// name of its relative path, so that is the key: 275 distinct tails across the
-/// UBL table, largest bucket 42 entries. Built on first use through `OnceLock`,
-/// which adds no dependency to a crate whose graph size is one of its claims.
+/// A prohibition table indexed by the last segment of its relative path, since
+/// a prohibition can only match a path ending in that name. `forbidden_path`
+/// runs once per element emitted.
 pub(crate) struct ProhibitionIndex {
     by_tail: std::collections::HashMap<&'static str, Vec<usize>>,
 }
@@ -390,11 +786,8 @@ impl ProhibitionIndex {
         Self { by_tail }
     }
 
-    /// The first entry in **table order** that `path` violates.
-    ///
-    /// Table order, not bucket order, is what keeps the reported rule id stable:
-    /// two prohibitions can match one path, and which one a document names
-    /// should not depend on how a hash bucket happened to fill.
+    /// The first entry in table order that `path` violates, so the reported
+    /// rule id is stable when two match.
     pub(crate) fn find(
         &self,
         table: &'static [(&'static str, &'static str, &'static str)],
@@ -416,9 +809,7 @@ fn tail_of(path: &str) -> &str {
 
 /// Whether `path` ends with `a/b`, on a segment boundary — without building it.
 ///
-/// Element names are ASCII, but the slicing below is done through `get` rather
-/// than by indexing, because "this is always ASCII" is exactly the assumption
-/// that panicked on a rule name (D36).
+/// Slices through `get`, so a non-ASCII name cannot panic.
 fn ends_with_segment_pair(path: &str, a: &str, b: &str) -> bool {
     let needle_len = a.len() + 1 + b.len();
     let Some(start) = path.len().checked_sub(needle_len) else {
@@ -443,22 +834,25 @@ fn local(name: &str) -> &str {
 
 /// Sort `children` into sequence order, reporting any the sequence cannot place.
 ///
-/// Repeated elements keep the order they were written in: `sort_by_key` is
-/// stable, so two invoice lines stay in line order.
-fn order_children(parent: &str, children: &mut Vec<Node>, dropped: &mut Vec<String>, r: &Rules) {
+/// Stable: repeated elements keep the order they were written in.
+fn order_children(parent: &str, children: &mut Vec<XNode>, dropped: &mut Vec<Entry>, r: &Rules) {
     let Some(seq) = (r.order)(local(parent)) else {
         return; // no evidence for this parent; leave the writer's order alone
     };
     children.retain(|c| {
         let known = seq.contains(&local(&c.name));
         if !known {
-            // The sequences were derived from the authorities' own instances.
-            // An element absent from one is an element no published document
-            // places there — `cac:ProjectReference` under `<CreditNote>`,
-            // because UBL's credit note has no such element. Emitting it anyway
-            // produces a document the counterparty's schema rejects, which is
-            // worse than dropping it and saying so.
-            dropped.push(format!("{}/{}", local(parent), c.name));
+            // Not in the parent's sequence (e.g. `cac:ProjectReference` under
+            // `<CreditNote>`): emitting it would fail the schema.
+            let mut e = Entry::new(
+                Kind::Dropped,
+                format!("{}/{}", local(parent), c.name),
+                "the target document's element sequence has no place for it",
+            );
+            if let Some(t) = c.term {
+                e = e.term(t);
+            }
+            dropped.push(e);
         }
         known
     });
@@ -471,16 +865,13 @@ fn order_children(parent: &str, children: &mut Vec<Node>, dropped: &mut Vec<Stri
 
 /// Render `node`, sorting each level **in place**.
 ///
-/// `&mut Node`, not `&Node`, so [`order_children`] sorts the real children.
-/// Cloning them per level to get something mutable would deep-copy the whole
-/// subtree — `Node` is recursive — and rendering a thousand-line invoice would
-/// copy the document once per level of nesting before writing a byte.
+/// `&mut` so [`order_children`] sorts in place rather than cloning subtrees.
 fn render(
-    node: &mut Node,
+    node: &mut XNode,
     path: &str,
     depth: usize,
     out: &mut String,
-    dropped: &mut Vec<String>,
+    dropped: &mut Vec<Entry>,
     r: &Rules,
     waived: &[&str],
 ) {
@@ -490,30 +881,39 @@ fn render(
     let _ = write!(out, "<{}", node.name);
     for (k, v) in &node.attrs {
         if let Some(rule) = (r.forbidden_attribute)(k) {
-            dropped.push(format!("{path}/@{k} ({rule})"));
+            dropped.push(
+                Entry::new(
+                    Kind::Prohibited,
+                    format!("{path}/@{k}"),
+                    "CEN's syntax rules fence it out of the EN 16931 subset",
+                )
+                .rule(rule),
+            );
             continue;
         }
         let _ = write!(out, " {k}=\"");
-        escape(v, out);
+        if escape_attribute(v, out) {
+            dropped.push(unwritable_characters(format!("{path}/@{k}"), node.term));
+        }
         out.push('"');
     }
     if node.children.is_empty() {
-        // A required-but-empty aggregate serialises as `<x/>` rather than
-        // `<x></x>`: both are the same infoset, and the short form is what
-        // every producer in this field emits.
+        // A required-but-empty aggregate serialises as `<x/>`.
         if node.text.is_none() {
             let _ = writeln!(out, "/>");
             return;
         }
         out.push('>');
-        escape(node.text.as_deref().unwrap_or_default(), out);
+        if escape(node.text.as_deref().unwrap_or_default(), out) {
+            dropped.push(unwritable_characters(path.to_owned(), node.term));
+        }
         let _ = writeln!(out, "</{}>", node.name);
         return;
     }
     let _ = writeln!(out, ">");
     // Disjoint field borrows: the sequence table is keyed by the parent's name
     // and the sort mutates its children, and the two are different fields.
-    let Node { name, children, .. } = node;
+    let XNode { name, children, .. } = node;
     order_children(name, children, dropped, r);
     for c in children.iter_mut() {
         let child_path = if path.is_empty() {
@@ -521,15 +921,21 @@ fn render(
         } else {
             format!("{path}/{}", c.name)
         };
-        // Enforcing here rather than trusting every call site is what makes
-        // "the writer cannot emit a forbidden element" a property instead of a
-        // habit — `cbc:CompanyLegalForm` is BT-33, the *seller's*, and
-        // `UBL-CR-244` forbids it on the customer, which a hand-written writer
-        // got wrong.
+        // Enforced here for every element (e.g. `UBL-CR-244` forbids
+        // `cbc:CompanyLegalForm` on the customer).
         if let Some(rule) = (r.forbidden_path)(&child_path)
             && !waived.contains(&rule)
         {
-            dropped.push(format!("{child_path} ({rule})"));
+            let mut e = Entry::new(
+                Kind::Prohibited,
+                child_path,
+                "CEN's syntax rules fence it out of the EN 16931 subset",
+            )
+            .rule(rule);
+            if let Some(t) = c.term {
+                e = e.term(t);
+            }
+            dropped.push(e);
             continue;
         }
         render(c, &child_path, depth + 1, out, dropped, r, waived);
@@ -540,9 +946,14 @@ fn render(
     let _ = writeln!(out, "</{name}>");
 }
 
-/// Escape the five metacharacters, and drop control characters XML 1.0 cannot
-/// represent at all.
-pub(crate) fn escape(s: &str, out: &mut String) {
+/// Escape the five metacharacters and a carriage return, and drop the
+/// characters XML 1.0 cannot represent at all (C0 controls, U+FFFE, U+FFFF) —
+/// returning whether any were dropped, so the caller reports it.
+///
+/// A literal carriage return would reach the reader as a line feed (XML's
+/// end-of-line normalisation), so it is written as `&#13;`, which survives.
+pub(crate) fn escape(s: &str, out: &mut String) -> bool {
+    let mut dropped = false;
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -550,16 +961,56 @@ pub(crate) fn escape(s: &str, out: &mut String) {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            c if (c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r') => {}
+            '\r' => out.push_str("&#13;"),
+            // Outside XML 1.0's `Char`: the C0 controls but tab and line feed
+            // (carriage return is referenced above), and U+FFFE / U+FFFF.
+            c if ((c as u32) < 0x20 && !matches!(c, '\t' | '\n'))
+                || matches!(c, '\u{FFFE}' | '\u{FFFF}') =>
+            {
+                dropped = true;
+            }
             c => out.push(c),
         }
+    }
+    dropped
+}
+
+/// [`escape`] for an attribute value, where a parser also turns a literal tab
+/// or line feed into a space (XML 1.0 §3.3.3): both are written as character
+/// references, which survive.
+pub(crate) fn escape_attribute(s: &str, out: &mut String) -> bool {
+    let mut dropped = false;
+    for part in s.split_inclusive(['\t', '\n']) {
+        let (body, end) = match part.strip_suffix(['\t', '\n']) {
+            Some(body) => (body, &part[body.len()..]),
+            None => (part, ""),
+        };
+        dropped |= escape(body, out);
+        match end {
+            "\t" => out.push_str("&#9;"),
+            "\n" => out.push_str("&#10;"),
+            _ => {}
+        }
+    }
+    dropped
+}
+
+/// The entry for a value that lost control characters XML cannot carry.
+fn unwritable_characters(path: String, term: Option<&'static str>) -> Entry {
+    let e = Entry::new(
+        Kind::Dropped,
+        path,
+        "characters XML 1.0 cannot represent were left out of the value",
+    );
+    match term {
+        Some(t) => e.term(t),
+        None => e,
     }
 }
 
 /// Base64, RFC 4648 §4, no line breaks.
 ///
-/// Fifteen lines rather than a dependency, and both syntaxes need it: BT-125
-/// carries an attachment's bytes inline.
+/// For BT-125, an attachment's bytes inline.
 pub(crate) fn base64(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -583,10 +1034,6 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
 }
 
 /// Decode base64, RFC 4648 §4, ignoring whitespace.
-///
-/// Handing the *encoded* text back as an attachment's content is a bug that
-/// survives every schema check and every rule: the document is valid, the
-/// attachment is present, and the bytes are wrong. Only a round-trip finds it.
 pub(crate) fn decode_base64(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len() / 4 * 3);
     let mut acc: u32 = 0;
@@ -624,8 +1071,63 @@ mod tests {
         forbidden_attribute: |_| None,
     };
 
-    /// The scanner may over-report nothing, because over-reporting rejects a
-    /// lawful invoice. Each case below is a way of writing `<` or `>` that is
+    /// One `text()` for both syntaxes: every text child, trimmed, and an empty
+    /// or whitespace-only element is absent.
+    #[test]
+    fn text_is_the_whole_value_and_blank_is_absent() {
+        let doc = roxmltree::Document::parse(
+            "<r><a> 12<!-- note -->34 </a><b>   </b><c/><d><![CDATA[x<y]]></d><e>\n7\n</e></r>",
+        )
+        .expect("well-formed");
+        let r = doc.root_element();
+        assert_eq!(child_text(r, "a").as_deref(), Some("1234"));
+        assert_eq!(child_text(r, "b"), None, "whitespace-only is absent");
+        assert_eq!(child_text(r, "c"), None, "empty is absent");
+        assert_eq!(child_text(r, "d").as_deref(), Some("x<y"));
+        assert_eq!(child_text(r, "missing"), None);
+        // Untrimmed for the one term whose whitespace is load-bearing.
+        assert_eq!(kid(r, "e").and_then(raw_text).as_deref(), Some("\n7\n"));
+    }
+
+    #[test]
+    fn utf8_and_utf16_with_a_mark_decode_alike() {
+        let xml = "<?xml version=\"1.0\"?><Invoice>Müller</Invoice>";
+        let mut bom8 = b"\xEF\xBB\xBF".to_vec();
+        bom8.extend_from_slice(xml.as_bytes());
+        let le: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(xml.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let be: Vec<u8> = [0xFE, 0xFF]
+            .into_iter()
+            .chain(xml.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        for bytes in [xml.as_bytes().to_vec(), bom8, le, be] {
+            assert_eq!(decode(&bytes).expect("decodes"), xml);
+        }
+    }
+
+    #[test]
+    fn every_other_encoding_is_refused_by_name() {
+        let found = |b: &[u8]| match decode(b) {
+            Err(crate::Error::Encoding { found }) => found,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            found(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a/>"),
+            "ISO-8859-1"
+        );
+        assert_eq!(found(b"<a>\xFC</a>"), "invalid UTF-8");
+        // A mark contradicting the declaration: refused, not one of them believed.
+        let mut lying = b"\xEF\xBB\xBF".to_vec();
+        lying.extend_from_slice(b"<?xml version='1.0' encoding='UTF-16'?><a/>");
+        assert_eq!(found(&lying), "UTF-16");
+        assert_eq!(found(b"<\0a\0/\0>\0"), "UTF-16 without a byte-order mark");
+        // The declared family that was found is fine, in any case.
+        assert!(decode(b"<?xml version='1.0' encoding='utf-8'?><a/>").is_ok());
+    }
+
+    /// The depth scanner never over-reports: each case is a `<` or `>` that is
     /// not a tag.
     #[test]
     fn depth_counts_elements_and_nothing_that_merely_looks_like_one() {
@@ -640,14 +1142,11 @@ mod tests {
         assert_eq!(max_depth("<a><![CDATA[<b><c><d>]]></a>"), 1);
         assert_eq!(max_depth("<?xml version=\"1.0\"?><a></a>"), 1);
         assert_eq!(max_depth("<!DOCTYPE a><a></a>"), 1);
-        // `>` inside a quoted attribute value is legal, and real invoices carry
-        // URLs and free text in attributes.
+        // `>` inside a quoted attribute value is legal.
         assert_eq!(max_depth("<a x=\"1>2\"><b/></a>"), 1);
         assert_eq!(max_depth("<a x='a>b' y=\"c>d\"/>"), 0);
-        // An unterminated construct ends the scan rather than looping. Depth may
-        // be over-reported by one for a truncated start tag, and that is the one
-        // place it is allowed to be: the document is not well-formed, so the
-        // parser rejects it either way and no lawful invoice is affected.
+        // An unterminated construct ends the scan. A truncated start tag may
+        // over-report by one; the document is not well-formed anyway.
         assert_eq!(max_depth("<a><!-- never closed"), 1);
         assert_eq!(max_depth("<a"), 1);
     }
@@ -676,8 +1175,12 @@ mod tests {
     #[test]
     fn text_is_escaped() {
         let mut s = String::new();
-        escape("x<y & \"z\" 'q'\u{7}", &mut s);
-        assert_eq!(s, "x&lt;y &amp; &quot;z&quot; &apos;q&apos;");
+        assert!(escape("x<y & \"z\" 'q'\u{7}\r\u{FFFF}", &mut s));
+        assert_eq!(s, "x&lt;y &amp; &quot;z&quot; &apos;q&apos;&#13;");
+        assert!(!escape("tab\tand\nline", &mut String::new()));
+        let mut a = String::new();
+        assert!(!escape_attribute("a\tb\nc\rd", &mut a));
+        assert_eq!(a, "a&#9;b&#10;c&#13;d");
     }
 
     #[test]
@@ -740,8 +1243,7 @@ mod tests {
         ));
     }
 
-    /// With no order table for a parent, the writer's own order is preserved
-    /// rather than mangled — the fallback must be inert, not lossy.
+    /// With no order table for a parent, the writer's own order is preserved.
     #[test]
     fn an_unknown_parent_keeps_the_writers_order() {
         let mut x = Xml::new("Root", vec![], &NO_RULES);

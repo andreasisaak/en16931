@@ -1,7 +1,7 @@
 +++
 title = "Validation"
 weight = 3
-description = "The 317 EN 16931 business rules as Rust: the nine VAT category families, four tolerance regimes, severity from the authority, and reports in JSON or SVRL."
+description = "The 334 EN 16931 business rules as Rust: the nine VAT category families, four tolerance regimes, severity from the authority, and reports in JSON or SVRL."
 +++
 
 `validate(&invoice)` runs the core EN 16931 rule set and returns a report.
@@ -10,24 +10,21 @@ sees a document, and both point their findings at business terms.
 
 ## What is in the registry
 
-**317 rules.** Of those, **53 are retired by the type system** — no state of the
-model can make them fire — **4 are undecidable** at the semantic layer, and the
-remaining **260 are each exercised by their own failing fixture**.
+334 rules registered: 53 rules retired by the type system — no state of the
+model can make them fire — 4 undecidable at the semantic layer (CEN binds them
+to `true()` too), and the remaining 277 exercised by their own failing fixture.
+**4** of those are this crate's own, namespaced `EN-*`.
 
-That last number is the one that matters. A rule nobody has seen fire may be
-inverted, unreachable, or checking the wrong field, and a suite of valid
-documents would be green either way. So the coverage gate fails if a rule is
-uncovered and undeclared, if a declared rule has since become covered, **and if
-anything is declared for a reason other than being type-retired**. The excuse
-list has no room in it.
+The coverage gate fails if a rule is neither exercised nor declared retired or
+undecidable, and if a declared rule has since become exercised.
 
 ```text
 conformance corpus
-  registered:            317
+  registered:            334
   retired by the types:   53  (no state can make them fire)
   undecidable:             4  (CEN binds them to true() too)
-  checkable:             260
-  exercised by a case:   260  (100% of checkable)
+  checkable:             277
+  exercised by a case:   277  (100% of checkable)
   declared uncovered:      0
 ```
 
@@ -37,6 +34,7 @@ The composition, by family:
 |---|---:|---|
 | `BR-*` and the nine VAT families | 156 | cardinality, presence, the category tables |
 | `PEPPOL-EN16931-*` | 46 | Peppol BIS Billing 3.0 |
+| `PEPPOL-COMMON-*` | 17 | Peppol's identifier checks — GLN, national registry numbers, Dutch VAT numbers |
 | `BR-DE-*` | 27 | XRechnung |
 | `BR-CO-*` | 24 | the totals and derivation chain |
 | `BR-CL-*` | 23 | code-list membership |
@@ -45,10 +43,10 @@ The composition, by family:
 | `BR-TMP-*` | 2 | temporary CEN rules |
 | `EN-*` | 4 | this crate's own, namespaced so they cannot be mistaken for CEN's |
 
-Out of scope and named rather than quietly dropped: the **1 339 syntax rules**
-(`UBL-*`, `CII-*`) belong to [`en16931-formats`](@/docs/syntaxes.md), and
-Peppol's ~90 national rules (`DK-R-*`, `SE-R-*`, …) are country registry-format
-and check-digit checks.
+Out of scope: the **1 339 syntax rules** (`UBL-*`, `CII-*`) belong to
+[`en16931-formats`](@/docs/syntaxes.md), and most of Peppol's national rules are
+not implemented — [Peppol's national rules](@/docs/profiles.md#peppol-s-national-rules)
+says which.
 
 ### This crate's own four
 
@@ -151,10 +149,9 @@ and pick the zero-rate branch of `BR-CO-17` on `round(Percent) = 0`. Both are
 
 Banker's and half-away-from-zero each get one of the two midpoint columns
 wrong, so the rules use `floor(x + 0.5)` — the definition rather than an
-approximation of it. It is not academic: a VAT rate of exactly **0.5 %**
-(Spain's *recargo de equivalencia* on reduced-rate goods) rounds to `1` for the
-artefact and to `0` for banker's, which sent `BR-CO-17` down its zero-rate
-branch and rejected a correct invoice every deployed validator accepts.
+approximation of it. A VAT rate of exactly **0.5 %** (Spain's *recargo de
+equivalencia* on reduced-rate goods) rounds to `1` for the artefact and to `0`
+for banker's, which would send `BR-CO-17` down its zero-rate branch.
 
 ## Severity is the authority's, not ours
 
@@ -209,22 +206,12 @@ One field to fix, not three.
 
 ### A third source: the CEN release each authority built against
 
-KoSIT's `v2026-01-31` configuration declares CEN Schematron `1.3.15`; this crate
-derives CEN's rules from `1.3.16`, which is CEN's current release and the one the
-conformance suite's test files come from. Between them CEN:
-
-| | |
-|---|---|
-| removed `BGN` and `ANG` from ISO 4217 | Bulgaria adopted the euro; `ANG` became `XCG` |
-| added `XCG` | the Caribbean guilder |
-| moved type codes `502` and `503` | from the invoice list to the credit-note list in `BR-CL-01` |
-| added ISO 6523 ICD `0245`–`0248` | new registered schemes |
-
-So a **Bulgarian-lev invoice is fatal here and valid for the German reference
-validator**. Following CEN's newest release is the defensible choice; holding
-the skew unnoticed is not, so `tests/artefact_pin.rs` reads the CEN version out
-of KoSIT's changelog, fails when it changes, and pins the affected currency
-codes. The declaration deletes itself when KoSIT catches up.
+KoSIT's `v2026-08-31` configuration and Peppol BIS Billing 3.0.21 both name CEN
+`1.3.16`, the release this crate derives CEN's rules from. A code list that
+differs between two CEN releases turns a valid invoice fatal, so
+`tests/artefact_pin.rs` reads the CEN release out of each authority's own
+artefact and fails when one differs from this crate's, unless that skew is
+declared with every diverging code value asserted. None is declared.
 
 **Getting either file wrong rejects invoices Germany accepts.** `BR-CL-21` and
 `BR-CL-23` are code-list rules whose CEN tables lag the registries they track
@@ -247,7 +234,7 @@ standard's own wording — so the registry is listable, filterable and explainab
 use en16931::validation::rules::{explain, explain_restriction};
 
 assert_eq!(explain("BR-CO-3").map(|r| r.id.as_str()), Some("BR-CO-03"));   // padding
-assert_eq!(explain("BR-IG-8").map(|r| r.id.as_str()), Some("BR-AF-08"));   // family alias
+assert!(explain("BR-IG-8").is_none());                                      // no family mapping
 assert!(explain("PEPPOL-EN16931-R120").is_some());
 assert!(explain_restriction("br-de-3").is_some());                          // a restriction
 ```
@@ -289,31 +276,46 @@ assert_eq!(report.suppressed(), ["BR-DE-15"]);
 assert!(report.to_string().contains("suppressed and NOT checked"));
 ```
 
-The suppressed ids are on the report, printed by `Display`, carried in the JSON,
-and `rules_checked` drops by the number of checks that were **actually** removed
-— not by the number of requests, which would let a name resolving to nothing
-deduct from a count of checks that were never going to run.
+```text
+XRechnung 3.0 validation (EN 16931-1:2017+A1:2019) — 281 rule(s) checked, 29 finding(s) (26 fatal, 2 warning, 1 information), INVALID
+  ⚠ 1 rule(s) suppressed and NOT checked: BR-DE-15
+```
+
+The suppressed ids are on the report, printed by `Display` and carried in the
+JSON, and `rules_checked` drops by the number of checks actually removed.
+
+### A receiver re-levels
+
+A receiver that accepts documents breaking one rule lowers that rule —
+KoSIT's `customLevel`, on the receiving side:
+
+```rust
+use en16931::{Invoice, Severity, profiles, validation::Check};
+
+let report = Check::new(&profiles::XRECHNUNG)
+    .relevel("BR-CL-23", Severity::Warning)   // unit codes our ERP still sends
+    .run(&Invoice::default());
+assert_eq!(report.relevelled(), [("BR-CL-23".to_owned(), Severity::Warning)]);
+```
+
+The rule still runs and its finding still appears, at the new level; the report
+records the re-levelling and prints it.
 
 ### A proof has to be earned twice over
 
-`Check::prove` hands back a [`Validated<P>`](@/docs/profiles.md) only when two
-things hold, and refuses on either.
+`Check::prove` hands back a [`Validated<P>`](@/docs/profiles.md) only when the
+check runs `P`'s rule set as published and the invoice passes it:
 
 | Refusal | Why |
 |---|---|
-| `ProveError::Suppressed` | a rule set with a hole may accept documents the full set rejects, so a proof derived from it claims something untrue |
+| `ProveError::Rejected` | the invoice has a fatal finding; it carries the invoice and the report |
+| `ProveError::Suppressed` | a rule set with a hole may accept documents the full set rejects |
+| `ProveError::Relevelled` | a proof names a profile's rule set as published, at its published severities |
 | `ProveError::WrongProfile` | `P` names a profile this `Check` does not run |
 
-The second was a real hole rather than a hypothetical one. `prove::<P>()` read
-only its type parameter, so `Check::new(&profiles::XRECHNUNG).prove::<En16931>(inv)`
-announced an XRechnung run, evaluated the bare core rule set, and returned a
-proof — and the mirror image silently ran the *stricter* set. The profile named
-and the profile that ran were unrelated choices, in the one method whose whole
-job is to say which rule set a document passed.
-
-`Check::of::<P>()` is the constructor that makes the mismatch unrepresentable:
-the marker **is** the profile. `Check::new` stays for the runtime case a CLI
-resolving `--profile`, or a service reading BT-24, actually has.
+`Check::of::<P>()` makes the last one unrepresentable: the marker **is** the
+profile. `Check::new` is for the runtime case — a CLI resolving `--require`, a
+service reading BT-24.
 
 ## Reports you can store, diff and ship
 
@@ -325,13 +327,14 @@ use en16931::{Report, Invoice, profiles};
 
 let report = profiles::XRECHNUNG.validate(&Invoice::default());
 let out = Report::of(&report);
-assert_eq!(out.schema, "en16931-report/3");
+assert_eq!(out.schema, "en16931-report/4");
 assert_eq!(out.profile.as_deref(), Some("XRechnung 3.0"));
+assert!(out.layers.is_empty());   // a bare model: there was no document
 ```
 
 ```json
 {
-  "schema": "en16931-report/3",
+  "schema": "en16931-report/4",
   "valid": false,
   "profile": "XRechnung 3.0",
   "edition": "EN 16931-1:2017+A1:2019",
@@ -340,18 +343,34 @@ assert_eq!(out.profile.as_deref(), Some("XRechnung 3.0"));
     { "authority": "CEN",        "repo": "ConnectingEurope/eInvoicing-EN16931",
       "gitRef": "validation-1.3.16" },
     { "authority": "KoSIT",      "repo": "itplr-kosit/xrechnung-schematron",
-      "gitRef": "v2.5.0" },
+      "gitRef": "v2.6.0" },
     { "authority": "KoSIT",      "repo": "itplr-kosit/validator-configuration-xrechnung",
-      "gitRef": "v2026-01-31" },
+      "gitRef": "v2026-08-31" },
     { "authority": "OpenPeppol", "repo": "OpenPEPPOL/peppol-bis-invoice-3",
-      "gitRef": "v3.0.20" }
+      "gitRef": "806866bd2bd91d7e9623b68f08164e8fbe9e67a0" }
   ],
+  "suppressed": [], "relevelled": [], "leftOut": [],
+  "source": null, "identity": null, "declaration": null,
+  "recommendation": null, "reasons": [], "layers": [], "required": null,
   "findings": [
     { "rule": "BR-02", "severity": "fatal", "source": "standard+artefact",
       "location": "BT-1", "text": "An Invoice shall have an Invoice number (BT-1)." }
   ]
 }
 ```
+
+**A received document fills the rest.** `/4` adds what a document passes
+through beside its findings: `layers` (container, syntax, schema, semantic —
+each `valid`, `invalid` or `skipped`, with the reader's and the container's
+entries, each with a kind, a level, a syntax path, the business term, the value
+and the artefact rule it cites), the document's `identity` (seller, BT-1, BT-2),
+the `declaration`, the `recommendation` with its `reasons`, and the report a
+receiver `required` beside the one declared. `en16931_formats::receive(…)
+.to_interchange()` fills them; `en16931 validate --format json` prints them.
+SVRL renders every layer: a fatal or warning entry is an `svrl:failed-assert`
+with an id in this crate's namespace (`en16931:schema:duplicate`), an
+information entry (an element the reader does not map) an
+`svrl:successful-report`.
 
 `ValidationReport` derives `Serialize`, but that shape is the crate's
 *internals*. `Report` is a separate, versioned shape: the internal layout may
@@ -391,31 +410,16 @@ codes, thousands of lines — and asserts that validation terminates, never pani
 is **deterministic and stably ordered**, and never cites a rule id that
 `explain()` cannot resolve.
 
-`proptest` rather than `cargo-fuzz`, on purpose: it runs in the ordinary suite on
-every commit. A property that only runs when someone remembers is a property that
-regresses.
+The property suite runs on every commit; coverage-guided fuzzing of the readers
+runs in CI beside it.
 
-### The one failure that is not a panic
+Documents, unlike models, can be nested: the readers in `en16931-formats`
+refuse nesting deeper than
+[`MAX_DEPTH`](https://docs.rs/en16931-formats/latest/en16931_formats/constant.MAX_DEPTH.html)
+before parsing, and any document carrying a DTD — see
+[syntaxes](@/docs/syntaxes.md#the-document-is-hostile-until-it-parses).
 
-Those properties generate *models*, and a model cannot be nested. A **document**
-can, and `en16931-formats` had the one crash a property suite over the model was
-never going to find: `roxmltree` recurses once per level of XML nesting, and at
-a few hundred levels it overflows the stack. That is not a panic — Rust cannot
-unwind a stack overflow and cannot catch it, so the process **aborts**.
-`en16931 validate theirs.xml` exited `134`, and a service embedding the reader
-simply died.
-
-It cannot be handled afterwards, so it is refused before: both readers measure
-nesting in one linear scan and return `TooDeep` past
-[`MAX_DEPTH`](https://docs.rs/en16931-formats/latest/en16931_formats/ubl/constant.MAX_DEPTH.html).
-The limit is 64 and the deepest of the 487 published instances is **9**, which
-the corpus suite measures rather than assumes.
-
-Two neighbouring attacks were already closed, and by the same principle of
-refusing rather than coping: `roxmltree` rejects any document carrying a DTD, so
-billion-laughs entity expansion and XXE file disclosure are both unreachable.
-
-## What is next
+## See also
 
 - **[Profiles](@/docs/profiles.md)** — XRechnung, Peppol, and the typed proof.
 - **[Conformance](@/docs/conformance.md)** — how all of the above is measured.

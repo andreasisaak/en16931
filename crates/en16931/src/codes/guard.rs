@@ -1,46 +1,23 @@
-//! Checking a code **at the point it is written**, not at validation time.
-//!
-//! # Why a second place to check the same thing
-//!
-//! [`crate::validate`] already reports every bad code, and it reports them with
-//! a business-term path. That is the right answer for a *document* — but it is
-//! the wrong moment for a *mapping*.
-//!
-//! A field mapper writing `Code::new("9958")` is looking at their own ERP's
-//! column at that instant. The `BR-CL-25` finding arrives minutes later, in a
-//! report about an assembled invoice, by which time the reader is no longer
-//! looking at the line of code that produced it. Worse, the finding can only
-//! say *"not in the CEF EAS code list"* — it does not know that `9958` was the
-//! German Leitweg-ID scheme, that OpenPeppol withdrew it on 31 July 2023, and
-//! that the answer is [`0204`](WITHDRAWN).
-//!
-//! So: the same lists, guarded, returning a [`CodeError`] that says what to do.
+//! Checking a code when it is written, returning a [`CodeError`] with a hint
+//! (successor of a [withdrawn](WITHDRAWN) code, case, whitespace).
 //!
 //! ```
 //! use en16931::codes::guard;
 //!
-//! // The typo a mapper actually makes.
 //! let err = guard::unit("kwh").unwrap_err();
 //! assert!(err.to_string().contains("did you mean \"KWH\""));
 //!
-//! // The code a German integrator actually reaches for.
+//! // Withdrawn; the hint names 0204.
 //! let err = guard::eas("9958").unwrap_err();
 //! assert!(err.to_string().contains("0204"));
 //!
-//! // And the ones that are simply right.
 //! assert_eq!(guard::eas("0204")?.as_str(), "0204");
 //! assert_eq!(guard::unit("KWH")?.as_str(), "KWH");
 //! # Ok::<(), en16931::codes::guard::CodeError>(())
 //! ```
 //!
-//! # This is a convenience, not a second source of truth
-//!
-//! Every function here checks the *same* generated list the corresponding rule
-//! checks, and `guarded_lists_agree_with_their_rules` asserts the pairing. A
-//! caller who skips this layer entirely loses nothing but the earlier message —
-//! validation still reports the code. That ordering is deliberate: a crate that
-//! made bad codes unrepresentable could not load an invalid document in order
-//! to explain it, which is the crate's whole design.
+//! Each function checks the same generated list as the corresponding rule;
+//! validation reports the code whether or not this layer is used.
 
 use core::fmt;
 
@@ -49,21 +26,8 @@ use crate::invoice::Code;
 
 // ── Withdrawn codes ───────────────────────────────────────────────────────────
 
-/// A code that **used to be valid** and has since been withdrawn.
-///
-/// # Why this table exists at all
-///
-/// "Not in the list" is an unhelpful thing to tell someone holding a value that
-/// their previous integration accepted, that appears in their counterparty's
-/// documentation, and that is still printed on a form somewhere. The useful
-/// message names the successor.
-///
-/// Twelve EAS schemes have left the CEF list since CEN artefact
-/// `validation-1.2.0` — nine of them in 2023 alone — and every one was in
-/// production somewhere. The membership half of this table is **measured**:
-/// `withdrawn_codes_are_really_gone` asserts each entry is absent from the
-/// current list and each named successor is present, so a code CEN reinstates
-/// fails the build rather than producing a wrong hint.
+/// A withdrawn EAS code and its successor. Tests assert each code is absent
+/// from the current list and each successor present.
 ///
 /// | Code | Was | Withdrawn | Use |
 /// |---|---|---|---|
@@ -84,9 +48,7 @@ pub struct Withdrawn {
     pub code: &'static str,
     /// What it used to mean.
     pub was: &'static str,
-    /// The code to use instead, when the authority names one.
-    ///
-    /// `None` for `9905`, which OpenPeppol removed without a successor.
+    /// The code to use instead, when the authority names one (`None` for `9905`).
     pub use_instead: Option<&'static str>,
     /// The extra sentence worth saying, if any.
     pub note: Option<&'static str>,
@@ -94,9 +56,7 @@ pub struct Withdrawn {
 
 /// The EAS schemes withdrawn since CEN artefact `validation-1.2.0`.
 ///
-/// Sourced from the OpenPeppol eDEC code-list change log; the *absence* of each
-/// from [`lists::EAS_SCHEMES`] is asserted by this module's tests against the
-/// pinned artefacts, so the two cannot disagree silently.
+/// From the OpenPeppol eDEC code-list change log.
 pub static WITHDRAWN: &[Withdrawn] = &[
     Withdrawn {
         code: "9901",
@@ -187,8 +147,7 @@ pub fn withdrawn(code: &str) -> Option<&'static Withdrawn> {
 
 /// A value that is not in the code list its business term draws from.
 ///
-/// Carries the rule that *would* have reported it, so the message and a later
-/// [`crate::Finding`] name the same thing and a reader can look it up once.
+/// Carries the rule that reports it at validation time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeError {
     /// The business terms the list serves — `"BT-34 / BT-49"`.
@@ -223,9 +182,7 @@ impl core::error::Error for CodeError {}
 
 /// One code list, together with what it is for.
 ///
-/// Public so a caller can guard a list this module has no named function for,
-/// and so [`crate::validation`] can borrow the same [`CodeList::advice`] without a second
-/// copy of the tables.
+/// Public so a caller can guard a list with no named function here.
 pub struct CodeList {
     /// The business terms it serves.
     pub terms: &'static str,
@@ -266,28 +223,11 @@ impl CodeList {
         })
     }
 
-    /// The most useful sentence this crate can produce about a rejected value.
-    ///
-    /// Three sources, in order of confidence:
-    ///
-    /// 1. **Withdrawn.** The value was in the list and the authority named a
-    ///    successor. This is the only case where the advice is authoritative
-    ///    rather than inferred.
-    /// 2. **Whitespace.** `" KWH"` is one `trim()` from correct, and §6.5.8's
-    ///    *"entered exactly as shown"* means the crate must not trim it for you.
-    /// 3. **Case.** `"kwh"` for `KWH`, `"eur"` for `EUR`. The single most common
-    ///    mapping bug, and unambiguous because no code list here contains two
-    ///    values differing only in case — asserted by `case_folding_is_unambiguous`.
-    ///
-    /// `None` when none of the three applies. **Deliberately no edit distance**:
-    /// `"KWO"` is one character from `KWH` and also from `KWT`, and a validator
-    /// that guesses between kilowatt-hours and kilowatts is worse than one that
-    /// says nothing.
+    /// A hint for a rejected value: a withdrawn code's successor, surrounding
+    /// whitespace, or a case mismatch, in that order. `None` otherwise (also
+    /// for an accepted value); no edit-distance guessing.
     #[must_use]
     pub fn advice(&self, value: &str) -> Option<String> {
-        // Nothing to advise about a value that is already correct. `check`
-        // never reaches here with one, but this is public and a caller asking
-        // "is there anything to say about X?" deserves `None` for a good X.
         if self.accepts(value) {
             return None;
         }
@@ -352,9 +292,6 @@ macro_rules! guarded {
 
 guarded! {
     /// BT-34 / BT-49 — the electronic address scheme.
-    ///
-    /// The list German integrators most often get wrong: `9958` looks right,
-    /// was right until 2023-07-31, and is not.
     EAS / eas = EAS_SCHEMES,
         terms: "BT-34 / BT-49", list: "the CEF EAS code list", rule: "BR-CL-25",
         withdrawals: true;
@@ -372,19 +309,16 @@ guarded! {
     COUNTRY / country = COUNTRY_CODES,
         terms: "BT-40 / BT-55 / BT-69 / BT-80", list: "ISO 3166-1 alpha-2", rule: "BR-CL-14";
 
-    /// BT-3 on an **invoice**. A credit note draws from [`CREDIT_NOTE_TYPE`].
+    /// BT-3 on an invoice. A credit note draws from [`CREDIT_NOTE_TYPE`].
     INVOICE_TYPE / invoice_type = INVOICE_TYPE_CODES,
         terms: "BT-3 (invoice)", list: "UNTDID 1001, invoice subset", rule: "BR-CL-01";
 
-    /// BT-3 on a **credit note**.
+    /// BT-3 on a credit note.
     CREDIT_NOTE_TYPE / credit_note_type = CREDIT_NOTE_TYPE_CODES,
         terms: "BT-3 (credit note)", list: "UNTDID 1001, credit-note subset", rule: "BR-CL-01";
 
-    /// BT-95 / BT-102 / BT-118 / BT-151 — the VAT category.
-    ///
-    /// Prefer [`crate::VatCategory::from_code`], which returns the *semantics*
-    /// rather than a string. This exists for symmetry and for callers holding a
-    /// code they have no branch for.
+    /// BT-95 / BT-102 / BT-118 / BT-151 — the VAT category. See also
+    /// [`crate::VatCategory::from_code`].
     VAT_CATEGORY / vat_category = VAT_CATEGORY_CODES,
         terms: "BT-95 / BT-102 / BT-118 / BT-151", list: "UNCL 5305", rule: "BR-CL-17";
 
@@ -396,11 +330,11 @@ guarded! {
     VATEX / vatex = VATEX_CODES,
         terms: "BT-121", list: "the CEF VATEX code list", rule: "PEPPOL-EN16931-CL002";
 
-    /// BT-98 — the document level allowance reason.
+    /// BT-98 / BT-140 — the allowance reason code.
     ALLOWANCE_REASON / allowance_reason = ALLOWANCE_REASON_CODES,
         terms: "BT-98 / BT-140", list: "UNCL 5189", rule: "BR-CL-19";
 
-    /// BT-105 — the document level charge reason.
+    /// BT-105 / BT-145 — the charge reason code.
     CHARGE_REASON / charge_reason = CHARGE_REASON_CODES,
         terms: "BT-105 / BT-145", list: "UNCL 7161", rule: "BR-CL-20";
 
@@ -428,48 +362,25 @@ guarded! {
 
 // ── Value shapes, for the schemes that have one ───────────────────────────────
 
-/// The EAS schemes whose **value** this crate can check, not merely the code.
-///
-/// Deliberately one entry. See [`eas_value`] for why the list is short and why
-/// it is a list at all rather than a hidden branch.
+/// The EAS schemes whose value [`eas_value`] checks, not merely the code.
 pub const CHECKED_EAS_SCHEMES: &[&str] = &["0088"];
 
 /// Whether [`eas_value`] can say anything about a value under `scheme`.
 ///
-/// The honest half of a partial check. `eas_value` returning `Ok` means either
-/// *"verified"* or *"not verifiable here"*, and those are very different claims
-/// to build on — this is how a caller tells them apart.
+/// Tells "verified" from "not verifiable here" when `eas_value` returns `Ok`.
 #[must_use]
 pub fn eas_value_is_checkable(scheme: &str) -> bool {
     CHECKED_EAS_SCHEMES.contains(&scheme)
 }
 
-/// Check an electronic address **value** against its EAS scheme's own format.
+/// Check an electronic address value against its EAS scheme's own format.
 ///
-/// # Why this exists, and why it covers one scheme
-///
-/// [`eas`] validates the scheme code. Nothing validates the content — and
-/// neither does `BR-CL-25`, which also only looks at the code. So
-/// `Identifier::eas(x, "0088")` asserts *"x is a GS1 GLN"* and no layer anywhere
-/// checks it. A downstream user put an eleven-digit BDEW Marktlokations-ID
-/// through that call: it returned `Ok`, validation passed, and the document went
-/// out claiming an eleven-digit German metering identifier was a thirteen-digit
-/// GLN. Syntactically valid, semantically false, unresolvable at the receiver.
-///
-/// The EAS list has over a hundred schemes and most have no fixed public
-/// format, so checking "the value" in general is not a job this crate can do
-/// honestly. What it can do is the handful whose format is fixed, published and
-/// **self-verifying** — where being wrong is detectable without a registry
-/// lookup. Today that is GS1's GLN and nothing else:
+/// `BR-CL-25` checks only the scheme code. Only schemes with a fixed,
+/// self-verifying format are checked:
 ///
 /// | Scheme | Check |
 /// |---|---|
 /// | `0088` GLN | 13 digits, GS1 mod-10 check digit |
-///
-/// Schemes are added here only when their specification is in hand. Guessing a
-/// format would produce the failure mode this whole module exists to prevent,
-/// one level further in — a check that passes wrong values and is trusted
-/// because it exists.
 ///
 /// # Errors
 /// [`CodeError`] when `scheme` is one of [`CHECKED_EAS_SCHEMES`] and `value`
@@ -494,9 +405,8 @@ pub fn eas_value(scheme: &str, value: &str) -> Result<(), CodeError> {
 
 /// What is wrong with `value` as a GS1 GLN, if anything.
 ///
-/// GLN is GS1's 13-digit key and shares GTIN-13's check digit: weights 1 and 3
-/// alternating from the left over the first twelve digits, and the check digit
-/// is whatever brings the total to a multiple of ten.
+/// GTIN-13 check digit: weights 1 and 3 alternating from the left over the
+/// first twelve digits; the check digit brings the sum to a multiple of ten.
 fn gln_problem(value: &str) -> Option<String> {
     if value.len() != 13 || !value.bytes().all(|b| b.is_ascii_digit()) {
         return Some(format!(
@@ -526,10 +436,7 @@ fn gln_problem(value: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The table's central claim: every entry really is gone from the list.
-    ///
-    /// If CEN reinstates one, this fails rather than the crate advising a
-    /// migration away from a code that is valid again.
+    /// Every entry is absent from the list; every successor is present.
     #[test]
     fn withdrawn_codes_are_really_gone() {
         for w in WITHDRAWN {
@@ -548,7 +455,6 @@ mod tests {
         }
     }
 
-    /// The papercut this whole module answers.
     #[test]
     fn the_leitweg_scheme_names_its_successor_and_bt_10() {
         let e = eas("9958").unwrap_err();
@@ -558,7 +464,7 @@ mod tests {
         assert!(msg.contains("use 0204 instead"), "{msg}");
         assert!(msg.contains("BT-10"), "{msg}");
         assert!(eas("0204").is_ok(), "the successor is accepted");
-        assert!(eas("0088").is_ok(), "GLN, which is what a BDEW MP-ID uses");
+        assert!(eas("0088").is_ok(), "GLN");
     }
 
     #[test]
@@ -589,12 +495,7 @@ mod tests {
 
     /// No user-facing sentence carries a run of spaces.
     ///
-    /// The same defect class the crate documents on [`crate::ATTRIBUTION`]: a
-    /// string meant as one sentence ends up with the source indentation inside
-    /// it, and every message built from it carries the gap. It recurred here —
-    /// `gln_problem`'s too-short message shipped with two fourteen-space runs —
-    /// so the property is now asserted for every rule text and for the advice
-    /// this module generates, not just for the notice.
+    /// Guards against source indentation leaking into multi-line literals.
     #[test]
     fn no_rule_text_or_advice_contains_a_run_of_spaces() {
         for r in crate::validation::rules::all() {
@@ -619,16 +520,13 @@ mod tests {
         }
     }
 
-    /// No advice at all is the right answer for a value nothing explains.
     #[test]
     fn nothing_is_guessed() {
         let e = unit("FURLONG").unwrap_err();
         assert_eq!(e.hint, None, "no edit distance, no guessing");
-        // One character from `KWH` and from `KWT`. A validator that guessed
-        // between kilowatt-hours and kilowatts would be worse than silent.
+        // One character from both `KWH` and `KWT`.
         assert!(!UNIT.accepts("KWQ"));
         assert_eq!(UNIT.advice("KWQ"), None);
-        // And a value that is simply right gets nothing said about it.
         assert_eq!(UNIT.advice("KWH"), None);
     }
 
@@ -651,8 +549,7 @@ mod tests {
 
     #[test]
     fn the_two_bt_3_lists_are_guarded_separately() {
-        // BR-CL-01 is a disjunction over the document kind, and `381` on an
-        // invoice is invalid however plausible it looks.
+        // BR-CL-01 picks the list by document kind.
         assert!(invoice_type("380").is_ok());
         assert!(invoice_type("381").is_err());
         assert!(credit_note_type("381").is_ok());
