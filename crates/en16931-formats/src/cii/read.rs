@@ -535,8 +535,7 @@ impl Reader {
                         category: code(c, "CategoryCode").unwrap_or_else(|| Code::new("")),
                         rate: self
                             .decimal(c, "RateApplicablePercent")
-                            .map(|d| d / rust_decimal::Decimal::from(100))
-                            .and_then(en16931::Percentage::from_fraction),
+                            .map(|d| en16931::Percentage::new(d.normalize())),
                         exemption_reason: text(c, "ExemptionReason"),
                         exemption_reason_code: code(c, "ExemptionReasonCode"),
                     });
@@ -555,8 +554,7 @@ impl Reader {
                         base_amount: self.amount(c, "BasisAmount"),
                         percentage: self
                             .decimal(c, "CalculationPercent")
-                            .map(|d| d / rust_decimal::Decimal::from(100))
-                            .and_then(en16931::Percentage::from_fraction),
+                            .map(|d| en16931::Percentage::new(d.normalize())),
                         vat: kid(c, "CategoryTradeTax")
                             .map(|t| self.line_vat(t))
                             .unwrap_or_default(),
@@ -871,8 +869,7 @@ impl Reader {
             category: code(n, "CategoryCode").unwrap_or_else(|| Code::new("")),
             rate: self
                 .decimal(n, "RateApplicablePercent")
-                .map(|d| d / rust_decimal::Decimal::from(100))
-                .and_then(en16931::Percentage::from_fraction),
+                .map(|d| en16931::Percentage::new(d.normalize())),
         }
     }
 
@@ -1000,8 +997,7 @@ impl Reader {
                         base_amount: self.amount(c, "BasisAmount"),
                         percentage: self
                             .decimal(c, "CalculationPercent")
-                            .map(|d| d / rust_decimal::Decimal::from(100))
-                            .and_then(en16931::Percentage::from_fraction),
+                            .map(|d| en16931::Percentage::new(d.normalize())),
                         reason: text(c, "Reason"),
                         reason_code: code(c, "ReasonCode"),
                     };

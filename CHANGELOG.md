@@ -35,6 +35,8 @@ Before 1.0, a minor release may break; every break is listed here.
 - A quantity, price or percentage that is not a decimal, or exceeds the
   `Decimal` range, is reported as `Malformed` in CII as in UBL; the CII reader
   and UBL's quantity and prices used to read it as zero or drop it silently.
+- The CII reader keeps every digit of a percentage, as the UBL reader does; it
+  used to divide by 100 and multiply back, which rounds below 10^-26 to zero.
 - `InvoiceAmount::parse` accepts an amount without an integer part (`.50`), as
   `xs:decimal` does; CEN's own unit tests write `.00`. `.` alone is refused.
 

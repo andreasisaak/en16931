@@ -474,6 +474,29 @@ fn a_number_that_is_not_one_is_reported() {
     }
 }
 
+/// A CII percentage is read as written, not rounded through a fraction: UBL
+/// reads the same digits.
+#[test]
+fn cii_reads_a_percentage_with_all_its_digits() {
+    let tiny = "0.0000000000000000000000000001";
+    let xml = with_text(
+        &write(&common::maximal(), Syntax::Cii).xml,
+        &[
+            "<ram:ApplicableHeaderTradeSettlement>",
+            "<ram:ApplicableTradeTax>",
+        ],
+        "ram:RateApplicablePercent",
+        tiny,
+    );
+    let got = en16931_formats::read(xml.as_bytes()).expect("readable");
+    assert_eq!(
+        got.invoice.vat_breakdown[0]
+            .rate
+            .map(en16931::Percentage::into_decimal),
+        Some(rust_decimal::Decimal::from_str_exact(tiny).expect("decimal"))
+    );
+}
+
 /// CII keeps the first kind of payment means it reads and reports every later
 /// one, as UBL does: BG-16 holds one of BG-17, BG-18 and BG-19.
 #[test]
