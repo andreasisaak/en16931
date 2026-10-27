@@ -48,10 +48,6 @@ fn code(n: Node<'_, '_>, want: &str) -> Option<Code> {
     text(n, want).map(Code::new)
 }
 
-fn decimal(n: Node<'_, '_>, want: &str) -> Option<rust_decimal::Decimal> {
-    text(n, want).and_then(|t| t.parse().ok())
-}
-
 /// An `Identifier` from an element with an optional `@schemeID`.
 fn identifier(n: Node<'_, '_>) -> Identifier {
     let content = own_text(n);
@@ -77,6 +73,19 @@ impl Reader {
     fn require(&mut self, n: Node<'_, '_>, path: &[&str], term: &str, rule: &str) {
         self.entries
             .extend(crate::xml::absent(n, path, (term, rule), &self.checks));
+    }
+
+    /// The text of `n`'s child `want` as a decimal, or `None`: absent, or
+    /// present and not an `xs:decimal` the model can hold, which is reported.
+    fn decimal(&mut self, n: Node<'_, '_>, want: &str) -> Option<rust_decimal::Decimal> {
+        let raw = text(n, want)?;
+        match raw.parse() {
+            Ok(d) => Some(d),
+            Err(e) => {
+                self.malformed(format!("{}/{want}", name(n)), e.to_string(), raw);
+                None
+            }
+        }
     }
 
     /// Note a value the model cannot hold.
@@ -524,7 +533,8 @@ impl Reader {
                         taxable_amount: self.amount(c, "BasisAmount").unwrap_or_default(),
                         tax_amount: self.amount(c, "CalculatedAmount").unwrap_or_default(),
                         category: code(c, "CategoryCode").unwrap_or_else(|| Code::new("")),
-                        rate: decimal(c, "RateApplicablePercent")
+                        rate: self
+                            .decimal(c, "RateApplicablePercent")
                             .map(|d| d / rust_decimal::Decimal::from(100))
                             .and_then(en16931::Percentage::from_fraction),
                         exemption_reason: text(c, "ExemptionReason"),
@@ -543,11 +553,12 @@ impl Reader {
                     let a = DocumentAllowanceCharge {
                         amount: self.amount(c, "ActualAmount").unwrap_or_default(),
                         base_amount: self.amount(c, "BasisAmount"),
-                        percentage: decimal(c, "CalculationPercent")
+                        percentage: self
+                            .decimal(c, "CalculationPercent")
                             .map(|d| d / rust_decimal::Decimal::from(100))
                             .and_then(en16931::Percentage::from_fraction),
                         vat: kid(c, "CategoryTradeTax")
-                            .map(|t| Self::line_vat(t))
+                            .map(|t| self.line_vat(t))
                             .unwrap_or_default(),
                         reason: text(c, "Reason"),
                         reason_code: code(c, "ReasonCode"),
@@ -573,7 +584,7 @@ impl Reader {
                         base_amount: None,
                         percentage: None,
                         vat: kid(c, "AppliedTradeTax")
-                            .map(|t| Self::line_vat(t))
+                            .map(|t| self.line_vat(t))
                             .unwrap_or_default(),
                         reason: text(c, "Description"),
                         reason_code: None,
@@ -855,10 +866,11 @@ impl Reader {
         None
     }
 
-    fn line_vat(n: Node<'_, '_>) -> LineVat {
+    fn line_vat(&mut self, n: Node<'_, '_>) -> LineVat {
         LineVat {
             category: code(n, "CategoryCode").unwrap_or_else(|| Code::new("")),
-            rate: decimal(n, "RateApplicablePercent")
+            rate: self
+                .decimal(n, "RateApplicablePercent")
                 .map(|d| d / rust_decimal::Decimal::from(100))
                 .and_then(en16931::Percentage::from_fraction),
         }
@@ -899,18 +911,20 @@ impl Reader {
                                     text(g, "LineID").map(DocumentReference::new);
                             }
                             "GrossPriceProductTradePrice" => {
-                                l.price.gross_price =
-                                    decimal(g, "ChargeAmount").map(en16931::UnitPriceAmount::new);
+                                l.price.gross_price = self
+                                    .decimal(g, "ChargeAmount")
+                                    .map(en16931::UnitPriceAmount::new);
                                 l.price.price_discount = kid(g, "AppliedTradeAllowanceCharge")
-                                    .and_then(|a| decimal(a, "ActualAmount"))
+                                    .and_then(|a| self.decimal(a, "ActualAmount"))
                                     .map(en16931::UnitPriceAmount::new);
                             }
                             "NetPriceProductTradePrice" => {
-                                l.price.net_price = decimal(g, "ChargeAmount")
+                                l.price.net_price = self
+                                    .decimal(g, "ChargeAmount")
                                     .map(en16931::UnitPriceAmount::new)
                                     .unwrap_or_default();
                                 l.price.base_quantity =
-                                    decimal(g, "BasisQuantity").map(Quantity::new);
+                                    self.decimal(g, "BasisQuantity").map(Quantity::new);
                                 // An empty `unitCode` is an absent BT-150
                                 // (else `PEPPOL-EN16931-R130` fires).
                                 l.price.base_quantity_code = kid(g, "BasisQuantity")
@@ -924,7 +938,9 @@ impl Reader {
                 }
                 "SpecifiedLineTradeDelivery" => {
                     if let Some(q) = kid(c, "BilledQuantity") {
-                        l.quantity = own_text(q).parse().map_or(Quantity::ZERO, Quantity::new);
+                        l.quantity = self
+                            .decimal(c, "BilledQuantity")
+                            .map_or(Quantity::ZERO, Quantity::new);
                         l.unit_code = q
                             .attribute("unitCode")
                             .map_or_else(|| Code::new(""), Code::new);
@@ -966,7 +982,7 @@ impl Reader {
     fn line_settlement(&mut self, l: &mut InvoiceLine, n: Node<'_, '_>) {
         for c in kids(n) {
             match name(c) {
-                "ApplicableTradeTax" => l.vat = Self::line_vat(c),
+                "ApplicableTradeTax" => l.vat = self.line_vat(c),
                 "BillingSpecifiedPeriod" => l.period = Some(self.period(c)),
                 "SpecifiedTradeAllowanceCharge" => {
                     let is_charge = self.is_charge(
@@ -982,7 +998,8 @@ impl Reader {
                     let a = LineAllowanceCharge {
                         amount: self.amount(c, "ActualAmount").unwrap_or_default(),
                         base_amount: self.amount(c, "BasisAmount"),
-                        percentage: decimal(c, "CalculationPercent")
+                        percentage: self
+                            .decimal(c, "CalculationPercent")
                             .map(|d| d / rust_decimal::Decimal::from(100))
                             .and_then(en16931::Percentage::from_fraction),
                         reason: text(c, "Reason"),

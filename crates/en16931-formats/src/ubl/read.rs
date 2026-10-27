@@ -851,10 +851,12 @@ impl Reader {
             accounting_reference: text(n, "AccountingCost"),
             object_identifier: None,
             quantity: Quantity::new(
-                text(n, "InvoicedQuantity")
-                    .or_else(|| text(n, "CreditedQuantity"))
-                    .and_then(|q| q.parse().ok())
-                    .unwrap_or_default(),
+                if kid(n, "InvoicedQuantity").is_some() {
+                    self.decimal(n, "InvoicedQuantity")
+                } else {
+                    self.decimal(n, "CreditedQuantity")
+                }
+                .unwrap_or_default(),
             ),
             unit_code: kid(n, "InvoicedQuantity")
                 .or_else(|| kid(n, "CreditedQuantity"))
@@ -957,8 +959,8 @@ impl Reader {
 
     fn price(&mut self, n: Node<'_, '_>) -> PriceDetails {
         let mut p = PriceDetails {
-            net_price: text(n, "PriceAmount")
-                .and_then(|t| t.parse().ok())
+            net_price: self
+                .decimal(n, "PriceAmount")
                 .map(en16931::UnitPriceAmount::new)
                 .unwrap_or_default(),
             price_discount: None,
@@ -989,11 +991,9 @@ impl Reader {
                         );
                         continue;
                     }
-                    p.price_discount = text(c, "Amount")
-                        .and_then(|t| t.parse().ok())
-                        .map(en16931::UnitPriceAmount::new);
-                    p.gross_price = text(c, "BaseAmount")
-                        .and_then(|t| t.parse().ok())
+                    p.price_discount = self.decimal(c, "Amount").map(en16931::UnitPriceAmount::new);
+                    p.gross_price = self
+                        .decimal(c, "BaseAmount")
                         .map(en16931::UnitPriceAmount::new);
                 }
                 "PriceAmount" | "BaseQuantity" => {}

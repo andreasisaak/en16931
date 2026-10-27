@@ -29,6 +29,9 @@ Before 1.0, a minor release may break; every break is listed here.
   BT-116, BT-117, BT-129, BT-131, BT-146 and allowance or charge amount as
   `Malformed`, when the declared profile runs the rule the model's type
   guarantees (`BR-12` … `BR-46`). They used to read it as zero.
+- A quantity, price or percentage that is not a decimal, or exceeds the
+  `Decimal` range, is reported as `Malformed` in CII as in UBL; the CII reader
+  and UBL's quantity and prices used to read it as zero or drop it silently.
 
 ## [0.8.0] — 2026-10-11
 

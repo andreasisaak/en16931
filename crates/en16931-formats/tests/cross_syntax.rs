@@ -379,6 +379,101 @@ fn an_absent_required_amount_is_reported_not_read_as_zero() {
     assert_eq!(got.entries_of(Kind::Malformed).count(), 0);
 }
 
+/// `xml` with the text of the first `<tag>` after each of `anchors` in turn
+/// replaced by `value`.
+fn with_text(xml: &str, anchors: &[&str], tag: &str, value: &str) -> String {
+    let from = anchors.iter().fold(0, |at, anchor| {
+        at + xml[at..].find(anchor).expect("anchor present")
+    });
+    let start = from
+        + xml[from..]
+            .find(&format!("<{tag}"))
+            .expect("element present");
+    let content = start + xml[start..].find('>').expect("end of tag") + 1;
+    let end = content + xml[content..].find('<').expect("end of content");
+    format!("{}{value}{}", &xml[..content], &xml[end..])
+}
+
+/// A quantity, price or percentage that is not an `xs:decimal`, or is beyond
+/// `Decimal`'s range, is reported in both syntaxes, not read as zero or dropped.
+#[test]
+fn a_number_that_is_not_one_is_reported() {
+    use en16931_formats::report::Kind;
+
+    const NET: &str = "<ram:NetPriceProductTradePrice>";
+    const GROSS: &str = "<ram:GrossPriceProductTradePrice>";
+    const LINE_SETTLEMENT: &str = "<ram:SpecifiedLineTradeSettlement>";
+    const HEADER: &str = "<ram:ApplicableHeaderTradeSettlement>";
+    const LINE: &str = "<cac:InvoiceLine>";
+    let cases: [(Syntax, &[&str], &str); 17] = [
+        (Syntax::Cii, &[], "ram:BilledQuantity"),
+        (Syntax::Cii, &[NET], "ram:ChargeAmount"),
+        (Syntax::Cii, &[NET], "ram:BasisQuantity"),
+        (Syntax::Cii, &[GROSS], "ram:ChargeAmount"),
+        (Syntax::Cii, &[GROSS], "ram:ActualAmount"),
+        (
+            Syntax::Cii,
+            &[LINE_SETTLEMENT, "<ram:ApplicableTradeTax>"],
+            "ram:RateApplicablePercent",
+        ),
+        (
+            Syntax::Cii,
+            &[LINE_SETTLEMENT, "<ram:SpecifiedTradeAllowanceCharge>"],
+            "ram:CalculationPercent",
+        ),
+        (
+            Syntax::Cii,
+            &[HEADER, "<ram:ApplicableTradeTax>"],
+            "ram:RateApplicablePercent",
+        ),
+        (
+            Syntax::Cii,
+            &[HEADER, "<ram:SpecifiedTradeAllowanceCharge>"],
+            "ram:CalculationPercent",
+        ),
+        (Syntax::Ubl, &[LINE], "cbc:InvoicedQuantity"),
+        (Syntax::Ubl, &[LINE, "<cac:Price>"], "cbc:PriceAmount"),
+        (Syntax::Ubl, &[LINE, "<cac:Price>"], "cbc:BaseQuantity"),
+        (
+            Syntax::Ubl,
+            &[LINE, "<cac:Price>", "<cac:AllowanceCharge>"],
+            "cbc:Amount",
+        ),
+        (
+            Syntax::Ubl,
+            &[LINE, "<cac:Price>", "<cac:AllowanceCharge>"],
+            "cbc:BaseAmount",
+        ),
+        (
+            Syntax::Ubl,
+            &[LINE, "<cac:AllowanceCharge>"],
+            "cbc:MultiplierFactorNumeric",
+        ),
+        (
+            Syntax::Ubl,
+            &[LINE, "<cac:ClassifiedTaxCategory>"],
+            "cbc:Percent",
+        ),
+        (
+            Syntax::Ubl,
+            &["<cac:AllowanceCharge>"],
+            "cbc:MultiplierFactorNumeric",
+        ),
+    ];
+    for value in ["abc", "79228162514264337593543950336"] {
+        for (syntax, anchors, tag) in cases {
+            let xml = write(&common::maximal(), syntax).xml;
+            let probe = with_text(&xml, anchors, tag, value);
+            let got = en16931_formats::read(probe.as_bytes()).expect("readable");
+            let values: Vec<Option<&str>> = got
+                .entries_of(Kind::Malformed)
+                .map(|e| e.value.as_deref())
+                .collect();
+            assert_eq!(values, [Some(value)], "{syntax:?} {tag} after {anchors:?}");
+        }
+    }
+}
+
 /// CII keeps the first kind of payment means it reads and reports every later
 /// one, as UBL does: BG-16 holds one of BG-17, BG-18 and BG-19.
 #[test]
