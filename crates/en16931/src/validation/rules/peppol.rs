@@ -98,14 +98,20 @@ pub(crate) fn check_line_amount(
             line.price.net_price.into_decimal(),
         );
         // Dividing first only when the product alone overflows keeps the exact
-        // result for every line that fits; `None` is then truly out of range.
+        // result for every line that fits; dividing the larger factor keeps its
+        // digits, so `None` is then truly out of range.
+        let (large, small) = if quantity.abs() >= price.abs() {
+            (quantity, price)
+        } else {
+            (price, quantity)
+        };
         let expected = quantity
             .checked_mul(price)
             .and_then(|p| p.checked_div(base))
             .or_else(|| {
-                price
+                large
                     .checked_div(base)
-                    .and_then(|unit| quantity.checked_mul(unit))
+                    .and_then(|share| share.checked_mul(small))
             })
             .and_then(|p| p.checked_add(charges))
             .and_then(|p| p.checked_sub(allowances));
@@ -270,14 +276,14 @@ terms: [bt::ITEM_NET_PRICE, bt::ITEM_GROSS_PRICE, bt::ITEM_PRICE_DISCOUNT],
             .price
             .price_discount
             .map_or(Decimal::ZERO, |d| d.into_decimal());
-        let expected = gross.into_decimal() - discount;
+        let path = Path::at_term(Group::Line, i, bt::ITEM_NET_PRICE);
+        let Some(expected) = gross.into_decimal().checked_sub(discount) else {
+            f.at_with_hint(path, BEYOND_RANGE);
+            continue;
+        };
         // Exact: no `u:slack`, unlike R040.
         if expected != line.price.net_price.into_decimal() {
-            f.arithmetic(
-                Path::at_term(Group::Line, i, bt::ITEM_NET_PRICE),
-                expected,
-                line.price.net_price,
-            );
+            f.arithmetic(path, expected, line.price.net_price);
         }
     }
 });
@@ -951,6 +957,28 @@ mod tests {
         inv.lines[0].price.base_quantity =
             Some(crate::Quantity::new(Decimal::from(10_000_000_000_000_i64)));
         assert!(fired(&R120, &inv).is_empty());
+    }
+
+    /// Quantity and base quantity both at `Decimal::MAX`: dividing the price
+    /// first would round it to zero; dividing the quantity keeps the 2.00.
+    #[test]
+    fn r120_divides_the_larger_factor_when_the_product_overflows() {
+        let mut inv = one_line(Decimal::MAX, Decimal::TWO, "0.00");
+        inv.lines[0].price.base_quantity = Some(crate::Quantity::new(Decimal::MAX));
+        assert_eq!(fired(&R120, &inv).len(), 1);
+        inv.lines[0].net_amount = InvoiceAmount::parse("2.00").unwrap();
+        assert!(fired(&R120, &inv).is_empty());
+    }
+
+    /// Gross price minus discount beyond `Decimal`'s range matches no net
+    /// price: `R046` fires rather than panicking.
+    #[test]
+    fn r046_fires_when_gross_minus_discount_overflows() {
+        let mut inv = one_line(Decimal::ONE, Decimal::ONE, "1.00");
+        inv.lines[0].price.gross_price = Some(crate::UnitPriceAmount::new(Decimal::MAX));
+        inv.lines[0].price.price_discount =
+            Some(crate::UnitPriceAmount::new(Decimal::NEGATIVE_ONE));
+        assert_eq!(fired(&R046, &inv).len(), 1);
     }
 
     /// A base amount × percentage beyond `Decimal`'s range matches no amount.
