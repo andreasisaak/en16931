@@ -19,6 +19,9 @@ Before 1.0, a minor release may break; every break is listed here.
 - The CII writer drops BT-89 no more: `ram:SpecifiedTradePaymentTerms`, which
   carries `ram:DirectDebitMandateID`, is written for a mandate reference alone,
   not only for payment terms or a due date.
+- `PEPPOL-EN16931-R120` and `R040` no longer panic when expected minus stated
+  amount overflows, and no longer skip a line or allowance whose expected
+  amount exceeds the `Decimal` range: they report it, with a hint.
 
 ## [0.8.0] — 2026-10-11
 

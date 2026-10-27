@@ -38,9 +38,16 @@ pub(crate) fn currency_slack(inv: &Invoice) -> Decimal {
 }
 
 /// `|expected − actual| ≤ slack`, matching `u:slack`'s inclusive comparison.
+/// A difference beyond `Decimal`'s range is never within the slack.
 fn within(expected: Decimal, actual: Decimal, slack: Decimal) -> bool {
-    (expected - actual).abs() <= slack
+    expected
+        .checked_sub(actual)
+        .is_some_and(|difference| difference.abs() <= slack)
 }
+
+/// Advice for a finding whose expected amount does not fit a `Decimal`.
+const BEYOND_RANGE: &str =
+    "The expected amount exceeds the decimal range, so no stated amount can match it.";
 
 macro_rules! rule {
     (
@@ -85,21 +92,29 @@ pub(crate) fn check_line_amount(
         let (Ok(charges), Ok(allowances)) = (sum(&line.charges), sum(&line.allowances)) else {
             continue;
         };
-        let Some(product) = line
-            .quantity
-            .into_decimal()
-            .checked_mul(line.price.net_price.into_decimal())
+        let path = Path::at_term(Group::Line, i, bt::LINE_NET_AMOUNT);
+        let (quantity, price) = (
+            line.quantity.into_decimal(),
+            line.price.net_price.into_decimal(),
+        );
+        // Dividing first only when the product alone overflows keeps the exact
+        // result for every line that fits; `None` is then truly out of range.
+        let expected = quantity
+            .checked_mul(price)
             .and_then(|p| p.checked_div(base))
-        else {
-            continue;
-        };
-        let expected = product + charges - allowances;
-        if !within(expected, line.net_amount.into_decimal(), tolerance) {
-            f.arithmetic(
-                Path::at_term(Group::Line, i, bt::LINE_NET_AMOUNT),
-                expected.round_dp(2),
-                line.net_amount,
-            );
+            .or_else(|| {
+                price
+                    .checked_div(base)
+                    .and_then(|unit| quantity.checked_mul(unit))
+            })
+            .and_then(|p| p.checked_add(charges))
+            .and_then(|p| p.checked_sub(allowances));
+        match expected {
+            None => f.at_with_hint(path, BEYOND_RANGE),
+            Some(expected) if !within(expected, line.net_amount.into_decimal(), tolerance) => {
+                f.arithmetic(path, expected.round_dp(2), line.net_amount);
+            }
+            Some(_) => {}
         }
     }
 }
@@ -126,11 +141,14 @@ fn check_basis(
     let (Some(base), Some(pct)) = (base, pct) else {
         return;
     };
+    // A stated amount fits an `i64` of cents, far below `Decimal::MAX / 100`,
+    // so none matches a product beyond `Decimal`'s range.
     let Some(expected) = base
         .into_decimal()
         .checked_mul(pct.into_decimal())
         .map(|v| v / Decimal::ONE_HUNDRED)
     else {
+        f.at_with_hint(path, BEYOND_RANGE);
         return;
     };
     if !within(expected, amount.into_decimal(), tolerance) {
@@ -895,6 +913,59 @@ mod tests {
         assert!(within(d("10.00"), d("10.02"), SLACK));
         assert!(within(d("10.00"), d("9.98"), SLACK));
         assert!(!within(d("10.00"), d("10.03"), SLACK));
+    }
+
+    /// One line, no line allowances or charges, from the shipped Peppol example.
+    fn one_line(quantity: Decimal, price: Decimal, net: &str) -> Invoice {
+        let mut inv = crate::examples::for_profile(&crate::profiles::PEPPOL_BIS_3).unwrap();
+        inv.lines.truncate(1);
+        let line = &mut inv.lines[0];
+        line.allowances.clear();
+        line.charges.clear();
+        line.price.base_quantity = None;
+        line.quantity = crate::Quantity::new(quantity);
+        line.price.net_price = crate::UnitPriceAmount::new(price);
+        line.net_amount = InvoiceAmount::parse(net).unwrap();
+        inv
+    }
+
+    /// A line amount beyond `Decimal`'s range matches no BT-131, so `R120`
+    /// fires rather than skipping the line or panicking.
+    #[test]
+    fn r120_fires_when_the_expected_line_amount_overflows() {
+        let product_overflows = one_line(Decimal::MAX, Decimal::TWO, "10.00");
+        assert_eq!(fired(&R120, &product_overflows).len(), 1);
+        let difference_overflows = one_line(Decimal::MAX, Decimal::ONE, "-1.00");
+        assert_eq!(fired(&R120, &difference_overflows).len(), 1);
+    }
+
+    /// Quantity × price may overflow while quantity × (price / base quantity)
+    /// fits; that line is still checked, and here it is right.
+    #[test]
+    fn r120_divides_first_when_the_product_alone_overflows() {
+        let mut inv = one_line(
+            Decimal::from_str_exact("100000000000000000000").unwrap(),
+            Decimal::from(1_000_000_000),
+            "10000000000000000.00",
+        );
+        inv.lines[0].price.base_quantity =
+            Some(crate::Quantity::new(Decimal::from(10_000_000_000_000_i64)));
+        assert!(fired(&R120, &inv).is_empty());
+    }
+
+    /// A base amount × percentage beyond `Decimal`'s range matches no amount.
+    #[test]
+    fn r040_fires_when_the_expected_amount_overflows() {
+        let mut inv = one_line(Decimal::ONE, Decimal::ONE, "1.00");
+        inv.allowances = vec![crate::invoice::DocumentAllowanceCharge {
+            amount: InvoiceAmount::parse("10.00").unwrap(),
+            base_amount: Some(InvoiceAmount::parse("1000.00").unwrap()),
+            percentage: Some(Percentage::new(Decimal::MAX)),
+            vat: crate::invoice::LineVat::default(),
+            reason: None,
+            reason_code: None,
+        }];
+        assert_eq!(fired(&R040, &inv).len(), 1);
     }
 
     /// The ported `u:*` helpers accept published real identifiers and reject
