@@ -73,8 +73,16 @@ fn parse(xml: &str) -> Read {
 }
 
 /// The reader's `Malformed` entries.
+/// The read's [`Kind::Malformed`] entries, the absent totals aside: CEN's
+/// fragments carry none.
 fn malformed(read: &Read) -> Vec<&Entry> {
-    read.entries_of(Kind::Malformed).collect()
+    let total = |e: &&Entry| {
+        e.value.is_none()
+            && ["BT-106", "BT-109", "BT-112", "BT-115"].contains(&e.term.as_deref().unwrap_or(""))
+    };
+    read.entries_of(Kind::Malformed)
+        .filter(|e| !total(e))
+        .collect()
 }
 
 /// Every `ram:DueDateTypeCode` value in a CII document, in order.

@@ -5,7 +5,8 @@
 //! fragment, `<success>` that it must not; each maps onto `ValidationReport::has`.
 //! Cases for type-retired or undecidable rules, and fragments the reader reports
 //! as [`Kind::Malformed`], are skipped and counted (an absent `cbc:ChargeIndicator`
-//! still runs, see [`absent_charge_indicator`]).
+//! still runs, see [`absent_charge_indicator`], and so does an absent amount, see
+//! [`absent_amount`]).
 
 #![cfg(feature = "ubl")]
 
@@ -34,6 +35,25 @@ fn malformed(read: &en16931_formats::Read) -> String {
 /// A present non-boolean indicator is still a refusal.
 fn absent_charge_indicator(e: &en16931_formats::report::Entry) -> bool {
     e.kind == Kind::Malformed && e.value.is_none() && e.path.ends_with("/ChargeIndicator")
+}
+
+/// The amounts and the quantity the model holds as zero when absent.
+const ZERO_WHEN_ABSENT: [&str; 13] = [
+    "BT-92", "BT-99", "BT-106", "BT-109", "BT-112", "BT-115", "BT-116", "BT-117", "BT-129",
+    "BT-131", "BT-136", "BT-141", "BT-146",
+];
+
+/// Whether an entry reports one of [`ZERO_WHEN_ABSENT`] absent.
+///
+/// CEN's minimal fragments and KoSIT's mutations omit what their rule does not
+/// concern, the totals above all. These cases run, as they did before the
+/// readers reported the absence; the rules only the type guarantees stay retired.
+fn absent_amount(e: &en16931_formats::report::Entry) -> bool {
+    e.kind == Kind::Malformed
+        && e.value.is_none()
+        && e.term
+            .as_deref()
+            .is_some_and(|t| ZERO_WHEN_ABSENT.contains(&t))
 }
 
 fn join<'a>(entries: impl Iterator<Item = &'a en16931_formats::report::Entry>) -> String {
@@ -263,7 +283,7 @@ fn run(case: &Case, unevaluated: &BTreeSet<String>) -> Outcome {
     };
     let what = join(
         read.entries_of(Kind::Malformed)
-            .filter(|e| !absent_charge_indicator(e)),
+            .filter(|e| !absent_charge_indicator(e) && !absent_amount(e)),
     );
     if !what.is_empty() {
         // The fragment carries a value the model refuses; the case is about syntax.
@@ -752,7 +772,7 @@ fn xrechnung_mutation_suite() {
             skipped += 1;
             continue;
         };
-        if read.entries_of(Kind::Malformed).next().is_some() {
+        if read.entries_of(Kind::Malformed).any(|e| !absent_amount(e)) {
             skipped += 1;
             continue;
         }
