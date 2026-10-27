@@ -105,9 +105,22 @@ fn svrl_renders_every_layer() {
         .children()
         .filter(|n| n.has_tag_name((ns, "failed-assert")))
         .collect();
+    // The layers in order: the probe has no BT-106 … BT-115 (syntax) and a
+    // second `cbc:ID` (schema).
+    let layered: Vec<&str> = asserts
+        .iter()
+        .filter_map(|n| n.attribute("id"))
+        .filter(|id| id.starts_with("en16931:"))
+        .collect();
     assert_eq!(
-        asserts[0].attribute("id"),
-        Some("en16931:schema:duplicate"),
+        layered,
+        [
+            "en16931:syntax:malformed",
+            "en16931:syntax:malformed",
+            "en16931:syntax:malformed",
+            "en16931:syntax:malformed",
+            "en16931:schema:duplicate",
+        ],
         "{svrl}"
     );
     assert_eq!(asserts[0].attribute("flag"), Some("fatal"));

@@ -239,6 +239,146 @@ fn bt_89_survives_cii_without_payment_terms_or_due_date() {
     assert_eq!(mandate.as_deref(), Some("MANDATE-1"), "{xml}");
 }
 
+/// `xml` without the first `<tag>…</tag>` after each of `anchors` in turn.
+fn without(xml: &str, anchors: &[&str], tag: &str) -> String {
+    let from = anchors.iter().fold(0, |at, anchor| {
+        at + xml[at..].find(anchor).expect("anchor present")
+    });
+    let start = from
+        + xml[from..]
+            .find(&format!("<{tag}"))
+            .expect("element present");
+    let close = format!("</{tag}>");
+    let end = start + xml[start..].find(&close).expect("closed") + close.len();
+    format!("{}{}", &xml[..start], &xml[end..])
+}
+
+/// A required amount or quantity that is absent is reported, not read as zero:
+/// the model holds it without an `Option`, so `BR-12` … `BR-46` pass by type
+/// and no rule would notice.
+#[test]
+fn an_absent_required_amount_is_reported_not_read_as_zero() {
+    use en16931_formats::report::Kind;
+
+    const HEADER: &str = "<ram:ApplicableHeaderTradeSettlement>";
+    const SUMMATION: &str = "<ram:SpecifiedTradeSettlementHeaderMonetarySummation>";
+    const TOTAL: &str = "<cac:LegalMonetaryTotal>";
+    let cases: [(Syntax, &[&str], &str, &str); 22] = [
+        (Syntax::Cii, &[], "ram:BilledQuantity", "BT-129"),
+        (
+            Syntax::Cii,
+            &["<ram:NetPriceProductTradePrice>"],
+            "ram:ChargeAmount",
+            "BT-146",
+        ),
+        (
+            Syntax::Cii,
+            &[
+                "<ram:SpecifiedLineTradeSettlement>",
+                "<ram:SpecifiedTradeAllowanceCharge>",
+            ],
+            "ram:ActualAmount",
+            "BT-136",
+        ),
+        (
+            Syntax::Cii,
+            &["<ram:SpecifiedTradeSettlementLineMonetarySummation>"],
+            "ram:LineTotalAmount",
+            "BT-131",
+        ),
+        (
+            Syntax::Cii,
+            &[HEADER, "<ram:ApplicableTradeTax>"],
+            "ram:BasisAmount",
+            "BT-116",
+        ),
+        (
+            Syntax::Cii,
+            &[HEADER, "<ram:ApplicableTradeTax>"],
+            "ram:CalculatedAmount",
+            "BT-117",
+        ),
+        (
+            Syntax::Cii,
+            &[HEADER, "<ram:SpecifiedTradeAllowanceCharge>"],
+            "ram:ActualAmount",
+            "BT-92",
+        ),
+        (Syntax::Cii, &[SUMMATION], "ram:LineTotalAmount", "BT-106"),
+        (
+            Syntax::Cii,
+            &[SUMMATION],
+            "ram:TaxBasisTotalAmount",
+            "BT-109",
+        ),
+        (Syntax::Cii, &[SUMMATION], "ram:GrandTotalAmount", "BT-112"),
+        (Syntax::Cii, &[SUMMATION], "ram:DuePayableAmount", "BT-115"),
+        (
+            Syntax::Ubl,
+            &["<cac:InvoiceLine>"],
+            "cbc:InvoicedQuantity",
+            "BT-129",
+        ),
+        (
+            Syntax::Ubl,
+            &["<cac:InvoiceLine>", "<cac:Price>"],
+            "cbc:PriceAmount",
+            "BT-146",
+        ),
+        (
+            Syntax::Ubl,
+            &["<cac:InvoiceLine>", "<cac:AllowanceCharge>"],
+            "cbc:Amount",
+            "BT-136",
+        ),
+        (
+            Syntax::Ubl,
+            &["<cac:InvoiceLine>"],
+            "cbc:LineExtensionAmount",
+            "BT-131",
+        ),
+        (
+            Syntax::Ubl,
+            &["<cac:TaxSubtotal>"],
+            "cbc:TaxableAmount",
+            "BT-116",
+        ),
+        (
+            Syntax::Ubl,
+            &["<cac:TaxSubtotal>"],
+            "cbc:TaxAmount",
+            "BT-117",
+        ),
+        (
+            Syntax::Ubl,
+            &["<cac:AllowanceCharge>"],
+            "cbc:Amount",
+            "BT-92",
+        ),
+        (Syntax::Ubl, &[TOTAL], "cbc:LineExtensionAmount", "BT-106"),
+        (Syntax::Ubl, &[TOTAL], "cbc:TaxExclusiveAmount", "BT-109"),
+        (Syntax::Ubl, &[TOTAL], "cbc:TaxInclusiveAmount", "BT-112"),
+        (Syntax::Ubl, &[TOTAL], "cbc:PayableAmount", "BT-115"),
+    ];
+    for (syntax, anchors, tag, term) in cases {
+        let xml = write(&common::maximal(), syntax).xml;
+        let got = en16931_formats::read(without(&xml, anchors, tag).as_bytes()).expect("readable");
+        let terms: Vec<&str> = got
+            .entries_of(Kind::Malformed)
+            .filter_map(|e| e.term.as_deref())
+            .collect();
+        assert_eq!(terms, [term], "{syntax:?} without {tag} after {anchors:?}");
+    }
+
+    // ZUGFeRD MINIMUM has no BT-106, and its profile runs no `BR-12`.
+    let mut minimum = common::maximal();
+    minimum.specification_id = Some(en16931::profiles::ZUGFERD_MINIMUM_ID.to_owned());
+    let xml = write(&minimum, Syntax::Cii).xml;
+    let got = en16931_formats::read(without(&xml, &[SUMMATION], "ram:LineTotalAmount").as_bytes())
+        .expect("readable");
+    assert_eq!(got.entries_of(Kind::Malformed).count(), 0);
+}
+
 /// CII keeps the first kind of payment means it reads and reports every later
 /// one, as UBL does: BG-16 holds one of BG-17, BG-18 and BG-19.
 #[test]

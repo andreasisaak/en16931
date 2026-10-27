@@ -166,6 +166,45 @@ pub(crate) fn child_text(n: Node<'_, '_>, want: &str) -> Option<String> {
     kid(n, want).and_then(text)
 }
 
+/// The ids of every check the profile BT-24 declares runs, or the core's when
+/// it declares none this build ships, as [`crate::receive`] picks the profile.
+pub(crate) fn declared_checks(bt24: Option<&str>) -> std::collections::BTreeSet<&'static str> {
+    en16931::profiles::classify(bt24)
+        .profile()
+        .unwrap_or(&en16931::profiles::EN16931)
+        .check_ids()
+        .collect()
+}
+
+/// A [`Kind::Malformed`] entry when the term at `path` below `n` is absent or
+/// empty and `checks` holds `rule`: an amount or quantity the model holds
+/// without an `Option`, which read as zero would satisfy `rule`, the rule only
+/// its type guarantees. ZUGFeRD MINIMUM and BASIC WL run few of these rules.
+pub(crate) fn absent(
+    n: Node<'_, '_>,
+    path: &[&str],
+    (term, rule): (&str, &str),
+    checks: &std::collections::BTreeSet<&'static str>,
+) -> Option<Entry> {
+    if !checks.contains(rule) {
+        return None;
+    }
+    let (last, parents) = path.split_last()?;
+    let present = parents
+        .iter()
+        .try_fold(n, |node, want| kid(node, want))
+        .and_then(|parent| child_text(parent, last))
+        .is_some();
+    (!present).then(|| {
+        Entry::new(
+            Kind::Malformed,
+            format!("{}/{}", name(n), path.join("/")),
+            format!("absent, and EN 16931 requires it ({rule})"),
+        )
+        .term(term)
+    })
+}
+
 /// The chain of local names from the document element down to `n`.
 pub(crate) fn path_of(n: Node<'_, '_>) -> String {
     let mut names: Vec<&str> = n

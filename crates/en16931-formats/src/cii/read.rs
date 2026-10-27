@@ -24,6 +24,8 @@ pub(crate) struct Reader {
     unmapped: BTreeSet<String>,
     /// Everything else the reader has to say, in document order.
     entries: Vec<Entry>,
+    /// The checks of the declared profile ([`crate::xml::declared_checks`]).
+    checks: BTreeSet<&'static str>,
 }
 
 /// Trimmed text of this element, empty when there is none.
@@ -69,6 +71,12 @@ impl Reader {
     fn not_held(&mut self, path: &str, message: &str) {
         self.entries
             .push(Entry::new(Kind::Unmapped, path, message.to_owned()));
+    }
+
+    /// Report a required amount or quantity absent at `path` below `n`.
+    fn require(&mut self, n: Node<'_, '_>, path: &[&str], term: &str, rule: &str) {
+        self.entries
+            .extend(crate::xml::absent(n, path, (term, rule), &self.checks));
     }
 
     /// Note a value the model cannot hold.
@@ -169,6 +177,12 @@ impl Reader {
     /// Read the document element.
     pub(crate) fn read(&mut self, root: Node<'_, '_>) -> Invoice {
         let mut inv = Invoice::default();
+        self.checks = crate::xml::declared_checks(
+            kid(root, "ExchangedDocumentContext")
+                .and_then(|c| kid(c, "GuidelineSpecifiedDocumentContextParameter"))
+                .and_then(|g| text(g, "ID"))
+                .as_deref(),
+        );
         for c in kids(root) {
             match name(c) {
                 "ExchangedDocumentContext" => self.context(&mut inv, c),
@@ -231,6 +245,23 @@ impl Reader {
                 "ApplicableHeaderTradeSettlement" => self.settlement(inv, c),
                 other => self.push_path("SupplyChainTradeTransaction", other),
             }
+        }
+        for (want, term, rule) in [
+            ("LineTotalAmount", "BT-106", "BR-12"),
+            ("TaxBasisTotalAmount", "BT-109", "BR-13"),
+            ("GrandTotalAmount", "BT-112", "BR-14"),
+            ("DuePayableAmount", "BT-115", "BR-15"),
+        ] {
+            self.require(
+                n,
+                &[
+                    "ApplicableHeaderTradeSettlement",
+                    "SpecifiedTradeSettlementHeaderMonetarySummation",
+                    want,
+                ],
+                term,
+                rule,
+            );
         }
     }
 
@@ -487,6 +518,8 @@ impl Reader {
                             Some(_) => {}
                         }
                     }
+                    self.require(c, &["BasisAmount"], "BT-116", "BR-45");
+                    self.require(c, &["CalculatedAmount"], "BT-117", "BR-46");
                     inv.vat_breakdown.push(VatBreakdown {
                         taxable_amount: self.amount(c, "BasisAmount").unwrap_or_default(),
                         tax_amount: self.amount(c, "CalculatedAmount").unwrap_or_default(),
@@ -501,6 +534,12 @@ impl Reader {
                 "BillingSpecifiedPeriod" => inv.invoicing_period = Some(self.period(c)),
                 "SpecifiedTradeAllowanceCharge" => {
                     let is_charge = self.is_charge(c, "SpecifiedTradeAllowanceCharge");
+                    let (term, rule) = if is_charge {
+                        ("BT-99", "BR-36")
+                    } else {
+                        ("BT-92", "BR-31")
+                    };
+                    self.require(c, &["ActualAmount"], term, rule);
                     let a = DocumentAllowanceCharge {
                         amount: self.amount(c, "ActualAmount").unwrap_or_default(),
                         base_amount: self.amount(c, "BasisAmount"),
@@ -528,6 +567,7 @@ impl Reader {
                         s.contains("#conformant#") || s.contains(":conformant:")
                     }) =>
                 {
+                    self.require(c, &["AppliedAmount"], "BT-99", "BR-36");
                     inv.charges.push(DocumentAllowanceCharge {
                         amount: self.amount(c, "AppliedAmount").unwrap_or_default(),
                         base_amount: None,
@@ -894,6 +934,32 @@ impl Reader {
                 other => self.push_path("IncludedSupplyChainTradeLineItem", other),
             }
         }
+        self.require(
+            n,
+            &["SpecifiedLineTradeDelivery", "BilledQuantity"],
+            "BT-129",
+            "BR-22",
+        );
+        self.require(
+            n,
+            &[
+                "SpecifiedLineTradeAgreement",
+                "NetPriceProductTradePrice",
+                "ChargeAmount",
+            ],
+            "BT-146",
+            "BR-26",
+        );
+        self.require(
+            n,
+            &[
+                "SpecifiedLineTradeSettlement",
+                "SpecifiedTradeSettlementLineMonetarySummation",
+                "LineTotalAmount",
+            ],
+            "BT-131",
+            "BR-24",
+        );
         l
     }
 
@@ -907,6 +973,12 @@ impl Reader {
                         c,
                         "IncludedSupplyChainTradeLineItem/SpecifiedTradeAllowanceCharge",
                     );
+                    let (term, rule) = if is_charge {
+                        ("BT-141", "BR-43")
+                    } else {
+                        ("BT-136", "BR-41")
+                    };
+                    self.require(c, &["ActualAmount"], term, rule);
                     let a = LineAllowanceCharge {
                         amount: self.amount(c, "ActualAmount").unwrap_or_default(),
                         base_amount: self.amount(c, "BasisAmount"),

@@ -25,6 +25,10 @@ Before 1.0, a minor release may break; every break is listed here.
 - The CII reader keeps the first kind of payment means it reads, as the UBL
   reader does, and reports every later card, debited account, mandate or
   creditor identifier as not held. It used to replace the first one silently.
+- Both readers report an absent or empty BT-106, BT-109, BT-112, BT-115,
+  BT-116, BT-117, BT-129, BT-131, BT-146 and allowance or charge amount as
+  `Malformed`, when the declared profile runs the rule the model's type
+  guarantees (`BR-12` … `BR-46`). They used to read it as zero.
 
 ## [0.8.0] — 2026-10-11
 

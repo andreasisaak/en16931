@@ -32,6 +32,8 @@ pub(crate) struct Reader {
     /// Everything else the reader has to say, in document order — values
     /// present and not representable, combinations the model cannot hold.
     entries: Vec<Entry>,
+    /// The checks of the declared profile ([`crate::xml::declared_checks`]).
+    checks: BTreeSet<&'static str>,
 }
 
 /// One `cac:TaxTotal/cbc:TaxAmount`, held until BT-5 and BT-6 are known.
@@ -114,6 +116,12 @@ impl Reader {
     /// Note an element this reader does not map.
     fn skip(&mut self, parent: &str, n: Node<'_, '_>) {
         self.unmapped.insert(format!("{parent}/{}", name(n)));
+    }
+
+    /// Report a required amount or quantity absent at `path` below `n`.
+    fn require(&mut self, n: Node<'_, '_>, path: &[&str], term: &str, rule: &str) {
+        self.entries
+            .extend(crate::xml::absent(n, path, (term, rule), &self.checks));
     }
 
     /// Note a combination the model cannot hold, at `path`.
@@ -219,6 +227,7 @@ impl Reader {
     /// Read a UBL `Invoice` or `CreditNote` root element.
     pub(crate) fn read(&mut self, root: Node<'_, '_>) -> Invoice {
         let mut inv = Invoice::default();
+        self.checks = crate::xml::declared_checks(text(root, "CustomizationID").as_deref());
         // The root element is the document kind.
         inv.kind = if name(root) == "CreditNote" {
             DocumentKind::CreditNote
@@ -322,6 +331,12 @@ impl Reader {
                 }
                 "AllowanceCharge" => {
                     let is_charge = self.charge_indicator(c, "AllowanceCharge");
+                    let (term, rule) = if is_charge {
+                        ("BT-99", "BR-36")
+                    } else {
+                        ("BT-92", "BR-31")
+                    };
+                    self.require(c, &["Amount"], term, rule);
                     let ac = self.allowance(c);
                     if is_charge {
                         inv.charges.push(ac);
@@ -365,6 +380,14 @@ impl Reader {
                 | "InvoiceDocumentReference" => {}
                 _ => self.skip("Invoice", c),
             }
+        }
+        for (want, term, rule) in [
+            ("LineExtensionAmount", "BT-106", "BR-12"),
+            ("TaxExclusiveAmount", "BT-109", "BR-13"),
+            ("TaxInclusiveAmount", "BT-112", "BR-14"),
+            ("PayableAmount", "BT-115", "BR-15"),
+        ] {
+            self.require(root, &["LegalMonetaryTotal", want], term, rule);
         }
         // BT-90 is the seller's `cac:PartyIdentification` with
         // `schemeID="SEPA"` in UBL and lives in BG-19 in the model. It is moved,
@@ -756,6 +779,8 @@ impl Reader {
                     _ => self.skip("TaxSubtotal", c),
                 }
             }
+            self.require(st, &["TaxableAmount"], "BT-116", "BR-45");
+            self.require(st, &["TaxAmount"], "BT-117", "BR-46");
             inv.vat_breakdown.push(VatBreakdown {
                 taxable_amount: self.amount(st, "TaxableAmount").unwrap_or_default(),
                 tax_amount: self.amount(st, "TaxAmount").unwrap_or_default(),
@@ -859,6 +884,12 @@ impl Reader {
                 }
                 "AllowanceCharge" => {
                     let is_charge = self.charge_indicator(c, "InvoiceLine/AllowanceCharge");
+                    let (term, rule) = if is_charge {
+                        ("BT-141", "BR-43")
+                    } else {
+                        ("BT-136", "BR-41")
+                    };
+                    self.require(c, &["Amount"], term, rule);
                     let a = LineAllowanceCharge {
                         amount: self.amount(c, "Amount").unwrap_or_default(),
                         base_amount: self.amount(c, "BaseAmount"),
@@ -891,6 +922,14 @@ impl Reader {
                 _ => self.skip("InvoiceLine", c),
             }
         }
+        let quantity = if name(n) == "CreditNoteLine" || kid(n, "CreditedQuantity").is_some() {
+            "CreditedQuantity"
+        } else {
+            "InvoicedQuantity"
+        };
+        self.require(n, &[quantity], "BT-129", "BR-22");
+        self.require(n, &["LineExtensionAmount"], "BT-131", "BR-24");
+        self.require(n, &["Price", "PriceAmount"], "BT-146", "BR-26");
         l
     }
 
