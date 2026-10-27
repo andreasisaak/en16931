@@ -25,6 +25,11 @@ Before 1.0, a minor release may break; every break is listed here.
   quantity × price alone overflows, R120 divides the larger factor by the base
   quantity first, so a price is not rounded away. `R046` reports a gross price
   minus discount beyond the range instead of panicking.
+- No total or tax rule passes on overflow any more. `BR-CO-10` … `BR-CO-16`,
+  the category `-08` rows, R120's line allowances and charges, `BR-DEX-02` and
+  `BR-DEX-09` sum the amounts exactly in `Decimal` instead of skipping when a
+  sum of `InvoiceAmount`s overflows; `BR-CO-17` and the category `-09` rows
+  report a tax beyond the `Decimal` range, with a hint.
 - The CII reader keeps the first kind of payment means it reads, as the UBL
   reader does, and reports every later card, debited account, mandate or
   creditor identifier as not held. It used to replace the first one silently.

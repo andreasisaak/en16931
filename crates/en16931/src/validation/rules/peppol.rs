@@ -8,6 +8,7 @@
 
 use rust_decimal::Decimal;
 
+use super::arith::{BEYOND_RANGE, exact_sum};
 use super::{Findings, Rule, RuleId, Severity, Source};
 use crate::bt::BtId;
 use crate::bt::{Group, Path};
@@ -44,10 +45,6 @@ fn within(expected: Decimal, actual: Decimal, slack: Decimal) -> bool {
         .checked_sub(actual)
         .is_some_and(|difference| difference.abs() <= slack)
 }
-
-/// Advice for a finding whose expected amount does not fit a `Decimal`.
-const BEYOND_RANGE: &str =
-    "The expected amount exceeds the decimal range, so no stated amount can match it.";
 
 macro_rules! rule {
     (
@@ -86,12 +83,8 @@ pub(crate) fn check_line_amount(
         if base.is_zero() {
             continue; // R121 reports this; dividing would panic.
         }
-        let sum = |v: &[LineAllowanceCharge]| {
-            InvoiceAmount::checked_sum(v.iter().map(|a| a.amount)).map(InvoiceAmount::into_decimal)
-        };
-        let (Ok(charges), Ok(allowances)) = (sum(&line.charges), sum(&line.allowances)) else {
-            continue;
-        };
+        let sum = |v: &[LineAllowanceCharge]| exact_sum(v.iter().map(|a| a.amount));
+        let (charges, allowances) = (sum(&line.charges), sum(&line.allowances));
         let path = Path::at_term(Group::Line, i, bt::LINE_NET_AMOUNT);
         let (quantity, price) = (
             line.quantity.into_decimal(),

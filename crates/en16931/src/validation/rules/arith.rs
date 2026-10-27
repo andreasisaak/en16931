@@ -18,6 +18,8 @@
 
 use rust_decimal::Decimal;
 
+use crate::InvoiceAmount;
+
 /// The ±1.00 the artefacts allow on `BR-CO-17` and the category `-08`/`-09`
 /// rows. Not in EN 16931-1 §6.4.2, which states a plain equation.
 pub(crate) const VAT_TOLERANCE: Decimal = Decimal::ONE;
@@ -39,6 +41,19 @@ pub(crate) fn derived_vat(base: Decimal, rate: Decimal) -> Option<Decimal> {
     base.abs()
         .checked_mul(rate)
         .map(|product| xpath_round(product) / Decimal::ONE_HUNDRED)
+}
+
+/// Advice for a finding whose expected amount does not fit a `Decimal`.
+pub(crate) const BEYOND_RANGE: &str =
+    "The expected amount exceeds the decimal range, so no stated amount can match it.";
+
+/// The exact sum of `amounts`. Each fits an `i64` of cents, so a `Decimal`
+/// holds the sum of more amounts than a document can carry, where a sum of
+/// [`InvoiceAmount`]s overflows and would leave its rule unchecked.
+pub(crate) fn exact_sum(amounts: impl IntoIterator<Item = InvoiceAmount>) -> Decimal {
+    amounts.into_iter().fold(Decimal::new(0, 2), |sum, amount| {
+        sum + amount.into_decimal()
+    })
 }
 
 /// Whether a stated VAT amount is within the artefacts' ±1.00 of `expected`.
