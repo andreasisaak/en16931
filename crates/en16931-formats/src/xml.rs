@@ -176,7 +176,17 @@ pub(crate) fn xs_decimal(text: &str) -> Result<rust_decimal::Decimal, String> {
     if (whole.is_empty() && fraction.is_empty()) || !digits(whole) || !digits(fraction) {
         return Err("not an xs:decimal".to_owned());
     }
-    text.parse().map_err(|e: rust_decimal::Error| e.to_string())
+    let parsed: rust_decimal::Decimal = text
+        .parse()
+        .map_err(|e: rust_decimal::Error| e.to_string())?;
+    // `rust_decimal` rounds a fraction beyond its 28 places without saying so.
+    let places = fraction.trim_end_matches('0').len();
+    if u32::try_from(places).map_or(true, |places| places > parsed.scale()) {
+        return Err(format!(
+            "{places} decimal places, more than a decimal holds beside its integer digits"
+        ));
+    }
+    Ok(parsed)
 }
 
 /// The ids of every check the profile BT-24 declares runs, or the core's when

@@ -681,7 +681,7 @@ impl Reader {
         // Called once per `ram:SpecifiedTradeSettlementPaymentMeans`; several
         // are one BG-16 with several BG-17 accounts (0..1 per element), so
         // everything accumulates into `p`.
-        let mut transfers: Vec<CreditTransfer> = Vec::new();
+        let mut held = false;
         for c in kids(n) {
             match name(c) {
                 "TypeCode" => {
@@ -714,31 +714,44 @@ impl Reader {
                     "SpecifiedTradeSettlementPaymentMeans/PayerPartyDebtorFinancialAccount",
                     "a debited account beside another payment means; BG-16 holds one kind",
                 ),
-                "PayeePartyCreditorFinancialAccount" => transfers.push(CreditTransfer {
-                    account_identifier: text(c, "IBANID").or_else(|| text(c, "ProprietaryID")),
-                    account_name: text(c, "AccountName"),
-                    provider_identifier: None,
-                }),
+                "PayeePartyCreditorFinancialAccount" => {
+                    let t = CreditTransfer {
+                        account_identifier: text(c, "IBANID").or_else(|| text(c, "ProprietaryID")),
+                        account_name: text(c, "AccountName"),
+                        provider_identifier: None,
+                    };
+                    // An account joins the transfers read before it; beside a
+                    // card or mandate read first it is reported, as in UBL.
+                    held = match &mut p.means {
+                        Some(PaymentMeans::CreditTransfer(existing)) => {
+                            existing.push(t);
+                            true
+                        }
+                        slot @ None => {
+                            *slot = Some(PaymentMeans::CreditTransfer(vec![t]));
+                            true
+                        }
+                        Some(_) => {
+                            self.not_held(
+                                "SpecifiedTradeSettlementPaymentMeans/PayeePartyCreditorFinancialAccount",
+                                "an account beside a card or mandate; BG-16 holds one kind",
+                            );
+                            false
+                        }
+                    };
+                }
                 "PayeeSpecifiedCreditorFinancialInstitution" => {
                     // BT-86 arrives *after* the account it belongs to, as a
-                    // sibling rather than a child, so it is attached here.
-                    if let Some(t) = transfers.last_mut() {
+                    // sibling rather than a child, so it is attached here, to
+                    // that account only when it was held.
+                    if let (true, Some(PaymentMeans::CreditTransfer(transfers))) =
+                        (held, &mut p.means)
+                        && let Some(t) = transfers.last_mut()
+                    {
                         t.provider_identifier = text(c, "BICID");
                     }
                 }
                 other => self.push_path("SpecifiedTradeSettlementPaymentMeans", other),
-            }
-        }
-        if !transfers.is_empty() {
-            match &mut p.means {
-                Some(PaymentMeans::CreditTransfer(existing)) => existing.extend(transfers),
-                slot @ None => *slot = Some(PaymentMeans::CreditTransfer(transfers)),
-                // An account on top of a card or mandate cannot be
-                // represented; reported.
-                Some(_) => self.not_held(
-                    "SpecifiedTradeSettlementPaymentMeans/PayeePartyCreditorFinancialAccount",
-                    "an account beside a card or mandate; BG-16 holds one kind",
-                ),
             }
         }
     }

@@ -461,7 +461,13 @@ fn a_number_that_is_not_one_is_reported() {
             "cbc:MultiplierFactorNumeric",
         ),
     ];
-    for value in ["abc", "79228162514264337593543950336", "1e1", "1_000"] {
+    for value in [
+        "abc",
+        "79228162514264337593543950336",
+        "1e1",
+        "1_000",
+        "0.00000000000000000000000000001",
+    ] {
         for (syntax, anchors, tag) in cases {
             let xml = write(&common::maximal(), syntax).xml;
             let probe = with_text(&xml, anchors, tag, value);
@@ -496,6 +502,32 @@ fn cii_reads_a_percentage_with_all_its_digits() {
             .map(en16931::Percentage::into_decimal),
         Some(rust_decimal::Decimal::from_str_exact(tiny).expect("decimal"))
     );
+}
+
+/// A UBL date with a time zone is an `xs:date` only with a valid offset.
+#[test]
+fn a_ubl_date_with_an_invalid_time_zone_is_reported() {
+    use en16931_formats::report::Kind;
+
+    let xml = write(&common::maximal(), Syntax::Ubl).xml;
+    for (zone, malformed) in [
+        ("Z", false),
+        ("+14:00", false),
+        ("-05:30", false),
+        ("+99:99", true),
+        ("+ab:cd", true),
+        ("+14:30", true),
+    ] {
+        let start = xml.find("<cbc:IssueDate>").expect("BT-2") + "<cbc:IssueDate>".len();
+        let end = start + "2026-01-15".len();
+        let probe = format!("{}{zone}{}", &xml[..end], &xml[end..]);
+        assert_ne!(probe, xml);
+        let got = en16931_formats::read(probe.as_bytes()).expect("readable");
+        let reported = got
+            .entries_of(Kind::Malformed)
+            .any(|e| e.path.ends_with("IssueDate"));
+        assert_eq!(reported, malformed, "{}", &probe[start..end + zone.len()]);
+    }
 }
 
 /// CII keeps the first kind of payment means it reads and reports every later
@@ -560,6 +592,23 @@ fn cii_reports_a_second_kind_of_payment_means_instead_of_replacing_the_first() {
     );
     assert_ne!(transfer_and_card, transfer, "second element inserted");
     let (means, paths) = not_held(&transfer_and_card);
+    assert!(
+        matches!(means, Some(PaymentMeans::CreditTransfer(_))),
+        "{means:?}"
+    );
+    assert_eq!(
+        paths,
+        ["SpecifiedTradeSettlementPaymentMeans/ApplicableTradeSettlementFinancialCard"]
+    );
+
+    // A credit transfer, then a card in the same element, out of schema order.
+    let account_then_card = transfer.replacen(
+        "</ram:PayeePartyCreditorFinancialAccount>",
+        &format!("</ram:PayeePartyCreditorFinancialAccount>{CARD}"),
+        1,
+    );
+    assert_ne!(account_then_card, transfer, "card inserted");
+    let (means, paths) = not_held(&account_then_card);
     assert!(
         matches!(means, Some(PaymentMeans::CreditTransfer(_))),
         "{means:?}"
