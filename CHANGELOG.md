@@ -22,6 +22,9 @@ Before 1.0, a minor release may break; every break is listed here.
 - `PEPPOL-EN16931-R120` and `R040` no longer panic when expected minus stated
   amount overflows, and no longer skip a line or allowance whose expected
   amount exceeds the `Decimal` range: they report it, with a hint.
+- The CII reader keeps the first kind of payment means it reads, as the UBL
+  reader does, and reports every later card, debited account, mandate or
+  creditor identifier as not held. It used to replace the first one silently.
 
 ## [0.8.0] — 2026-10-11
 
