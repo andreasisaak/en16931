@@ -166,6 +166,19 @@ pub(crate) fn child_text(n: Node<'_, '_>, want: &str) -> Option<String> {
     kid(n, want).and_then(text)
 }
 
+/// `text` as a [`rust_decimal::Decimal`] when it is an `xs:decimal`: an
+/// optional sign, then digits with at most one point, at least one digit.
+/// `rust_decimal` alone also reads `1e3` and `1_000`, which the schemas refuse.
+pub(crate) fn xs_decimal(text: &str) -> Result<rust_decimal::Decimal, String> {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty()) || !digits(whole) || !digits(fraction) {
+        return Err("not an xs:decimal".to_owned());
+    }
+    text.parse().map_err(|e: rust_decimal::Error| e.to_string())
+}
+
 /// The ids of every check the profile BT-24 declares runs, or the core's when
 /// it declares none this build ships, as [`crate::receive`] picks the profile.
 pub(crate) fn declared_checks(bt24: Option<&str>) -> std::collections::BTreeSet<&'static str> {

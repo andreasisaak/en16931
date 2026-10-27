@@ -394,8 +394,9 @@ fn with_text(xml: &str, anchors: &[&str], tag: &str, value: &str) -> String {
     format!("{}{value}{}", &xml[..content], &xml[end..])
 }
 
-/// A quantity, price or percentage that is not an `xs:decimal`, or is beyond
-/// `Decimal`'s range, is reported in both syntaxes, not read as zero or dropped.
+/// A quantity, price or percentage that is not an `xs:decimal` (also `1e1` or
+/// `1_000`, which `rust_decimal` reads), or is beyond `Decimal`'s range, is
+/// reported in both syntaxes, not read as zero or dropped.
 #[test]
 fn a_number_that_is_not_one_is_reported() {
     use en16931_formats::report::Kind;
@@ -460,7 +461,7 @@ fn a_number_that_is_not_one_is_reported() {
             "cbc:MultiplierFactorNumeric",
         ),
     ];
-    for value in ["abc", "79228162514264337593543950336"] {
+    for value in ["abc", "79228162514264337593543950336", "1e1", "1_000"] {
         for (syntax, anchors, tag) in cases {
             let xml = write(&common::maximal(), syntax).xml;
             let probe = with_text(&xml, anchors, tag, value);

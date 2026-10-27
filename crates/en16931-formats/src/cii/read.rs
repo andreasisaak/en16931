@@ -79,10 +79,10 @@ impl Reader {
     /// present and not an `xs:decimal` the model can hold, which is reported.
     fn decimal(&mut self, n: Node<'_, '_>, want: &str) -> Option<rust_decimal::Decimal> {
         let raw = text(n, want)?;
-        match raw.parse() {
+        match crate::xml::xs_decimal(&raw) {
             Ok(d) => Some(d),
             Err(e) => {
-                self.malformed(format!("{}/{want}", name(n)), e.to_string(), raw);
+                self.malformed(format!("{}/{want}", name(n)), e, raw);
                 None
             }
         }

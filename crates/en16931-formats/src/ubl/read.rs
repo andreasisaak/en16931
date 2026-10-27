@@ -217,7 +217,7 @@ impl Reader {
     }
 
     fn decimal(&mut self, n: Node<'_, '_>, want: &str) -> Option<rust_decimal::Decimal> {
-        self.value(n, want, str::parse::<rust_decimal::Decimal>)
+        self.value(n, want, crate::xml::xs_decimal)
     }
 
     fn date(&mut self, n: Node<'_, '_>, want: &str) -> Option<Date> {
