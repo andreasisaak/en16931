@@ -79,7 +79,10 @@ struct Case {
 /// Exact counts of what each suite runs at the pinned releases (CEN
 /// `validation-1.3.16`, KoSIT `v2.6.0`, Peppol BIS Billing 3.0.21), so a
 /// truncated fetch or moved directory cannot pass with a smaller denominator.
-const CEN_ASSERTIONS: usize = 1_025;
+///
+/// 1 027 since amounts without an integer part parse: CEN's own `BR-CO-12.xml`
+/// and `BR-CO-17.xml` write `.00`.
+const CEN_ASSERTIONS: usize = 1_027;
 /// See [`CEN_ASSERTIONS`]. 381 mutations run of 471 runnable.
 const KOSIT_MUTATIONS: usize = 381;
 /// See [`CEN_ASSERTIONS`].

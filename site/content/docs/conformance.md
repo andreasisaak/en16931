@@ -13,7 +13,7 @@ timings are measured, not asserted.
 ## CEN's unit tests
 
 277 files and 1 131 assertions, each a minimal UBL fragment with an explicit
-expectation. 1 025 CEN unit-test assertions run; the rest test rules the types
+expectation. 1 027 CEN unit-test assertions run; the rest test rules the types
 retire, undecidable rules or syntax rules:
 
 ```xml
@@ -27,8 +27,8 @@ retire, undecidable rules or syntax rules:
 CEN conformance suite
   files:                  277
   assertions:            1131
-  run:                   1025
-  agreed:                1014  (98.9% of run)
+  run:                   1027
+  agreed:                1016  (98.9% of run)
   disagreed:                0
   diverged, declared:      11
      6 × an empty <cac:PostalAddress/> is an absent address here
@@ -37,7 +37,7 @@ CEN conformance suite
      2 × two cac:TaxTotal elements cannot both be BT-110
   skipped, unevaluated:    66  (type-retired or undecidable)
   skipped, syntax rules:   32  (UBL-*/CII-*, the formats crate's job)
-  skipped, malformed:       8  (a value the model refuses)
+  skipped, malformed:       6  (a value the model refuses)
   skipped, unreadable:      0
   run, no indicator:        8  (absent cbc:ChargeIndicator, read as an allowance)
   core rules with no CEN expectation: 35 of 227
