@@ -30,6 +30,16 @@ Before 1.0, a minor release may break; every break is listed here.
   `BR-DEX-09` sum the amounts exactly in `Decimal` instead of skipping when a
   sum of `InvoiceAmount`s overflows; `BR-CO-17` and the category `-09` rows
   report a tax beyond the `Decimal` range, with a hint.
+- Rule products and differences keep every digit or are reported:
+  `rust_decimal` rounds a result beyond 28 places without saying so, which
+  turned a tax just below half a cent into a cent (`BR-CO-17`, `-09`, the
+  reconciler's BT-117) and let R120, R040 and R046 compare rounded values.
+  R040 compares a hundredfold instead of dividing by 100.
+- Both readers report a quantity, price or rate with more decimal places than
+  a `Decimal` holds instead of rounding it; the UBL reader reports a date
+  whose time zone is not an `xs:date` offset (`+99:99`); the CII reader holds
+  or reports a creditor account as soon as it reads it, so a card after it in
+  the same element does not take its place.
 - The CII reader keeps the first kind of payment means it reads, as the UBL
   reader does, and reports every later card, debited account, mandate or
   creditor identifier as not held. It used to replace the first one silently.

@@ -24,6 +24,8 @@ use crate::codes::generated as lists;
 use crate::invoice::{Invoice, terms as bt};
 use crate::{InvoiceAmount, VatCategory};
 
+/// Exact products for the reconciler, as the rules compute them.
+pub(crate) use arith::exact_mul;
 use arith::{BEYOND_RANGE, derived_vat, exact_sum, within_vat_tolerance, xpath_round};
 
 /// Declare a rule with its metadata beside its predicate.

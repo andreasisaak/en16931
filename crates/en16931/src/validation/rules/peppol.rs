@@ -8,7 +8,7 @@
 
 use rust_decimal::Decimal;
 
-use super::arith::{BEYOND_RANGE, exact_sum};
+use super::arith::{BEYOND_RANGE, exact_mul, exact_sub, exact_sum};
 use super::{Findings, Rule, RuleId, Severity, Source};
 use crate::bt::BtId;
 use crate::bt::{Group, Path};
@@ -98,13 +98,12 @@ pub(crate) fn check_line_amount(
         } else {
             (price, quantity)
         };
-        let expected = quantity
-            .checked_mul(price)
+        let expected = exact_mul(quantity, price)
             .and_then(|p| p.checked_div(base))
             .or_else(|| {
                 large
                     .checked_div(base)
-                    .and_then(|share| share.checked_mul(small))
+                    .and_then(|share| exact_mul(share, small))
             })
             .and_then(|p| p.checked_add(charges))
             .and_then(|p| p.checked_sub(allowances));
@@ -142,16 +141,14 @@ fn check_basis(
     };
     // A stated amount fits an `i64` of cents, far below `Decimal::MAX / 100`,
     // so none matches a product beyond `Decimal`'s range.
-    let Some(expected) = base
-        .into_decimal()
-        .checked_mul(pct.into_decimal())
-        .map(|v| v / Decimal::ONE_HUNDRED)
-    else {
+    let Some(product) = exact_mul(base.into_decimal(), pct.into_decimal()) else {
         f.at_with_hint(path, BEYOND_RANGE);
         return;
     };
-    if !within(expected, amount.into_decimal(), tolerance) {
-        f.arithmetic(path, expected.round_dp(2), amount);
+    // Compared a hundredfold, so the division by 100 rounds nothing away.
+    let hundredfold = amount.into_decimal() * Decimal::ONE_HUNDRED;
+    if !within(product, hundredfold, tolerance * Decimal::ONE_HUNDRED) {
+        f.arithmetic(path, (product / Decimal::ONE_HUNDRED).round_dp(2), amount);
     }
 }
 
@@ -270,7 +267,7 @@ terms: [bt::ITEM_NET_PRICE, bt::ITEM_GROSS_PRICE, bt::ITEM_PRICE_DISCOUNT],
             .price_discount
             .map_or(Decimal::ZERO, |d| d.into_decimal());
         let path = Path::at_term(Group::Line, i, bt::ITEM_NET_PRICE);
-        let Some(expected) = gross.into_decimal().checked_sub(discount) else {
+        let Some(expected) = exact_sub(gross.into_decimal(), discount) else {
             f.at_with_hint(path, BEYOND_RANGE);
             continue;
         };
@@ -972,6 +969,49 @@ mod tests {
         inv.lines[0].price.price_discount =
             Some(crate::UnitPriceAmount::new(Decimal::NEGATIVE_ONE));
         assert_eq!(fired(&R046, &inv).len(), 1);
+    }
+
+    /// Quantity × price below `Decimal`'s 28 places is not rounded to zero:
+    /// 0.00000000000001 × 0.000000000000004 / 10^-28 is 0.40.
+    #[test]
+    fn r120_keeps_a_product_below_decimal_precision() {
+        let d = |s: &str| Decimal::from_str_exact(s).unwrap();
+        let mut inv = one_line(d("0.00000000000001"), d("0.000000000000004"), "0.40");
+        inv.lines[0].price.base_quantity =
+            Some(crate::Quantity::new(d("0.0000000000000000000000000001")));
+        assert!(fired(&R120, &inv).is_empty());
+        inv.lines[0].net_amount = InvoiceAmount::parse("0.00").unwrap();
+        assert_eq!(fired(&R120, &inv).len(), 1);
+    }
+
+    /// 10^28 minus a discount of 0.01 needs more places than `Decimal` has;
+    /// rounded, it would equal a net price of 10^28.
+    #[test]
+    fn r046_does_not_round_away_a_discount() {
+        let d = |s: &str| Decimal::from_str_exact(s).unwrap();
+        let big = d("10000000000000000000000000000");
+        let mut inv = one_line(Decimal::ONE, big, "1.00");
+        inv.lines[0].price.gross_price = Some(crate::UnitPriceAmount::new(big));
+        inv.lines[0].price.price_discount = Some(crate::UnitPriceAmount::new(d("0.01")));
+        assert_eq!(fired(&R046, &inv).len(), 1);
+    }
+
+    /// 0.01 × 200.00000000000000000000000001 / 100 is just above the slack
+    /// of 0.02 from a stated 0.00; divided first it rounds onto the slack.
+    #[test]
+    fn r040_compares_without_rounding_the_expected_amount() {
+        let mut inv = one_line(Decimal::ONE, Decimal::ONE, "1.00");
+        inv.allowances = vec![crate::invoice::DocumentAllowanceCharge {
+            amount: InvoiceAmount::parse("0.00").unwrap(),
+            base_amount: Some(InvoiceAmount::parse("0.01").unwrap()),
+            percentage: Some(Percentage::new(
+                Decimal::from_str_exact("200.00000000000000000000000001").unwrap(),
+            )),
+            vat: crate::invoice::LineVat::default(),
+            reason: None,
+            reason_code: None,
+        }];
+        assert_eq!(fired(&R040, &inv).len(), 1);
     }
 
     /// A base amount × percentage beyond `Decimal`'s range matches no amount.
