@@ -14,6 +14,12 @@ Before 1.0, a minor release may break; every break is listed here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The CII writer drops BT-89 no more: `ram:SpecifiedTradePaymentTerms`, which
+  carries `ram:DirectDebitMandateID`, is written for a mandate reference alone,
+  not only for payment terms or a due date.
+
 ## [0.8.0] — 2026-10-11
 
 Everything under Removed is breaking.
