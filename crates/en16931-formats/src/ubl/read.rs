@@ -967,7 +967,13 @@ impl Reader {
                 // `BR-26` (`en16931::SubInvoiceLine::quantity_stated`,
                 // `price_stated`) do not apply to it, only to a childless one.
                 let is_group = kids(c).any(|x| name(x) == "SubInvoiceLine");
-                let quantity_stated = kid(c, "InvoicedQuantity").is_some();
+                // `line` reads BT-129 from either tag (a credit note's
+                // sub-line states it as `cbc:CreditedQuantity`, exactly as the
+                // writer spells it in `ubl/write.rs::sub_line`); the flag must
+                // check both too, or a credit note's sub-line always reads as
+                // unstated.
+                let quantity_stated =
+                    kid(c, "InvoicedQuantity").is_some() || kid(c, "CreditedQuantity").is_some();
                 let price_stated = kid(c, "Price")
                     .is_some_and(|p| crate::xml::child_text(p, "PriceAmount").is_some());
                 let line = self.line(c, !is_group);

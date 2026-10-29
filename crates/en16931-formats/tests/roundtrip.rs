@@ -883,6 +883,89 @@ fn a_grouping_sub_line_round_trips_without_quantity_or_price() {
     assert!(child.price_stated, "the child states BG-29");
 }
 
+/// A childless `cac:SubInvoiceLine` states its quantity as
+/// `cbc:CreditedQuantity` when it hangs under a `cac:CreditNoteLine` — `line`
+/// reads either tag, so `quantity_stated` must too, not only
+/// `cbc:InvoicedQuantity`.
+///
+/// Hand-built XML rather than a round trip through [`write`]: the generated
+/// `cac:CreditNoteLine` sequence table (`ubl::order::ORDER`) has no slot for
+/// `cac:SubInvoiceLine` at all (a `cac:CreditNoteLine` legally nests
+/// `cac:SubCreditNoteLine`, a distinct element this crate's writer does not
+/// emit and its reader does not read), so today's writer drops the group
+/// outright before this flag ever matters on a credit note. That gap is
+/// pre-existing and separate from `quantity_stated`; this test only pins the
+/// flag's own logic against the element name `line` already reads.
+#[cfg(feature = "ubl")]
+#[test]
+fn a_credit_notes_childless_sub_line_keeps_its_credited_quantity_stated() {
+    use en16931_formats::Syntax;
+
+    let xml = r#"<CreditNote xmlns="urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2"
+        xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+        xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+      <cac:LegalMonetaryTotal>
+        <cbc:LineExtensionAmount currencyID="EUR">300.00</cbc:LineExtensionAmount>
+        <cbc:TaxExclusiveAmount currencyID="EUR">300.00</cbc:TaxExclusiveAmount>
+        <cbc:TaxInclusiveAmount currencyID="EUR">357.00</cbc:TaxInclusiveAmount>
+        <cbc:PayableAmount currencyID="EUR">357.00</cbc:PayableAmount>
+      </cac:LegalMonetaryTotal>
+      <cac:CreditNoteLine>
+        <cbc:ID>1</cbc:ID>
+        <cbc:CreditedQuantity unitCode="C62">3</cbc:CreditedQuantity>
+        <cbc:LineExtensionAmount currencyID="EUR">300.00</cbc:LineExtensionAmount>
+        <cac:Item>
+          <cbc:Name>Widget</cbc:Name>
+          <cac:ClassifiedTaxCategory>
+            <cbc:ID>S</cbc:ID>
+            <cbc:Percent>19</cbc:Percent>
+            <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+          </cac:ClassifiedTaxCategory>
+        </cac:Item>
+        <cac:Price>
+          <cbc:PriceAmount currencyID="EUR">100.00</cbc:PriceAmount>
+        </cac:Price>
+        <cac:SubInvoiceLine>
+          <cbc:ID>1.</cbc:ID>
+          <cbc:CreditedQuantity unitCode="C62">3</cbc:CreditedQuantity>
+          <cbc:LineExtensionAmount currencyID="EUR">300.00</cbc:LineExtensionAmount>
+          <cac:Item>
+            <cbc:Name>Widget</cbc:Name>
+            <cac:ClassifiedTaxCategory>
+              <cbc:ID>S</cbc:ID>
+              <cbc:Percent>19</cbc:Percent>
+              <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+            </cac:ClassifiedTaxCategory>
+          </cac:Item>
+          <cac:Price>
+            <cbc:PriceAmount currencyID="EUR">100.00</cbc:PriceAmount>
+          </cac:Price>
+        </cac:SubInvoiceLine>
+      </cac:CreditNoteLine>
+    </CreditNote>"#;
+
+    let back = read(xml, Syntax::Ubl);
+    assert!(
+        back.entries_of(Kind::Malformed).next().is_none(),
+        "a childless sub-line with both terms must not be Malformed: {:?}",
+        back.entries
+    );
+    let [sub] = back.invoice.extensions.sub_lines(0) else {
+        panic!(
+            "one sub-line, got {:?}",
+            back.invoice.extensions.sub_lines(0)
+        );
+    };
+    assert!(
+        sub.quantity_stated,
+        "cbc:CreditedQuantity was present, so the flag must read true, not false"
+    );
+    assert!(
+        sub.price_stated,
+        "cac:Price/cbc:PriceAmount was present too"
+    );
+}
+
 // ── Write, read back: the invoice is unchanged or something says why ───────────
 
 /// The extreme amounts, such as `InvoiceAmount::MIN`, survive both syntaxes.
