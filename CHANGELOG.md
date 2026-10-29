@@ -19,15 +19,21 @@ Before 1.0, a minor release may break; every break is listed here.
 - **Breaking:** `en16931::SubInvoiceLine` has two new fields,
   `quantity_stated` and `price_stated` (both default to `true` under `serde`,
   so existing data is unchanged): `false` means the sub-line's `line.quantity`
-  or `line.price` is absent, not a stated zero.
+  or `line.price` is absent, not a stated zero. Both are `true` only when the
+  element is present *and valid*; an empty one is refused, not read as
+  unstated.
 
 ### Fixed
 
-- The UBL reader no longer rejects a grouping `cac:SubInvoiceLine` — one with
-  its own `cac:SubInvoiceLine` children — for lacking `cbc:InvoicedQuantity` or
-  `cac:Price`: the XRechnung Extension Schematron requires neither there, only
-  `BR-DEX-02` and `BR-DEX-03`. A childless sub-line still needs both (`BR-22`,
-  `BR-26`), and the UBL writer omits what a grouping sub-line does not state.
+- The UBL reader no longer rejects a `cac:SubInvoiceLine` — grouping or
+  childless — for lacking `cbc:InvoicedQuantity` or `cac:Price`: `BR-22`'s and
+  `BR-26`'s context is `cac:InvoiceLine | cac:CreditNoteLine`, never a
+  sub-line, confirmed against the KoSIT validator. An empty
+  `cbc:InvoicedQuantity`/`cbc:CreditedQuantity`, or a `cac:Price` without
+  `cbc:PriceAmount`, is still refused: the UBL schema requires non-empty
+  content wherever either element is present at all (KoSIT 406), unlike most
+  absent terms this crate reads as simply missing. The UBL writer omits what a
+  sub-line does not state.
 - The CII writer drops BT-89 no more: `ram:SpecifiedTradePaymentTerms`, which
   carries `ram:DirectDebitMandateID`, is written for a mandate reference alone,
   not only for payment terms or a due date.

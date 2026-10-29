@@ -373,8 +373,8 @@ impl Reader {
                 "LegalMonetaryTotal" => self.totals(c, &mut inv),
                 "InvoiceLine" | "CreditNoteLine" => {
                     // BG-25 always has its own BT-129 and BT-146 (`BR-22`,
-                    // `BR-26`); only a grouping sub-line may leave them out.
-                    let l = self.line(c, true);
+                    // `BR-26`); no `cac:SubInvoiceLine` ever does.
+                    let (l, _, _) = self.line(c, true);
                     // BG-DEX-01 hangs beneath the line, keyed by its index.
                     let subs = self.sub_lines(c);
                     if !subs.is_empty() {
@@ -858,25 +858,58 @@ impl Reader {
         }
     }
 
-    /// `require_quantity_and_price` is `false` only for a `cac:SubInvoiceLine`
-    /// that itself has `cac:SubInvoiceLine` children: the one case where
-    /// `BT-129`/`BR-22` and `BG-29`/`BR-26` may be absent — see
-    /// `en16931::SubInvoiceLine::quantity_stated`.
-    fn line(&mut self, n: Node<'_, '_>, require_quantity_and_price: bool) -> InvoiceLine {
+    /// `require_quantity_and_price` is `true` only for `cac:InvoiceLine` and
+    /// `cac:CreditNoteLine`: `BR-22`'s and `BR-26`'s context is exactly that
+    /// pair (`eInvoicing-EN16931/ubl/schematron/preprocessed/
+    /// EN16931-UBL-validation-preprocessed.sch:138-144`), never a
+    /// `cac:SubInvoiceLine` — confirmed against the KoSIT validator, which
+    /// accepts a sub-line with neither `cbc:InvoicedQuantity` nor
+    /// `cac:Price`. Returns, besides the line, whether BT-129 and BT-146 are
+    /// present *and valid*; see `en16931::SubInvoiceLine::quantity_stated`.
+    fn line(
+        &mut self,
+        n: Node<'_, '_>,
+        require_quantity_and_price: bool,
+    ) -> (InvoiceLine, bool, bool) {
+        let quantity_tag = if kid(n, "InvoicedQuantity").is_some() {
+            "InvoicedQuantity"
+        } else {
+            "CreditedQuantity"
+        };
+        let quantity_value = self.decimal(n, quantity_tag);
+        // Absent is legitimate wherever `require_quantity_and_price` is
+        // `false` (no entry). Present but empty is, unlike most absent terms
+        // this crate reads as simply missing, a schema violation UBL never
+        // allows for a decimal element (KoSIT 406, `cvc-complex-type.2.2` /
+        // `cvc-datatype-valid.1.2.1`); reported once here, only on a
+        // sub-line, since the top level's own `require` below already
+        // reports an absent or empty one (citing `BR-22`) and must not be
+        // reported twice. Present but otherwise unparseable already has its
+        // own entry from the parse that produced `quantity_value` above.
+        let quantity_stated = match (kid(n, quantity_tag), &quantity_value) {
+            (Some(_), Some(_)) => true,
+            (None, _) => false,
+            (Some(node), None) => {
+                if !require_quantity_and_price && crate::xml::text(node).is_none() {
+                    self.entries.push(
+                        Entry::new(
+                            Kind::Malformed,
+                            format!("{}/{quantity_tag}", name(n)),
+                            "present but empty, and the UBL schema requires an xs:decimal value",
+                        )
+                        .term("BT-129"),
+                    );
+                }
+                false
+            }
+        };
         let mut l = InvoiceLine {
             id: text(n, "ID").unwrap_or_default(),
             note: text(n, "Note"),
             order_line_reference: None,
             accounting_reference: text(n, "AccountingCost"),
             object_identifier: None,
-            quantity: Quantity::new(
-                if kid(n, "InvoicedQuantity").is_some() {
-                    self.decimal(n, "InvoicedQuantity")
-                } else {
-                    self.decimal(n, "CreditedQuantity")
-                }
-                .unwrap_or_default(),
-            ),
+            quantity: Quantity::new(quantity_value.unwrap_or_default()),
             unit_code: kid(n, "InvoicedQuantity")
                 .or_else(|| kid(n, "CreditedQuantity"))
                 .and_then(|q| q.attribute("unitCode"))
@@ -890,6 +923,7 @@ impl Reader {
             vat: LineVat::default(),
             item: Item::default(),
         };
+        let mut price_stated = false;
         for c in kids(n) {
             match name(c) {
                 "InvoicePeriod" => l.period = Some(self.period(c)),
@@ -926,7 +960,11 @@ impl Reader {
                         l.allowances.push(a);
                     }
                 }
-                "Price" => l.price = self.price(c),
+                "Price" => {
+                    let (price, stated) = self.price(c, !require_quantity_and_price, name(n));
+                    l.price = price;
+                    price_stated = stated;
+                }
                 "Item" => {
                     let (item, vat) = self.item(c);
                     l.item = item;
@@ -955,7 +993,7 @@ impl Reader {
         if require_quantity_and_price {
             self.require(n, &["Price", "PriceAmount"], "BT-146", "BR-26");
         }
-        l
+        (l, quantity_stated, price_stated)
     }
 
     /// `cac:SubInvoiceLine` children, recursively — BG-DEX-01.
@@ -963,20 +1001,10 @@ impl Reader {
         kids(n)
             .filter(|c| name(*c) == "SubInvoiceLine")
             .map(|c| {
-                // A sub-line with its own sub-lines is a group: `BR-22` and
-                // `BR-26` (`en16931::SubInvoiceLine::quantity_stated`,
-                // `price_stated`) do not apply to it, only to a childless one.
-                let is_group = kids(c).any(|x| name(x) == "SubInvoiceLine");
-                // `line` reads BT-129 from either tag (a credit note's
-                // sub-line states it as `cbc:CreditedQuantity`, exactly as the
-                // writer spells it in `ubl/write.rs::sub_line`); the flag must
-                // check both too, or a credit note's sub-line always reads as
-                // unstated.
-                let quantity_stated =
-                    kid(c, "InvoicedQuantity").is_some() || kid(c, "CreditedQuantity").is_some();
-                let price_stated = kid(c, "Price")
-                    .is_some_and(|p| crate::xml::child_text(p, "PriceAmount").is_some());
-                let line = self.line(c, !is_group);
+                // `BR-22` and `BR-26` never apply to a sub-line, grouping or
+                // not (see `Self::line`); it may always leave BT-129 and
+                // BT-146 unstated.
+                let (line, quantity_stated, price_stated) = self.line(c, false);
                 // BG-DEX-06: `BR-DEX-03` requires exactly one, so two map to
                 // `None` and the rule fires.
                 let categories = kid(c, "Item").map_or(0, |i| {
@@ -995,10 +1023,41 @@ impl Reader {
             .collect()
     }
 
-    fn price(&mut self, n: Node<'_, '_>) -> PriceDetails {
+    /// `n` is a present `cac:Price`, `parent` its line's element name (for a
+    /// new entry's path); `report_empty` is `true` only when reading a
+    /// `cac:SubInvoiceLine`'s own price (see [`Self::line`]).
+    ///
+    /// UBL's schema makes `cbc:PriceAmount` `cac:Price`'s one mandatory
+    /// child: a stated `cac:Price` without it, or with it present but empty,
+    /// is invalid either way (KoSIT 406, `cvc-complex-type.2.4.b` /
+    /// `cvc-datatype-valid.1.2.1`), unlike `cac:Price` itself being absent,
+    /// which is legitimate on a sub-line. Reported once here, only when
+    /// `report_empty`: the top level's own `require` already reports an
+    /// absent or empty one, citing `BR-26`, and must not be reported twice.
+    fn price(&mut self, n: Node<'_, '_>, report_empty: bool, parent: &str) -> (PriceDetails, bool) {
+        let amount = self.decimal(n, "PriceAmount");
+        // Present but non-empty and still unparseable already has its own
+        // entry from the `self.decimal` call above; only a missing or empty
+        // `cbc:PriceAmount` is new here.
+        let stated = match (kid(n, "PriceAmount"), &amount) {
+            (_, Some(_)) => true,
+            (node, None) => {
+                if report_empty && node.is_none_or(|p| crate::xml::text(p).is_none()) {
+                    self.entries.push(
+                        Entry::new(
+                            Kind::Malformed,
+                            format!("{parent}/{}/PriceAmount", name(n)),
+                            "a stated cac:Price must have a valid xs:decimal cbc:PriceAmount; \
+                             the UBL schema refuses a missing or empty one",
+                        )
+                        .term("BT-146"),
+                    );
+                }
+                false
+            }
+        };
         let mut p = PriceDetails {
-            net_price: self
-                .decimal(n, "PriceAmount")
+            net_price: amount
                 .map(en16931::UnitPriceAmount::new)
                 .unwrap_or_default(),
             price_discount: None,
@@ -1038,7 +1097,7 @@ impl Reader {
                 _ => self.skip("Price", c),
             }
         }
-        p
+        (p, stated)
     }
 
     fn item(&mut self, n: Node<'_, '_>) -> (Item, LineVat) {

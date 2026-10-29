@@ -130,29 +130,36 @@ pub const THIRD_PARTY_PAYMENTS: &str = "BG-DEX-09";
 pub struct SubInvoiceLine {
     /// The line itself, with the same business terms as BG-25.
     ///
-    /// A grouping sub-line ([`children`](Self::children) non-empty) may leave
-    /// `line.quantity` and `line.price` at their default; see
+    /// Any sub-line, grouping or childless, may leave `line.quantity` and
+    /// `line.price` at their default; see
     /// [`quantity_stated`](Self::quantity_stated) and
     /// [`price_stated`](Self::price_stated).
     pub line: InvoiceLine,
     /// `BG-DEX-06` — its VAT information. Exactly one (`BR-DEX-03`), on every
     /// sub-line, grouping or not.
     pub vat: Option<LineVat>,
-    /// Whether `BT-129` (and its unit, BT-130) is stated.
+    /// Whether `BT-129` (and its unit, BT-130) is present *and valid*.
     ///
-    /// The UBL schema makes `cac:SubInvoiceLine/cbc:InvoicedQuantity` 0..1
-    /// (`InvoiceLineType`), and the XRechnung Extension Schematron checks only
-    /// `BR-DEX-02` (this line's BT-131 is the sum of its children's) and
-    /// `BR-DEX-03` on a sub-line with children — never `BR-22`. A childless
-    /// sub-line still needs it (`BR-22` applies there as on BG-25). `false`
-    /// means `line.quantity` is `Quantity::default()` (zero) and does not
-    /// count — a quantity is never actually zero and absent.
+    /// `BR-22`'s context is `cac:InvoiceLine | cac:CreditNoteLine`
+    /// (CEN's EN 16931 UBL Schematron), never `cac:SubInvoiceLine`: it does
+    /// not apply to a sub-line at all, grouping or childless, confirmed
+    /// against the KoSIT validator. `false` with `line.quantity` at its
+    /// `Quantity::default()` (zero) means `cbc:InvoicedQuantity` /
+    /// `cbc:CreditedQuantity` is simply absent — a quantity is never actually
+    /// zero and absent. A *present but empty* element is different: the UBL
+    /// schema requires non-empty `xs:decimal` content wherever the element
+    /// appears at all (KoSIT 406, `cvc-datatype-valid.1.2.1`), so a reader
+    /// rejects that (`Kind::Malformed`) rather than reading `quantity_stated`
+    /// as `false` for a stated zero.
     #[cfg_attr(feature = "serde", serde(default = "stated_by_default"))]
     pub quantity_stated: bool,
-    /// Whether `BG-29` (`BT-146`, the item net price) is stated, on the same
-    /// terms as [`quantity_stated`](Self::quantity_stated) but for `BR-26`.
-    /// `false` means `line.price` is `PriceDetails::default()` and does not
-    /// count.
+    /// Whether `BG-29` (`BT-146`, the item net price) is present *and
+    /// valid*, on the same terms as
+    /// [`quantity_stated`](Self::quantity_stated) but for `BR-26`: never
+    /// required on a sub-line, but a stated `cac:Price` must have a valid
+    /// `cbc:PriceAmount` (missing or empty is rejected, KoSIT 406,
+    /// `cvc-complex-type.2.4.b`). `false` means `line.price` is
+    /// `PriceDetails::default()`.
     #[cfg_attr(feature = "serde", serde(default = "stated_by_default"))]
     pub price_stated: bool,
     /// Its own sub-lines, if it decomposes further.

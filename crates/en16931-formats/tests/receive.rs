@@ -652,11 +652,12 @@ fn xrechnung_extension_with_a_group() -> Invoice {
 }
 
 /// A grouping `BG-DEX-01` sub-line (one with its own child) may leave BT-129
-/// and BG-29 unstated: the UBL schema allows it, and the XRechnung Extension
-/// Schematron checks only `BR-DEX-02` and `BR-DEX-03` there, never `BR-22` or
-/// `BR-26`. The real-world case this guards is the KoSIT XRechnung Extension
-/// testsuite's `04.03a`/`04.04a-INVOICE_ubl.xml`, each a lawful invoice with
-/// such a group.
+/// and BG-29 unstated: `BR-22`'s and `BR-26`'s context is `cac:InvoiceLine |
+/// cac:CreditNoteLine`, never a `cac:SubInvoiceLine`, and the XRechnung
+/// Extension Schematron checks only `BR-DEX-02` and `BR-DEX-03` there. The
+/// real-world case this guards is the KoSIT XRechnung Extension testsuite's
+/// `04.03a`/`04.04a-INVOICE_ubl.xml`, each a lawful invoice with such a
+/// group.
 #[test]
 fn a_grouping_sub_line_without_quantity_or_price_is_accepted() {
     let inv = xrechnung_extension_with_a_group();
@@ -682,42 +683,217 @@ fn a_grouping_sub_line_without_quantity_or_price_is_accepted() {
     );
 }
 
-/// A childless `BG-DEX-01` sub-line always states BT-129 and BG-29: `BR-22`
-/// and `BR-26` still apply there, exactly as on BG-25. Leaving the item net
-/// price unstated remains a `Kind::Malformed` entry, and `receive` rejects
-/// the document — unlike the grouping case above.
+/// A childless `BG-DEX-01` sub-line may also leave BT-129 and BG-29
+/// unstated: `BR-22`'s and `BR-26`'s context is `cac:InvoiceLine |
+/// cac:CreditNoteLine`
+/// (`eInvoicing-EN16931/ubl/schematron/preprocessed/
+/// EN16931-UBL-validation-preprocessed.sch:138-144`), never a sub-line,
+/// grouping or not — confirmed against the KoSIT validator, which accepts a
+/// childless sub-line missing both.
 #[test]
-fn a_childless_sub_line_without_price_stays_malformed() {
+fn a_childless_sub_line_without_quantity_or_price_is_accepted() {
     let mut inv = xrechnung();
     inv.specification_id = Some(profiles::XRECHNUNG_EXTENSION.specification_id.to_owned());
     let mut leaf = inv.lines[0].clone();
     leaf.id = "1.".to_owned();
+    leaf.quantity = en16931::Quantity::default();
+    leaf.unit_code = en16931::invoice::Code::default();
+    leaf.price = en16931::invoice::PriceDetails::default();
     inv.extensions.sub_invoice_lines = vec![(
         0,
         vec![en16931::SubInvoiceLine {
             vat: Some(leaf.vat.clone()),
-            quantity_stated: true,
+            quantity_stated: false,
             price_stated: false,
             line: leaf,
             children: vec![],
         }],
     )];
+    let report = profiles::XRECHNUNG_EXTENSION.validate(&inv);
+    assert!(report.is_valid(), "{report}");
 
     let bytes = xml(&inv, Syntax::Ubl);
     let read = en16931_formats::read(&bytes).expect("readable");
-    let entry = read
-        .entries_of(Kind::Malformed)
-        .find(|e| e.term.as_deref() == Some("BT-146"))
-        .unwrap_or_else(|| {
-            panic!(
-                "BR-26 must still fire on a childless sub-line: {:?}",
-                read.entries
-            )
-        });
-    assert!(entry.path.contains("SubInvoiceLine"), "{entry:?}");
-    assert!(entry.message.contains("BR-26"), "{entry:?}");
+    let malformed: Vec<_> = read.entries_of(Kind::Malformed).collect();
+    assert!(malformed.is_empty(), "{malformed:?}");
+    let [sub] = read.invoice.extensions.sub_lines(0) else {
+        panic!(
+            "one sub-line, got {:?}",
+            read.invoice.extensions.sub_lines(0)
+        );
+    };
+    assert!(!sub.quantity_stated, "no BT-129 was written");
+    assert!(!sub.price_stated, "no BG-29 was written");
 
-    let got = receive(&bytes, &Policy::default());
+    let got = receive(&bytes, &policy(Some(&profiles::XRECHNUNG_EXTENSION)));
+    assert_eq!(
+        got.recommendation,
+        Recommendation::Accept,
+        "{:?}",
+        got.reasons
+    );
+}
+
+/// An empty `cbc:InvoicedQuantity` or `cac:Price` without `cbc:PriceAmount`
+/// is, unlike an absent one, a schema violation UBL never allows: the UBL 2.1
+/// schema requires non-empty `xs:decimal` content wherever the element is
+/// present at all. KoSIT's validator refuses both with a 406
+/// (`cvc-datatype-valid.1.2.1` for the empty quantity, `cvc-complex-type.2.4.b`
+/// for `<cac:Price/>`) on a grouping sub-line exactly as on a childless one;
+/// this covers the grouping case, the next test the childless one.
+#[test]
+fn an_empty_quantity_or_price_on_a_group_is_rejected() {
+    let xml = r#"<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
+        xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+        xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+      <cbc:CustomizationID>urn:cen.eu:en16931:2017#compliant#urn:xeinkauf.de:kosit:xrechnung_3.0#conformant#urn:xeinkauf.de:kosit:extension:xrechnung_3.0</cbc:CustomizationID>
+      <cac:LegalMonetaryTotal>
+        <cbc:LineExtensionAmount currencyID="EUR">300.00</cbc:LineExtensionAmount>
+        <cbc:TaxExclusiveAmount currencyID="EUR">300.00</cbc:TaxExclusiveAmount>
+        <cbc:TaxInclusiveAmount currencyID="EUR">357.00</cbc:TaxInclusiveAmount>
+        <cbc:PayableAmount currencyID="EUR">357.00</cbc:PayableAmount>
+      </cac:LegalMonetaryTotal>
+      <cac:InvoiceLine>
+        <cbc:ID>1</cbc:ID>
+        <cbc:InvoicedQuantity unitCode="C62">3</cbc:InvoicedQuantity>
+        <cbc:LineExtensionAmount currencyID="EUR">300.00</cbc:LineExtensionAmount>
+        <cac:Item>
+          <cbc:Name>Widget</cbc:Name>
+          <cac:ClassifiedTaxCategory>
+            <cbc:ID>S</cbc:ID>
+            <cbc:Percent>19</cbc:Percent>
+            <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+          </cac:ClassifiedTaxCategory>
+        </cac:Item>
+        <cac:Price>
+          <cbc:PriceAmount currencyID="EUR">100.00</cbc:PriceAmount>
+        </cac:Price>
+        <cac:SubInvoiceLine>
+          <cbc:ID>1.</cbc:ID>
+          <cbc:InvoicedQuantity unitCode="C62"></cbc:InvoicedQuantity>
+          <cbc:LineExtensionAmount currencyID="EUR">300.00</cbc:LineExtensionAmount>
+          <cac:Item>
+            <cbc:Name>Widget</cbc:Name>
+            <cac:ClassifiedTaxCategory>
+              <cbc:ID>S</cbc:ID>
+              <cbc:Percent>19</cbc:Percent>
+              <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+            </cac:ClassifiedTaxCategory>
+          </cac:Item>
+          <cac:Price/>
+          <cac:SubInvoiceLine>
+            <cbc:ID>1.1.</cbc:ID>
+            <cbc:InvoicedQuantity unitCode="C62">3</cbc:InvoicedQuantity>
+            <cbc:LineExtensionAmount currencyID="EUR">300.00</cbc:LineExtensionAmount>
+            <cac:Item>
+              <cbc:Name>Widget</cbc:Name>
+              <cac:ClassifiedTaxCategory>
+                <cbc:ID>S</cbc:ID>
+                <cbc:Percent>19</cbc:Percent>
+                <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+              </cac:ClassifiedTaxCategory>
+            </cac:Item>
+            <cac:Price>
+              <cbc:PriceAmount currencyID="EUR">100.00</cbc:PriceAmount>
+            </cac:Price>
+          </cac:SubInvoiceLine>
+        </cac:SubInvoiceLine>
+      </cac:InvoiceLine>
+    </Invoice>"#;
+
+    let read = en16931_formats::read(xml.as_bytes()).expect("readable");
+    let malformed: Vec<_> = read.entries_of(Kind::Malformed).collect();
+    assert!(
+        malformed
+            .iter()
+            .any(|e| e.term.as_deref() == Some("BT-129") && e.path.contains("SubInvoiceLine")),
+        "the empty quantity must be reported: {malformed:?}"
+    );
+    assert!(
+        malformed
+            .iter()
+            .any(|e| e.term.as_deref() == Some("BT-146") && e.path.contains("SubInvoiceLine")),
+        "the empty price must be reported: {malformed:?}"
+    );
+
+    let got = receive(
+        xml.as_bytes(),
+        &policy(Some(&profiles::XRECHNUNG_EXTENSION)),
+    );
+    assert_eq!(
+        got.recommendation,
+        Recommendation::Reject,
+        "{:?}",
+        got.reasons
+    );
+}
+
+/// As the previous test, on a childless sub-line (no `cac:SubInvoiceLine`
+/// children) rather than a group — `BR-22`/`BR-26` do not distinguish the
+/// two, and neither does UBL's schema.
+#[test]
+fn an_empty_quantity_or_price_on_a_childless_sub_line_is_rejected() {
+    let xml = r#"<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
+        xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+        xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+      <cbc:CustomizationID>urn:cen.eu:en16931:2017#compliant#urn:xeinkauf.de:kosit:xrechnung_3.0#conformant#urn:xeinkauf.de:kosit:extension:xrechnung_3.0</cbc:CustomizationID>
+      <cac:LegalMonetaryTotal>
+        <cbc:LineExtensionAmount currencyID="EUR">300.00</cbc:LineExtensionAmount>
+        <cbc:TaxExclusiveAmount currencyID="EUR">300.00</cbc:TaxExclusiveAmount>
+        <cbc:TaxInclusiveAmount currencyID="EUR">357.00</cbc:TaxInclusiveAmount>
+        <cbc:PayableAmount currencyID="EUR">357.00</cbc:PayableAmount>
+      </cac:LegalMonetaryTotal>
+      <cac:InvoiceLine>
+        <cbc:ID>1</cbc:ID>
+        <cbc:InvoicedQuantity unitCode="C62">3</cbc:InvoicedQuantity>
+        <cbc:LineExtensionAmount currencyID="EUR">300.00</cbc:LineExtensionAmount>
+        <cac:Item>
+          <cbc:Name>Widget</cbc:Name>
+          <cac:ClassifiedTaxCategory>
+            <cbc:ID>S</cbc:ID>
+            <cbc:Percent>19</cbc:Percent>
+            <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+          </cac:ClassifiedTaxCategory>
+        </cac:Item>
+        <cac:Price>
+          <cbc:PriceAmount currencyID="EUR">100.00</cbc:PriceAmount>
+        </cac:Price>
+        <cac:SubInvoiceLine>
+          <cbc:ID>1.</cbc:ID>
+          <cbc:InvoicedQuantity unitCode="C62"></cbc:InvoicedQuantity>
+          <cbc:LineExtensionAmount currencyID="EUR">300.00</cbc:LineExtensionAmount>
+          <cac:Item>
+            <cbc:Name>Widget</cbc:Name>
+            <cac:ClassifiedTaxCategory>
+              <cbc:ID>S</cbc:ID>
+              <cbc:Percent>19</cbc:Percent>
+              <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+            </cac:ClassifiedTaxCategory>
+          </cac:Item>
+          <cac:Price/>
+        </cac:SubInvoiceLine>
+      </cac:InvoiceLine>
+    </Invoice>"#;
+
+    let read = en16931_formats::read(xml.as_bytes()).expect("readable");
+    let malformed: Vec<_> = read.entries_of(Kind::Malformed).collect();
+    assert!(
+        malformed
+            .iter()
+            .any(|e| e.term.as_deref() == Some("BT-129") && e.path.contains("SubInvoiceLine")),
+        "the empty quantity must be reported: {malformed:?}"
+    );
+    assert!(
+        malformed
+            .iter()
+            .any(|e| e.term.as_deref() == Some("BT-146") && e.path.contains("SubInvoiceLine")),
+        "the empty price must be reported: {malformed:?}"
+    );
+
+    let got = receive(
+        xml.as_bytes(),
+        &policy(Some(&profiles::XRECHNUNG_EXTENSION)),
+    );
     assert_eq!(
         got.recommendation,
         Recommendation::Reject,

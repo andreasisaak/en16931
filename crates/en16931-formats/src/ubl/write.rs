@@ -879,9 +879,10 @@ fn sub_line(x: &mut Xml, s: &en16931::SubInvoiceLine, i: usize, credit: bool, cc
         if let Some(n) = &s.line.note {
             x.leaf("cbc:Note", &[], n);
         }
-        // A grouping sub-line (one with its own children) may leave BT-129 and
-        // BG-29 unstated (`en16931::SubInvoiceLine::quantity_stated`,
-        // `price_stated`); a childless one always states both.
+        // Any sub-line, grouping or childless, may leave BT-129 and BG-29
+        // unstated (`en16931::SubInvoiceLine::quantity_stated`,
+        // `price_stated`): `BR-22`/`BR-26` never reach a `cac:SubInvoiceLine`
+        // at all.
         if s.quantity_stated {
             let qty_name = if credit {
                 "cbc:CreditedQuantity"
