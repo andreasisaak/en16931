@@ -613,27 +613,20 @@ fn a_duplicated_payment_terms_carrier_is_fatal_under_xrechnung_only() {
 }
 
 /// An XRechnung Extension `BG-DEX-01` group — a sub-line with its own
-/// child — built from `inv.lines[0]` twice: once as the group (`group_*`
-/// controls whether it states BT-129 and BG-29), once as its only child,
-/// which always states both. Cloning the same line keeps `BR-DEX-02` (the
-/// group's BT-131 is the sum of its children's) and `BR-DEX-03` (exactly one
-/// VAT category each) satisfied by construction.
-fn xrechnung_extension_with_a_group(
-    group_quantity_stated: bool,
-    group_price_stated: bool,
-) -> Invoice {
+/// child — built from `inv.lines[0]` twice: once as the group, which states
+/// neither BT-129 nor BG-29, once as its only child, which states both.
+/// Cloning the same line keeps `BR-DEX-02` (the group's BT-131 is the sum of
+/// its children's) and `BR-DEX-03` (exactly one VAT category each) satisfied
+/// by construction.
+fn xrechnung_extension_with_a_group() -> Invoice {
     let mut inv = xrechnung();
     inv.specification_id = Some(profiles::XRECHNUNG_EXTENSION.specification_id.to_owned());
 
     let mut group = inv.lines[0].clone();
     group.id = "1.".to_owned();
-    if !group_quantity_stated {
-        group.quantity = en16931::Quantity::default();
-        group.unit_code = en16931::invoice::Code::default();
-    }
-    if !group_price_stated {
-        group.price = en16931::invoice::PriceDetails::default();
-    }
+    group.quantity = en16931::Quantity::default();
+    group.unit_code = en16931::invoice::Code::default();
+    group.price = en16931::invoice::PriceDetails::default();
     let mut child = inv.lines[0].clone();
     child.id = "1.1.".to_owned();
 
@@ -641,8 +634,8 @@ fn xrechnung_extension_with_a_group(
         0,
         vec![en16931::SubInvoiceLine {
             vat: Some(group.vat.clone()),
-            quantity_stated: group_quantity_stated,
-            price_stated: group_price_stated,
+            quantity_stated: false,
+            price_stated: false,
             line: group,
             children: vec![en16931::SubInvoiceLine {
                 vat: Some(child.vat.clone()),
@@ -666,7 +659,7 @@ fn xrechnung_extension_with_a_group(
 /// such a group.
 #[test]
 fn a_grouping_sub_line_without_quantity_or_price_is_accepted() {
-    let inv = xrechnung_extension_with_a_group(false, false);
+    let inv = xrechnung_extension_with_a_group();
     let bytes = xml(&inv, Syntax::Ubl);
 
     let read = en16931_formats::read(&bytes).expect("readable");
