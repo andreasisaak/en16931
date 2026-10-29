@@ -129,12 +129,43 @@ pub const THIRD_PARTY_PAYMENTS: &str = "BG-DEX-09";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubInvoiceLine {
     /// The line itself, with the same business terms as BG-25.
+    ///
+    /// A grouping sub-line ([`children`](Self::children) non-empty) may leave
+    /// `line.quantity` and `line.price` at their default; see
+    /// [`quantity_stated`](Self::quantity_stated) and
+    /// [`price_stated`](Self::price_stated).
     pub line: InvoiceLine,
-    /// `BG-DEX-06` — its VAT information. Exactly one (`BR-DEX-03`).
+    /// `BG-DEX-06` — its VAT information. Exactly one (`BR-DEX-03`), on every
+    /// sub-line, grouping or not.
     pub vat: Option<LineVat>,
+    /// Whether `BT-129` (and its unit, BT-130) is stated.
+    ///
+    /// The UBL schema makes `cac:SubInvoiceLine/cbc:InvoicedQuantity` 0..1
+    /// (`InvoiceLineType`), and the XRechnung Extension Schematron checks only
+    /// `BR-DEX-02` (this line's BT-131 is the sum of its children's) and
+    /// `BR-DEX-03` on a sub-line with children — never `BR-22`. A childless
+    /// sub-line still needs it (`BR-22` applies there as on BG-25). `false`
+    /// means `line.quantity` is `Quantity::default()` (zero) and does not
+    /// count — a quantity is never actually zero and absent.
+    #[cfg_attr(feature = "serde", serde(default = "stated_by_default"))]
+    pub quantity_stated: bool,
+    /// Whether `BG-29` (`BT-146`, the item net price) is stated, on the same
+    /// terms as [`quantity_stated`](Self::quantity_stated) but for `BR-26`.
+    /// `false` means `line.price` is `PriceDetails::default()` and does not
+    /// count.
+    #[cfg_attr(feature = "serde", serde(default = "stated_by_default"))]
+    pub price_stated: bool,
     /// Its own sub-lines, if it decomposes further.
     #[cfg_attr(feature = "serde", serde(default))]
     pub children: Vec<SubInvoiceLine>,
+}
+
+/// Serde default for [`SubInvoiceLine::quantity_stated`] and
+/// [`SubInvoiceLine::price_stated`]: data from before these fields existed
+/// carried both, so an absent field reads as `true`.
+#[cfg(feature = "serde")]
+const fn stated_by_default() -> bool {
+    true
 }
 
 impl SubInvoiceLine {

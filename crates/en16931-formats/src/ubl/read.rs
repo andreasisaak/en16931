@@ -372,7 +372,9 @@ impl Reader {
                 }
                 "LegalMonetaryTotal" => self.totals(c, &mut inv),
                 "InvoiceLine" | "CreditNoteLine" => {
-                    let l = self.line(c);
+                    // BG-25 always has its own BT-129 and BT-146 (`BR-22`,
+                    // `BR-26`); only a grouping sub-line may leave them out.
+                    let l = self.line(c, true);
                     // BG-DEX-01 hangs beneath the line, keyed by its index.
                     let subs = self.sub_lines(c);
                     if !subs.is_empty() {
@@ -856,7 +858,11 @@ impl Reader {
         }
     }
 
-    fn line(&mut self, n: Node<'_, '_>) -> InvoiceLine {
+    /// `require_quantity_and_price` is `false` only for a `cac:SubInvoiceLine`
+    /// that itself has `cac:SubInvoiceLine` children: the one case where
+    /// `BT-129`/`BR-22` and `BG-29`/`BR-26` may be absent — see
+    /// `en16931::SubInvoiceLine::quantity_stated`.
+    fn line(&mut self, n: Node<'_, '_>, require_quantity_and_price: bool) -> InvoiceLine {
         let mut l = InvoiceLine {
             id: text(n, "ID").unwrap_or_default(),
             note: text(n, "Note"),
@@ -942,9 +948,13 @@ impl Reader {
         } else {
             "InvoicedQuantity"
         };
-        self.require(n, &[quantity], "BT-129", "BR-22");
+        if require_quantity_and_price {
+            self.require(n, &[quantity], "BT-129", "BR-22");
+        }
         self.require(n, &["LineExtensionAmount"], "BT-131", "BR-24");
-        self.require(n, &["Price", "PriceAmount"], "BT-146", "BR-26");
+        if require_quantity_and_price {
+            self.require(n, &["Price", "PriceAmount"], "BT-146", "BR-26");
+        }
         l
     }
 
@@ -953,7 +963,14 @@ impl Reader {
         kids(n)
             .filter(|c| name(*c) == "SubInvoiceLine")
             .map(|c| {
-                let line = self.line(c);
+                // A sub-line with its own sub-lines is a group: `BR-22` and
+                // `BR-26` (`en16931::SubInvoiceLine::quantity_stated`,
+                // `price_stated`) do not apply to it, only to a childless one.
+                let is_group = kids(c).any(|x| name(x) == "SubInvoiceLine");
+                let quantity_stated = kid(c, "InvoicedQuantity").is_some();
+                let price_stated = kid(c, "Price")
+                    .is_some_and(|p| crate::xml::child_text(p, "PriceAmount").is_some());
+                let line = self.line(c, !is_group);
                 // BG-DEX-06: `BR-DEX-03` requires exactly one, so two map to
                 // `None` and the rule fires.
                 let categories = kid(c, "Item").map_or(0, |i| {
@@ -964,6 +981,8 @@ impl Reader {
                 en16931::SubInvoiceLine {
                     vat: (categories == 1).then(|| line.vat.clone()),
                     line,
+                    quantity_stated,
+                    price_stated,
                     children: self.sub_lines(c),
                 }
             })

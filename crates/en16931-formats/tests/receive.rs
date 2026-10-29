@@ -611,3 +611,124 @@ fn a_duplicated_payment_terms_carrier_is_fatal_under_xrechnung_only() {
     // The declared report (core) keeps CEN's level.
     assert_eq!(xr.report_declared.schema.validity, Validity::Valid);
 }
+
+/// An XRechnung Extension `BG-DEX-01` group — a sub-line with its own
+/// child — built from `inv.lines[0]` twice: once as the group (`group_*`
+/// controls whether it states BT-129 and BG-29), once as its only child,
+/// which always states both. Cloning the same line keeps `BR-DEX-02` (the
+/// group's BT-131 is the sum of its children's) and `BR-DEX-03` (exactly one
+/// VAT category each) satisfied by construction.
+fn xrechnung_extension_with_a_group(
+    group_quantity_stated: bool,
+    group_price_stated: bool,
+) -> Invoice {
+    let mut inv = xrechnung();
+    inv.specification_id = Some(profiles::XRECHNUNG_EXTENSION.specification_id.to_owned());
+
+    let mut group = inv.lines[0].clone();
+    group.id = "1.".to_owned();
+    if !group_quantity_stated {
+        group.quantity = en16931::Quantity::default();
+        group.unit_code = en16931::invoice::Code::default();
+    }
+    if !group_price_stated {
+        group.price = en16931::invoice::PriceDetails::default();
+    }
+    let mut child = inv.lines[0].clone();
+    child.id = "1.1.".to_owned();
+
+    inv.extensions.sub_invoice_lines = vec![(
+        0,
+        vec![en16931::SubInvoiceLine {
+            vat: Some(group.vat.clone()),
+            quantity_stated: group_quantity_stated,
+            price_stated: group_price_stated,
+            line: group,
+            children: vec![en16931::SubInvoiceLine {
+                vat: Some(child.vat.clone()),
+                quantity_stated: true,
+                price_stated: true,
+                line: child,
+                children: vec![],
+            }],
+        }],
+    )];
+    let report = profiles::XRECHNUNG_EXTENSION.validate(&inv);
+    assert!(report.is_valid(), "{report}");
+    inv
+}
+
+/// A grouping `BG-DEX-01` sub-line (one with its own child) may leave BT-129
+/// and BG-29 unstated: the UBL schema allows it, and the XRechnung Extension
+/// Schematron checks only `BR-DEX-02` and `BR-DEX-03` there, never `BR-22` or
+/// `BR-26`. The real-world case this guards is the KoSIT XRechnung Extension
+/// testsuite's `04.03a`/`04.04a-INVOICE_ubl.xml`, each a lawful invoice with
+/// such a group.
+#[test]
+fn a_grouping_sub_line_without_quantity_or_price_is_accepted() {
+    let inv = xrechnung_extension_with_a_group(false, false);
+    let bytes = xml(&inv, Syntax::Ubl);
+
+    let read = en16931_formats::read(&bytes).expect("readable");
+    let malformed: Vec<_> = read.entries_of(Kind::Malformed).collect();
+    assert!(malformed.is_empty(), "{malformed:?}");
+    let group = &read.invoice.extensions.sub_lines(0)[0];
+    assert!(!group.quantity_stated, "the group states no BT-129");
+    assert!(!group.price_stated, "the group states no BG-29");
+    assert_eq!(group.line.quantity, en16931::Quantity::default());
+    assert_eq!(group.line.price, en16931::invoice::PriceDetails::default());
+    assert!(group.children[0].quantity_stated, "the child states BT-129");
+    assert!(group.children[0].price_stated, "the child states BG-29");
+
+    let got = receive(&bytes, &policy(Some(&profiles::XRECHNUNG_EXTENSION)));
+    assert_eq!(
+        got.recommendation,
+        Recommendation::Accept,
+        "{:?}",
+        got.reasons
+    );
+}
+
+/// A childless `BG-DEX-01` sub-line always states BT-129 and BG-29: `BR-22`
+/// and `BR-26` still apply there, exactly as on BG-25. Leaving the item net
+/// price unstated remains a `Kind::Malformed` entry, and `receive` rejects
+/// the document — unlike the grouping case above.
+#[test]
+fn a_childless_sub_line_without_price_stays_malformed() {
+    let mut inv = xrechnung();
+    inv.specification_id = Some(profiles::XRECHNUNG_EXTENSION.specification_id.to_owned());
+    let mut leaf = inv.lines[0].clone();
+    leaf.id = "1.".to_owned();
+    inv.extensions.sub_invoice_lines = vec![(
+        0,
+        vec![en16931::SubInvoiceLine {
+            vat: Some(leaf.vat.clone()),
+            quantity_stated: true,
+            price_stated: false,
+            line: leaf,
+            children: vec![],
+        }],
+    )];
+
+    let bytes = xml(&inv, Syntax::Ubl);
+    let read = en16931_formats::read(&bytes).expect("readable");
+    let entry = read
+        .entries_of(Kind::Malformed)
+        .find(|e| e.term.as_deref() == Some("BT-146"))
+        .unwrap_or_else(|| {
+            panic!(
+                "BR-26 must still fire on a childless sub-line: {:?}",
+                read.entries
+            )
+        });
+    assert!(entry.path.contains("SubInvoiceLine"), "{entry:?}");
+    assert!(entry.message.contains("BR-26"), "{entry:?}");
+
+    let got = receive(&bytes, &Policy::default());
+    assert_eq!(
+        got.recommendation,
+        Recommendation::Reject,
+        "{:?}",
+        got.reasons
+    );
+}

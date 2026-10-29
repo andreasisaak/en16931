@@ -800,6 +800,89 @@ fn a_logistics_service_charge_is_a_charge_only_under_an_extension() {
     );
 }
 
+/// A grouping `cac:SubInvoiceLine` (one with its own child) round-trips
+/// without `cbc:InvoicedQuantity` or `cac:Price`: the writer omits them when
+/// `en16931::SubInvoiceLine::quantity_stated` / `price_stated` are `false`,
+/// and the reader puts both back absent, not as a stated zero.
+#[cfg(feature = "ubl")]
+#[test]
+fn a_grouping_sub_line_round_trips_without_quantity_or_price() {
+    use en16931_formats::Syntax;
+
+    let mut inv = common::maximal();
+    // A declared profile with no extension groups drops `cac:SubInvoiceLine`
+    // outright (`UBL-CR-646`); the Extension is the one that carries it.
+    inv.specification_id = Some(
+        en16931::profiles::XRECHNUNG_EXTENSION
+            .specification_id
+            .to_owned(),
+    );
+
+    let mut group = inv.lines[0].clone();
+    group.id = "1.".to_owned();
+    group.quantity = en16931::Quantity::default();
+    group.unit_code = en16931::invoice::Code::default();
+    group.price = en16931::invoice::PriceDetails::default();
+    let mut child = inv.lines[0].clone();
+    child.id = "1.1.".to_owned();
+    inv.extensions.sub_invoice_lines = vec![(
+        0,
+        vec![en16931::SubInvoiceLine {
+            vat: Some(group.vat.clone()),
+            quantity_stated: false,
+            price_stated: false,
+            line: group,
+            children: vec![en16931::SubInvoiceLine {
+                vat: Some(child.vat.clone()),
+                quantity_stated: true,
+                price_stated: true,
+                line: child,
+                children: vec![],
+            }],
+        }],
+    )];
+
+    let written = write(&inv, Syntax::Ubl);
+    assert!(
+        !written
+            .entries
+            .iter()
+            .any(|e| e.rule.as_deref() == Some("UBL-CR-646")),
+        "the Extension must carry the group: {:?}",
+        written.entries
+    );
+    let group_start = written
+        .xml
+        .find("<cbc:ID>1.</cbc:ID>")
+        .expect("group written");
+    let child_start = written.xml[group_start..]
+        .find("<cac:SubInvoiceLine>")
+        .expect("the child follows the group")
+        + group_start;
+    let group_xml = &written.xml[group_start..child_start];
+    assert!(
+        !group_xml.contains("InvoicedQuantity") && !group_xml.contains("<cac:Price>"),
+        "the group must not write BT-129 or BG-29:\n{group_xml}"
+    );
+
+    let back = read(&written.xml, Syntax::Ubl);
+    assert!(
+        back.entries_of(Kind::Malformed).next().is_none(),
+        "{:?}",
+        back.entries
+    );
+    let group = &back.invoice.extensions.sub_lines(0)[0];
+    assert!(!group.quantity_stated, "the group states no BT-129");
+    assert!(!group.price_stated, "the group states no BG-29");
+    assert_eq!(group.line.quantity, en16931::Quantity::default());
+    assert_eq!(group.line.price, en16931::invoice::PriceDetails::default());
+    let [child] = &group.children[..] else {
+        panic!("one child, got {:?}", group.children);
+    };
+    assert!(child.quantity_stated, "the child states BT-129");
+    assert!(child.price_stated, "the child states BG-29");
+}
+
 // ── Write, read back: the invoice is unchanged or something says why ───────────
 
 /// The extreme amounts, such as `InvoiceAmount::MIN`, survive both syntaxes.
