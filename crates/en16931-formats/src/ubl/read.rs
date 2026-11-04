@@ -1142,14 +1142,15 @@ impl Reader {
     /// One line; `index` is its 1-based position among its siblings, passed
     /// in rather than counted, which would make a document quadratic.
     ///
-    /// Returns, besides the line, whether its BT-129 and its BT-146 are
-    /// stated: present and readable (`en16931::SubInvoiceLine::quantity_stated`,
+    /// Returns, besides the line, whether it carries a quantity element and a
+    /// `cac:Price` (`en16931::SubInvoiceLine::quantity_stated`,
     /// `price_stated`). `BR-22`, `BR-23` and `BR-26` hold on `cac:InvoiceLine |
     /// cac:CreditNoteLine` only (`eInvoicing-EN16931/ubl/schematron/
     /// preprocessed/EN16931-UBL-validation-preprocessed.sch`), so a
     /// `cac:SubInvoiceLine`, grouping or childless, may leave BT-129, BT-130
     /// and BG-29 out; the KoSIT validator accepts it. Present but empty is
     /// still refused: UBL's schema requires a value wherever the element is.
+    /// A value that is refused is held as a placeholder, as on a line.
     fn line(&mut self, n: Node<'_, '_>, index: usize) -> (InvoiceLine, bool, bool) {
         // A sub-line is BG-DEX-01; its index is among its siblings, and its
         // path says which line it hangs beneath.
@@ -1182,7 +1183,7 @@ impl Reader {
             }
             None
         };
-        let quantity_stated = quantity.is_some();
+        let quantity_stated = kid(n, quantity_el).is_some();
         let quantity = quantity.map_or(Quantity::ZERO, Quantity::new);
         let unit_code = if let Some(u) = kid(n, quantity_el)
             .and_then(|q| q.attribute("unitCode"))
@@ -1304,7 +1305,10 @@ impl Reader {
                         l.allowances.push(a);
                     }
                 }
-                "Price" => (l.price, price_stated) = self.price(c, &group, sub),
+                "Price" => {
+                    l.price = self.price(c, &group, sub);
+                    price_stated = true;
+                }
                 "Item" => {
                     let (item, vat) = self.item(c, &group);
                     l.item = item;
@@ -1363,9 +1367,8 @@ impl Reader {
             .collect()
     }
 
-    /// The price of a line, or of a sub-line when `sub`, and whether its
-    /// BT-146 is stated (see [`Self::line`]).
-    fn price(&mut self, n: Node<'_, '_>, group: &str, sub: bool) -> (PriceDetails, bool) {
+    /// The price of a line, or of a sub-line when `sub` (see [`Self::line`]).
+    fn price(&mut self, n: Node<'_, '_>, group: &str, sub: bool) -> PriceDetails {
         if text(n, "PriceAmount").is_none() {
             if sub {
                 self.empty_on_sub_line(n, "PriceAmount", Term::new(group, "BT-146"));
@@ -1373,10 +1376,10 @@ impl Reader {
                 self.missing(n, Term::new(group, "BT-146"), "the item net price");
             }
         }
-        let net_price = self.unit_price(n, "PriceAmount", Term::new(group, "BT-146"));
-        let stated = net_price.is_some();
         let mut p = PriceDetails {
-            net_price: net_price.unwrap_or_default(),
+            net_price: self
+                .unit_price(n, "PriceAmount", Term::new(group, "BT-146"))
+                .unwrap_or_default(),
             price_discount: None,
             gross_price: None,
             base_quantity: self
@@ -1414,7 +1417,7 @@ impl Reader {
                 _ => self.skip("Price", c),
             }
         }
-        (p, stated)
+        p
     }
 
     fn item(&mut self, n: Node<'_, '_>, group: &str) -> (Item, LineVat) {

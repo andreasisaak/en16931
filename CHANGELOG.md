@@ -31,21 +31,23 @@ Before 1.0, a minor release may break; every break is listed here.
   cac:CreditNoteLine` only, and the KoSIT validator accepts such a sub-line,
   grouping or childless. A quantity element present but empty, or a
   `cac:Price` without `cbc:PriceAmount`, is still `Malformed`: UBL's schema
-  refuses both. The UBL writer omits what a sub-line does not state.
+  refuses both. The UBL writer omits what a sub-line does not state, an
+  absent unit included.
 - The CII writer dropped BT-89, the mandate reference, when the invoice had
   neither payment terms (BT-20) nor a due date (BT-9):
   `ram:SpecifiedTradePaymentTerms`, which carries `ram:DirectDebitMandateID`,
   was written only for those two. A mandate reference alone now writes it.
-- The CII reader keeps the first kind of payment means it reads, as the UBL
-  reader does, and reports every later card, debited account, mandate,
-  creditor identifier or creditor account as `Unmapped`. It used to replace
-  the first one silently, so a card followed by a debited account read as a
+- The CII reader keeps the first card, debited account or creditor account it
+  reads, as the UBL reader does, and reports every later one as `Unmapped`.
+  A mandate reference (BT-89) or creditor identifier (BT-90) joins a direct
+  debit and is reported beside a card or a credit transfer. The reader used to
+  replace the first one silently: a card followed by a debited account read
+  as a direct debit, a mandate beside a credit transfer turned it into a
   direct debit, and a creditor account followed by a card in the same element
   read as a card.
-- Both readers take only `xs:decimal` spellings as quantities, prices and
-  rates: `rust_decimal` alone also reads `1e1` and `1_000`, which the schemas
-  refuse. A value with more decimal places than a `Decimal` holds is
-  `Malformed` instead of rounded.
+- Both readers refuse `1e1` and `1_000` as quantities, prices and rates:
+  `rust_decimal` reads them, `xs:decimal` does not. A value with more decimal
+  places than a `Decimal` holds is `Malformed` instead of rounded.
 - The CII reader keeps every digit of a percentage, as the UBL reader does; it
   divided by 100 and multiplied back, which rounds a rate below 10^-26 to zero.
 - The UBL reader reports a date whose time zone is not an `xs:date` offset
@@ -65,7 +67,9 @@ Before 1.0, a minor release may break; every break is listed here.
   `rust_decimal` rounds a result beyond 28 places without saying so, which
   turned a tax just below half a cent into a cent (`BR-CO-17`, `-09`, the
   reconciler's BT-117) and let R120, R040 and R046 compare rounded values.
-  R040 compares a hundredfold instead of dividing by 100.
+  R040 compares a hundredfold instead of dividing by 100, and XPath's
+  `round` no longer rounds `x + 0.5` first. Only R120's division by the base
+  quantity rounds at 28 places, as XPath's decimal division does.
 - `InvoiceAmount::parse` accepts an amount without an integer part (`.50`), as
   `xs:decimal` does; CEN's own unit tests write `.00`, so 1 027 CEN assertions
   run instead of 1 025. `.` alone is refused.
