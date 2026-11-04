@@ -74,8 +74,8 @@ impl InvoiceAmount {
             Some((i, f)) => (i, f),
             None => (digits, ""),
         };
-        // An empty integer part (".5") is rejected.
-        if int_part.is_empty()
+        // `xs:decimal` allows an empty integer part (".5"), not an empty number (".").
+        if (int_part.is_empty() && frac_part.is_empty())
             || !int_part.bytes().all(|b| b.is_ascii_digit())
             || !frac_part.bytes().all(|b| b.is_ascii_digit())
         {
@@ -332,12 +332,21 @@ mod tests {
 
     #[test]
     fn rejects_malformed_input() {
-        for bad in ["", "   ", "abc", "1.2.3", "1,50", ".5", "-", "1e3", "1 000"] {
+        for bad in [
+            "", "   ", "abc", "1.2.3", "1,50", ".", "-.", "-", "1e3", "1 000",
+        ] {
             assert!(
                 InvoiceAmount::parse(bad).is_err(),
                 "{bad:?} should not parse"
             );
         }
+    }
+
+    /// `xs:decimal` allows an empty integer part when a fraction follows.
+    #[test]
+    fn a_fraction_without_an_integer_part_parses() {
+        let units = |s: &str| InvoiceAmount::parse(s).map(InvoiceAmount::to_minor_units);
+        assert_eq!([".5", "-.5", "+.50"].map(units), [Ok(50), Ok(-50), Ok(50)]);
     }
 
     #[test]

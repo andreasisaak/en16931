@@ -14,6 +14,12 @@ Before 1.0, a minor release may break; every break is listed here.
 
 ## [Unreleased]
 
+### Fixed
+
+- `InvoiceAmount::parse` accepts an amount without an integer part (`.50`), as
+  `xs:decimal` does; CEN's own unit tests write `.00`, so 1 027 CEN assertions
+  run instead of 1 025. `.` alone is refused.
+
 ## [0.9.0] — 2026-11-04
 
 The readers no longer invent values or drop them silently ([#14], [#15]), and
