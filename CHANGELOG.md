@@ -42,6 +42,14 @@ Before 1.0, a minor release may break; every break is listed here.
   the first one silently, so a card followed by a debited account read as a
   direct debit, and a creditor account followed by a card in the same element
   read as a card.
+- Both readers take only `xs:decimal` spellings as quantities, prices and
+  rates: `rust_decimal` alone also reads `1e1` and `1_000`, which the schemas
+  refuse. A value with more decimal places than a `Decimal` holds is
+  `Malformed` instead of rounded.
+- The CII reader keeps every digit of a percentage, as the UBL reader does; it
+  divided by 100 and multiplied back, which rounds a rate below 10^-26 to zero.
+- The UBL reader reports a date whose time zone is not an `xs:date` offset
+  (`+99:99`, `+14:30`) instead of dropping the zone.
 
 ## [0.9.0] — 2026-11-04
 
