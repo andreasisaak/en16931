@@ -66,6 +66,9 @@ Before 1.0, a minor release may break; every break is listed here.
   turned a tax just below half a cent into a cent (`BR-CO-17`, `-09`, the
   reconciler's BT-117) and let R120, R040 and R046 compare rounded values.
   R040 compares a hundredfold instead of dividing by 100.
+- `InvoiceAmount::parse` accepts an amount without an integer part (`.50`), as
+  `xs:decimal` does; CEN's own unit tests write `.00`, so 1 027 CEN assertions
+  run instead of 1 025. `.` alone is refused.
 
 ## [0.9.0] — 2026-11-04
 
