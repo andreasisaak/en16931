@@ -16,6 +16,10 @@ Before 1.0, a minor release may break; every break is listed here.
 
 ### Fixed
 
+- The CII writer dropped BT-89, the mandate reference, when the invoice had
+  neither payment terms (BT-20) nor a due date (BT-9):
+  `ram:SpecifiedTradePaymentTerms`, which carries `ram:DirectDebitMandateID`,
+  was written only for those two. A mandate reference alone now writes it.
 - `InvoiceAmount::parse` accepts an amount without an integer part (`.50`), as
   `xs:decimal` does; CEN's own unit tests write `.00`, so 1 027 CEN assertions
   run instead of 1 025. `.` alone is refused.
